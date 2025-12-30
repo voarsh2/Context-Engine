@@ -122,29 +122,12 @@ def _ensure_once(name: str) -> bool:
     except Exception:
         return False
 
-# Configure transport security to allow Docker internal hostnames
-# This prevents "Invalid Host header: mcp:8000" errors from inter-container calls
+# Configure transport security to explicitly disable DNS rebinding protection
+# This ensures Docker/Bridge hostnames (e.g. mcp:8000) are allowed.
 try:
     from mcp.server.transport_security import TransportSecuritySettings
     _transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "localhost:*",
-            "127.0.0.1:*",
-            "0.0.0.0:*",
-            "mcp:*",           # Docker service name
-            "mcp_http:*",      # Docker service name (HTTP variant)
-            "memory:*",        # Docker service name
-            "mcp-search:*",    # Docker container name pattern
-            "mcp-search-dev-remote:*",
-            "mcp-search-http-dev-remote:*",
-        ],
-        allowed_origins=[
-            "http://localhost:*",
-            "http://127.0.0.1:*",
-            "http://mcp:*",
-            "http://mcp_http:*",
-        ],
+        enable_dns_rebinding_protection=False
     )
 except ImportError:
     _transport_security = None
