@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import weakref
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from contextlib import contextmanager
 from qdrant_client import QdrantClient
 
@@ -17,6 +17,30 @@ from qdrant_client import QdrantClient
 # Connection pool implementation
 
 logger = logging.getLogger(__name__)
+
+
+def _get_qdrant_timeout() -> Optional[float]:
+    """Return the configured Qdrant HTTP timeout (seconds) if set."""
+    raw = os.environ.get("QDRANT_TIMEOUT") or os.environ.get("QDRANT_CLIENT_TIMEOUT")
+    if not raw:
+        return None
+    try:
+        timeout = float(raw)
+        return timeout if timeout > 0 else None
+    except (TypeError, ValueError):
+        logger.debug("Invalid Qdrant timeout value '%s'; ignoring", raw)
+        return None
+
+
+def _client_kwargs(url: str, api_key: Optional[str]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "url": url,
+        "api_key": api_key if api_key else None,
+    }
+    timeout = _get_qdrant_timeout()
+    if timeout is not None:
+        kwargs["timeout"] = timeout  # type: ignore[assignment]
+    return kwargs
 class QdrantConnectionPool:
     """Thread-safe connection pool for QdrantClient instances."""
     
@@ -49,7 +73,7 @@ class QdrantConnectionPool:
             
             # No suitable client found, create a new one
             if self._created_count < self.max_size:
-                client = QdrantClient(url=url, api_key=api_key)
+                client = QdrantClient(**_client_kwargs(url, api_key))
                 pool_entry = {
                     'client': client,
                     'url': url,
@@ -66,7 +90,7 @@ class QdrantConnectionPool:
                 # Pool is full, create a temporary client (not pooled)
                 # Mark it for tracking so return_client can close it
                 self._misses += 1
-                temp_client = QdrantClient(url=url, api_key=api_key)
+                temp_client = QdrantClient(**_client_kwargs(url, api_key))
                 # Track temporary clients with weakref so they auto-close
                 self._temp_clients.add(temp_client)
                 return temp_client
@@ -197,13 +221,13 @@ def get_qdrant_client(
     
     # Fallback to singleton pattern for backward compatibility
     if force_new:
-        return QdrantClient(url=url, api_key=api_key if api_key else None)
+        return QdrantClient(**_client_kwargs(url, api_key))
     
     global _client
     
     with _client_lock:
         if _client is None:
-            _client = QdrantClient(url=url, api_key=api_key if api_key else None)
+            _client = QdrantClient(**_client_kwargs(url, api_key))
         return _client
 
 

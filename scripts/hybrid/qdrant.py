@@ -17,18 +17,72 @@ import os
 import logging
 import threading
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-# Core Qdrant imports
+# Core Qdrant imports (optional in some runtimes)
 try:
     from qdrant_client import QdrantClient, models
-except ImportError:
+except ImportError:  # pragma: no cover
     QdrantClient = None  # type: ignore
     models = None  # type: ignore
 
+try:
+    from qdrant_client.http.exceptions import ResponseHandlingException
+except ImportError:  # pragma: no cover
+    ResponseHandlingException = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    import httpcore
+except ImportError:
+    httpcore = None  # type: ignore
+
 logger = logging.getLogger("hybrid_qdrant")
+
+
+def _is_timeout_exception(exc: Exception) -> bool:
+    """Detect whether an exception is a Qdrant/http timeout."""
+
+    if ResponseHandlingException and isinstance(exc, ResponseHandlingException):
+        cause = exc.__cause__ or exc.__context__
+        if cause is not None and cause is not exc:
+            return _is_timeout_exception(cause)
+        return "timeout" in str(exc).lower()
+
+    timeout_types = []
+    if httpx is not None:
+        timeout_types.append(getattr(httpx, "TimeoutException", None))
+        timeout_types.append(getattr(httpx, "ReadTimeout", None))
+    if httpcore is not None:
+        timeout_types.append(getattr(httpcore, "TimeoutException", None))
+        timeout_types.append(getattr(httpcore, "ReadTimeout", None))
+
+    for t in timeout_types:
+        if t and isinstance(exc, t):
+            return True
+
+    return isinstance(exc, TimeoutError)
+
+
+def _log_qdrant_timeout(kind: str, collection: Optional[str], detail: Exception) -> None:
+    coll = collection or "(unknown)"
+    logger.warning(
+        "Qdrant %s query timed out for collection %s; returning partial results", kind, coll
+    )
+
+
+def _handle_timeout(kind: str, collection: Optional[str], exc: Exception) -> bool:
+    if _is_timeout_exception(exc):
+        _log_qdrant_timeout(kind, collection, exc)
+        return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Helper functions for safe type conversion
@@ -191,7 +245,9 @@ def _legacy_vector_search(
             query_filter=flt,
         )
         return _coerce_points(getattr(result, "points", result))
-    except Exception:
+    except Exception as exc:
+        if _handle_timeout("legacy", collection, exc):
+            return []
         return []
 
 
@@ -582,6 +638,8 @@ def sparse_lex_query(
         except Exception:
             return []
     except Exception as e:
+        if _handle_timeout("sparse", collection, e):
+            return []
         if os.environ.get("DEBUG_HYBRID_SEARCH"):
             logger.debug("SPARSE_LEX_QUERY_ERROR", extra={"error": str(e)[:200]})
         return []
@@ -648,6 +706,8 @@ def dense_query(
         )
         return _coerce_points(getattr(qp, "points", qp))
     except Exception as e:
+        if _handle_timeout("dense", collection, e):
+            return []
         if os.environ.get("DEBUG_HYBRID_SEARCH"):
             try:
                 logger.debug("QP_FILTER_DROP", extra={"using": vec_name, "reason": str(e)[:200]})
@@ -679,6 +739,8 @@ def dense_query(
                 )
                 return _coerce_points(getattr(qp, "points", qp))
             except Exception as e2:
+                if _handle_timeout("dense", collection, e2):
+                    return []
                 if os.environ.get("DEBUG_HYBRID_SEARCH"):
                     try:
                         logger.debug("QP_FILTER_DROP_FAILED", extra={"using": vec_name, "reason": str(e2)[:200]})
