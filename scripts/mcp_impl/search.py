@@ -295,7 +295,6 @@ async def _repo_search_impl(
     # Session token (top-level or parsed from nested kwargs above)
     sid = (str(session).strip() if session is not None else "")
 
-
     def _to_str(x, default=""):
         if x is None:
             return default
@@ -318,9 +317,11 @@ async def _repo_search_impl(
     rerank_return_m = _to_int(
         rerank_return_m, int(os.environ.get("RERANKER_RETURN_M", "20") or 20)
     )
+    MIN_RERANK_TIMEOUT_MS = int(os.environ.get("RERANK_TIMEOUT_MIN_MS", "10000") or 10000)
     rerank_timeout_ms = _to_int(
         rerank_timeout_ms, int(os.environ.get("RERANKER_TIMEOUT_MS", "3000") or 3000)
     )
+    rerank_timeout_ms = max(rerank_timeout_ms, MIN_RERANK_TIMEOUT_MS)
     highlight_snippet = _to_bool(highlight_snippet, True)
 
     # Resolve collection and related hints: explicit > per-connection defaults > token defaults > env
@@ -803,11 +804,17 @@ async def _repo_search_impl(
         "error": 0,
         "learning": 0,  # Learning-enabled recursive reranker
     }
+    learning_results = None
     if rerank_enabled:
-        # Check for learning reranker mode (learns from ONNX teacher)
-        use_learning_rerank = str(
-            os.environ.get("RERANK_LEARNING", "")
+        # Determine whether in-process rerankers are allowed
+        use_rerank_inproc = str(
+            os.environ.get("RERANK_IN_PROCESS", "")
         ).strip().lower() in {"1", "true", "yes", "on"}
+
+        # Learning reranker only runs when in-process rerank is enabled
+        use_learning_rerank = use_rerank_inproc and (
+            str(os.environ.get("RERANK_LEARNING", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        )
 
         if use_learning_rerank and json_lines:
             try:
@@ -870,16 +877,10 @@ async def _repo_search_impl(
                         tmp.append(item)
 
                     if tmp:
-                        results = tmp
-                        used_rerank = True
-                        rerank_counters["learning"] += 1
+                        learning_results = tmp
             except Exception as e:
                 logger.debug(f"Suppressed exception: {e}")  # Fall through to standard reranking
 
-        # Resolve in-process gating once and reuse
-        use_rerank_inproc = str(
-            os.environ.get("RERANK_IN_PROCESS", "")
-        ).strip().lower() in {"1", "true", "yes", "on"}
         # Prefer fusion-aware reranking over hybrid candidates when available, but only if in-process reranker is enabled
         if use_rerank_inproc and not used_rerank:
             try:
@@ -1140,7 +1141,25 @@ async def _repo_search_impl(
                         _req_ms = _floor_ms
                     _eff_ms = max(_floor_ms, _req_ms)
                     _t_sec = max(0.1, _eff_ms / 1000.0)
-                    rres = await _run_async_fn(rcmd, env=env, timeout=_t_sec)
+                    try:
+                        rres = await _run_async_fn(rcmd, env=env, timeout=_t_sec)
+                    except (asyncio.TimeoutError, ReadTimeout, ResponseHandlingException) as exc:
+                        rerank_counters["timeout"] += 1
+                        logger.warning(
+                            "Rerank subprocess timed out after %sms; falling back to hybrid results",
+                            rerank_timeout_ms,
+                            exc_info=True,
+                        )
+                        rres = {"ok": False, "code": -1, "stdout": "", "stderr": str(exc)}
+                        used_rerank = False
+                    except Exception as exc:
+                        rerank_counters["error"] += 1
+                        logger.warning(
+                            "Rerank subprocess failed; continuing without rerank",
+                            exc_info=True,
+                        )
+                        rres = {"ok": False, "code": -1, "stdout": "", "stderr": str(exc)}
+                        used_rerank = False
                     if os.environ.get("MCP_DEBUG_RERANK", "").strip():
                         logger.debug(
                             "RERANK_RET",
@@ -1247,6 +1266,12 @@ async def _repo_search_impl(
             if _payload:
                 item["payload"] = _payload
             results.append(item)
+
+    # If all rerankers failed but learning rerank produced output, fall back to it now
+    if (not used_rerank) and learning_results:
+        results = learning_results
+        used_rerank = True
+        rerank_counters["learning"] += 1
 
     # Mode-aware reordering: nudge core implementation code vs docs and non-core when requested
     def _is_doc_path(p: str) -> bool:
