@@ -17,7 +17,8 @@ import os
 import logging
 import threading
 import re
-from typing import List, Dict, Any, Tuple, Optional
+import time
+from typing import List, Dict, Any, Tuple, Optional, Callable, TypeVar
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -129,6 +130,10 @@ from scripts.ingest.config import (
 )
 
 EF_SEARCH = _safe_int(os.environ.get("QDRANT_EF_SEARCH", "128"), 128)
+_MAX_QDRANT_CONCURRENCY = max(1, _safe_int(os.environ.get("QDRANT_MAX_CONCURRENCY", "6"), 6))
+_SEMAPHORE_LOG_THRESHOLD = float(os.environ.get("QDRANT_SEMAPHORE_LOG_THRESHOLD", "0.5") or 0.5)
+_QDRANT_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_MAX_QDRANT_CONCURRENCY)
+T = TypeVar("T")
 
 # Quantization search params (for faster search with quantized collections)
 QDRANT_QUANTIZATION = os.environ.get("QDRANT_QUANTIZATION", "none").strip().lower()
@@ -147,6 +152,24 @@ def _get_search_params(ef: int) -> models.SearchParams:
             )
         )
     return models.SearchParams(hnsw_ef=ef)
+
+
+def _with_qdrant_slot(kind: str, fn: Callable[[], T]) -> T:
+    """Serialize Qdrant calls to avoid overload while preserving concurrency."""
+    wait_start = time.perf_counter()
+    _QDRANT_REQUEST_SEMAPHORE.acquire()
+    waited = time.perf_counter() - wait_start
+    if waited >= _SEMAPHORE_LOG_THRESHOLD:
+        logger.debug(
+            "Qdrant %s query waited %.3fs for slot (max=%s)",
+            kind,
+            waited,
+            _MAX_QDRANT_CONCURRENCY,
+        )
+    try:
+        return fn()
+    finally:
+        _QDRANT_REQUEST_SEMAPHORE.release()
 
 
 # ---------------------------------------------------------------------------
@@ -557,25 +580,31 @@ def lex_query(
             except Exception as e:
                 logger.debug(f"Suppressed exception: {e}")
         try:
-            qp = client.query_points(
-                collection_name=collection,
-                query=v,
-                using=LEX_VECTOR_NAME,
-                query_filter=None,
-                search_params=_get_search_params(ef),
-                limit=per_query,
-                with_payload=True,
+            qp = _with_qdrant_slot(
+                "lex",
+                lambda: client.query_points(
+                    collection_name=collection,
+                    query=v,
+                    using=LEX_VECTOR_NAME,
+                    query_filter=None,
+                    search_params=_get_search_params(ef),
+                    limit=per_query,
+                    with_payload=True,
+                ),
             )
             return _coerce_points(getattr(qp, "points", qp))
         except TypeError:
-            qp = client.query_points(
-                collection_name=collection,
-                query=v,
-                using=LEX_VECTOR_NAME,
-                filter=None,
-                search_params=_get_search_params(ef),
-                limit=per_query,
-                with_payload=True,
+            qp = _with_qdrant_slot(
+                "lex",
+                lambda: client.query_points(
+                    collection_name=collection,
+                    query=v,
+                    using=LEX_VECTOR_NAME,
+                    filter=None,
+                    search_params=_get_search_params(ef),
+                    limit=per_query,
+                    with_payload=True,
+                ),
             )
             return _coerce_points(getattr(qp, "points", qp))
         except Exception as e2:
@@ -609,30 +638,36 @@ def sparse_lex_query(
         return []
 
     try:
-        qp = client.query_points(
-            collection_name=collection,
-            query=models.SparseVector(
-                indices=sparse_vec["indices"],
-                values=sparse_vec["values"],
-            ),
-            using=LEX_SPARSE_NAME,
-            query_filter=flt,
-            limit=per_query,
-            with_payload=True,
-        )
-        return _coerce_points(getattr(qp, "points", qp))
-    except TypeError:
-        try:
-            qp = client.query_points(
+        qp = _with_qdrant_slot(
+            "sparse",
+            lambda: client.query_points(
                 collection_name=collection,
                 query=models.SparseVector(
                     indices=sparse_vec["indices"],
                     values=sparse_vec["values"],
                 ),
                 using=LEX_SPARSE_NAME,
-                filter=flt,
+                query_filter=flt,
                 limit=per_query,
                 with_payload=True,
+            ),
+        )
+        return _coerce_points(getattr(qp, "points", qp))
+    except TypeError:
+        try:
+            qp = _with_qdrant_slot(
+                "sparse",
+                lambda: client.query_points(
+                    collection_name=collection,
+                    query=models.SparseVector(
+                        indices=sparse_vec["indices"],
+                        values=sparse_vec["values"],
+                    ),
+                    using=LEX_SPARSE_NAME,
+                    filter=flt,
+                    limit=per_query,
+                    with_payload=True,
+                ),
             )
             return _coerce_points(getattr(qp, "points", qp))
         except Exception:
@@ -682,27 +717,33 @@ def dense_query(
         return []
 
     try:
-        qp = client.query_points(
-            collection_name=collection,
-            query=v,
-            using=vec_name,
-            query_filter=flt,
-            search_params=_get_search_params(ef),
-            limit=per_query,
-            with_payload=True,
+        qp = _with_qdrant_slot(
+            "dense",
+            lambda: client.query_points(
+                collection_name=collection,
+                query=v,
+                using=vec_name,
+                query_filter=flt,
+                search_params=_get_search_params(ef),
+                limit=per_query,
+                with_payload=True,
+            ),
         )
         return _coerce_points(getattr(qp, "points", qp))
     except TypeError:
         if os.environ.get("DEBUG_HYBRID_SEARCH"):
             logger.debug("QP_FILTER_KWARG_SWITCH", extra={"using": vec_name})
-        qp = client.query_points(
-            collection_name=collection,
-            query=v,
-            using=vec_name,
-            filter=flt,
-            search_params=_get_search_params(ef),
-            limit=per_query,
-            with_payload=True,
+        qp = _with_qdrant_slot(
+            "dense",
+            lambda: client.query_points(
+                collection_name=collection,
+                query=v,
+                using=vec_name,
+                filter=flt,
+                search_params=_get_search_params(ef),
+                limit=per_query,
+                with_payload=True,
+            ),
         )
         return _coerce_points(getattr(qp, "points", qp))
     except Exception as e:
@@ -716,26 +757,32 @@ def dense_query(
         if not collection:
             return _legacy_vector_search(client, _collection(), vec_name, v, per_query, flt)
         try:
-            qp = client.query_points(
-                collection_name=collection,
-                query=v,
-                using=vec_name,
-                query_filter=None,
-                search_params=_get_search_params(ef),
-                limit=per_query,
-                with_payload=True,
+            qp = _with_qdrant_slot(
+                "dense",
+                lambda: client.query_points(
+                    collection_name=collection,
+                    query=v,
+                    using=vec_name,
+                    query_filter=None,
+                    search_params=_get_search_params(ef),
+                    limit=per_query,
+                    with_payload=True,
+                ),
             )
             return _coerce_points(getattr(qp, "points", qp))
         except TypeError:
             try:
-                qp = client.query_points(
-                    collection_name=collection,
-                    query=v,
-                    using=vec_name,
-                    filter=None,
-                    search_params=_get_search_params(ef),
-                    limit=per_query,
-                    with_payload=True,
+                qp = _with_qdrant_slot(
+                    "dense",
+                    lambda: client.query_points(
+                        collection_name=collection,
+                        query=v,
+                        using=vec_name,
+                        filter=None,
+                        search_params=_get_search_params(ef),
+                        limit=per_query,
+                        with_payload=True,
+                    ),
                 )
                 return _coerce_points(getattr(qp, "points", qp))
             except Exception as e2:
