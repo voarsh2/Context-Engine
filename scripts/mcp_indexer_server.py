@@ -1431,6 +1431,7 @@ async def symbol_graph(
     language: Any = None,
     under: Any = None,
     repo: Any = None,
+    collection: Any = None,
     session: Any = None,
     output_format: Any = None,
     depth: Any = None,
@@ -1451,6 +1452,7 @@ async def symbol_graph(
     - language: str (optional). Filter by programming language.
     - under: str (optional). Filter by path prefix.
     - repo: str (optional). Filter by repository name. Use "*" to search all repos.
+    - collection: str (optional). Override the default Qdrant collection.
     - output_format: "json" (default) or "toon" for token-efficient format.
     - depth: int (default 1). Multi-hop traversal depth. 2 = callers of callers, etc.
 
@@ -1480,6 +1482,7 @@ async def symbol_graph(
         language=str(language).strip() if language else None,
         under=str(under).strip() if under else None,
         repo=str(repo).strip() if repo else None,
+        collection=str(collection).strip() if collection else None,
         session=str(session).strip() if session else None,
         ctx=ctx,
         depth=_depth,
