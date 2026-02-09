@@ -520,6 +520,34 @@ class RemoteUploadClient:
         logger.info(f"  source_path: {info['source_path']}")
         logger.info(f"  container_path: {info['container_path']}")
 
+    def _excluded_dirnames(self) -> set:
+        # Keep in sync with standalone_upload_client exclusions.
+        excluded = {
+            "node_modules", "vendor", "dist", "build", "target", "out",
+            ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
+            "__pycache__", ".pytest_cache", ".mypy_cache", ".cache",
+            ".context-engine", ".context-engine-uploader", ".codebase",
+        }
+        dev_remote = os.environ.get("DEV_REMOTE_MODE") == "1" or os.environ.get("REMOTE_UPLOAD_MODE") == "development"
+        if dev_remote:
+            excluded.add("dev-workspace")
+        return excluded
+
+    def _is_ignored_path(self, path: Path) -> bool:
+        """Return True when path is outside workspace or under excluded dirs."""
+        try:
+            workspace_root = Path(self.workspace_path).resolve()
+            rel = path.resolve().relative_to(workspace_root)
+        except Exception:
+            return True
+
+        parts = set(rel.parts)
+        if parts & self._excluded_dirnames():
+            return True
+        if any(p.startswith(".") for p in rel.parts):
+            return True
+        return False
+
     def _get_temp_bundle_dir(self) -> Path:
         """Get or create temporary directory for bundle creation."""
         if not self.temp_dir:
@@ -547,6 +575,8 @@ class RemoteUploadClient:
         }
 
         for path in changed_paths:
+            if self._is_ignored_path(path):
+                continue
             # Resolve to an absolute path for stable cache keys
             try:
                 abs_path = str(path.resolve())
@@ -1297,15 +1327,7 @@ class RemoteUploadClient:
             # Single walk with early pruning similar to standalone client
             ext_suffixes = {str(ext).lower() for ext in idx.CODE_EXTS if str(ext).startswith('.')}
             name_matches = {str(ext) for ext in idx.CODE_EXTS if not str(ext).startswith('.')}
-            dev_remote = os.environ.get("DEV_REMOTE_MODE") == "1" or os.environ.get("REMOTE_UPLOAD_MODE") == "development"
-            excluded = {
-                "node_modules", "vendor", "dist", "build", "target", "out",
-                ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
-                "__pycache__", ".pytest_cache", ".mypy_cache", ".cache",
-                ".context-engine", ".context-engine-uploader", ".codebase"
-            }
-            if dev_remote:
-                excluded.add("dev-workspace")
+            excluded = self._excluded_dirnames()
 
             seen = set()
             for root, dirnames, filenames in os.walk(workspace_path):
@@ -1315,6 +1337,8 @@ class RemoteUploadClient:
                     if filename.startswith('.'):
                         continue
                     candidate = Path(root) / filename
+                    if self._is_ignored_path(candidate):
+                        continue
                     suffix = candidate.suffix.lower()
                     if filename in name_matches or suffix in ext_suffixes:
                         resolved = candidate.resolve()
@@ -1368,13 +1392,13 @@ class RemoteUploadClient:
 
                 # Always check src_path
                 src_path = Path(event.src_path)
-                if idx.CODE_EXTS.get(src_path.suffix.lower(), "unknown") != "unknown":
+                if not self.client._is_ignored_path(src_path) and idx.CODE_EXTS.get(src_path.suffix.lower(), "unknown") != "unknown":
                     paths_to_process.append(src_path)
 
                 # For FileMovedEvent, also process the destination path
                 if hasattr(event, 'dest_path') and event.dest_path:
                     dest_path = Path(event.dest_path)
-                    if idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown") != "unknown":
+                    if not self.client._is_ignored_path(dest_path) and idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown") != "unknown":
                         paths_to_process.append(dest_path)
 
                 if not paths_to_process:
@@ -1413,9 +1437,9 @@ class RemoteUploadClient:
                             self.client.workspace_path,
                             self.client.repo_name
                         )
-                        all_paths = list(set(pending + [
-                            Path(p) for p in cached_file_hashes.keys()
-                        ]))
+                        cached_paths = [Path(p) for p in cached_file_hashes.keys()]
+                        cached_paths = [p for p in cached_paths if not self.client._is_ignored_path(p)]
+                        all_paths = list(set(pending + cached_paths))
                     else:
                         all_paths = pending
 

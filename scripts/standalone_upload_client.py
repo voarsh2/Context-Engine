@@ -730,6 +730,34 @@ class RemoteUploadClient:
         logger.info(f"  source_path: {info['source_path']}")
         logger.info(f"  container_path: {info['container_path']}")
 
+    def _excluded_dirnames(self) -> set:
+        # Keep in sync with get_all_code_files exclusions.
+        excluded = {
+            "node_modules", "vendor", "dist", "build", "target", "out",
+            ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
+            "__pycache__", ".pytest_cache", ".mypy_cache", ".cache",
+            ".context-engine", ".context-engine-uploader", ".codebase",
+        }
+        dev_remote = os.environ.get("DEV_REMOTE_MODE") == "1" or os.environ.get("REMOTE_UPLOAD_MODE") == "development"
+        if dev_remote:
+            excluded.add("dev-workspace")
+        return excluded
+
+    def _is_ignored_path(self, path: Path) -> bool:
+        """Return True when path is outside workspace or under excluded dirs."""
+        try:
+            workspace_root = Path(self.workspace_path).resolve()
+            rel = path.resolve().relative_to(workspace_root)
+        except Exception:
+            return True
+
+        parts = set(rel.parts)
+        if parts & self._excluded_dirnames():
+            return True
+        if any(p.startswith(".") for p in rel.parts):
+            return True
+        return False
+
     def _get_temp_bundle_dir(self) -> Path:
         """Get or create temporary directory for bundle creation."""
         if not self.temp_dir:
@@ -757,6 +785,8 @@ class RemoteUploadClient:
         }
 
         for path in changed_paths:
+            if self._is_ignored_path(path):
+                continue
             try:
                 abs_path = str(path.resolve())
             except Exception:
@@ -1532,13 +1562,13 @@ class RemoteUploadClient:
 
                 # Always check src_path
                 src_path = Path(event.src_path)
-                if detect_language(src_path) != "unknown":
+                if not self.client._is_ignored_path(src_path) and detect_language(src_path) != "unknown":
                     paths_to_process.append(src_path)
 
                 # For FileMovedEvent, also process the destination path
                 if hasattr(event, 'dest_path') and event.dest_path:
                     dest_path = Path(event.dest_path)
-                    if detect_language(dest_path) != "unknown":
+                    if not self.client._is_ignored_path(dest_path) and detect_language(dest_path) != "unknown":
                         paths_to_process.append(dest_path)
 
                 if not paths_to_process:
@@ -1569,9 +1599,11 @@ class RemoteUploadClient:
                 try:
                     # Only include cached paths when deletion-related events occurred
                     if check_deletions:
-                        all_paths = list(set(pending + [
+                        cached_paths = [
                             Path(p) for p in get_all_cached_paths(self.client.repo_name)
-                        ]))
+                        ]
+                        cached_paths = [p for p in cached_paths if not self.client._is_ignored_path(p)]
+                        all_paths = list(set(pending + cached_paths))
                     else:
                         all_paths = pending
                     
@@ -1722,13 +1754,7 @@ class RemoteUploadClient:
             extensionless_names = set(EXTENSIONLESS_FILES.keys())
             # Always exclude dev-workspace to prevent recursive upload loops
             # (upload service creates dev-workspace/<collection>/ which would otherwise get re-uploaded)
-            excluded = {
-                "node_modules", "vendor", "dist", "build", "target", "out",
-                ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
-                "__pycache__", ".pytest_cache", ".mypy_cache", ".cache",
-                ".context-engine", ".context-engine-uploader", ".codebase",
-                "dev-workspace"
-            }
+            excluded = self._excluded_dirnames()
 
             seen = set()
             for root, dirnames, filenames in os.walk(workspace_path):
