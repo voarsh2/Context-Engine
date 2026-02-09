@@ -16,6 +16,7 @@ from scripts.ingest.config import (
     get_collection_name,
 )
 from scripts import workspace_state as _ws
+from scripts.collection_health import clear_indexing_caches as _clear_indexing_caches_impl
 from scripts.ingest.pipeline import index_repo
 from scripts.ingest.pseudo import generate_pseudo_tags
 
@@ -194,17 +195,7 @@ def main():
 
     def _clear_indexing_caches(workspace_root: Path, repo_name: str | None) -> None:
         try:
-            _ws.clear_symbol_cache(workspace_path=str(workspace_root), repo_name=repo_name)
-        except Exception:
-            pass
-        try:
-            if _ws.is_multi_repo_mode() and repo_name:
-                state_dir = _ws._get_repo_state_dir(repo_name)
-                cache_path = state_dir / _ws.CACHE_FILENAME
-            else:
-                cache_path = _ws._get_cache_path(workspace_root)
-            if cache_path.exists():
-                cache_path.unlink()
+            _clear_indexing_caches_impl(str(workspace_root), repo_name=repo_name)
         except Exception:
             pass
 

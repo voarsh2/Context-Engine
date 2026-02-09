@@ -931,8 +931,13 @@ def delete_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], collect
         if not name.endswith("_graph"):
             try:
                 cli.delete_collection(collection_name=f"{name}_graph")
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    print(
+                        f"[indexing_admin] best-effort graph collection delete failed for {name}_graph: {exc}"
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
@@ -961,8 +966,13 @@ def recreate_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], colle
         if not name.endswith("_graph"):
             try:
                 cli.delete_collection(collection_name=f"{name}_graph")
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    print(
+                        f"[indexing_admin] best-effort graph collection delete failed for {name}_graph: {exc}"
+                    )
+                except Exception:
+                    pass
     finally:
         try:
             cli.close()

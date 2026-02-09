@@ -223,6 +223,8 @@ try:
         upsert_file_edges as upsert_graph_edges_for_file,
     )
 except ImportError:
+    # graph_edges_backfill_tick is optional and intentionally left as None to
+    # force callers to explicitly guard long-running backfill behavior.
     graph_edges_backfill_tick = None  # type: ignore[assignment]
 
     def delete_graph_edges_by_path(*_args, **_kwargs) -> int:

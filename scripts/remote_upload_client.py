@@ -522,6 +522,9 @@ class RemoteUploadClient:
 
     def _excluded_dirnames(self) -> set:
         # Keep in sync with standalone_upload_client exclusions.
+        cached = getattr(self, "_excluded_dirnames_cache", None)
+        if cached is not None:
+            return cached
         excluded = {
             "node_modules", "vendor", "dist", "build", "target", "out",
             ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
@@ -531,7 +534,9 @@ class RemoteUploadClient:
         dev_remote = os.environ.get("DEV_REMOTE_MODE") == "1" or os.environ.get("REMOTE_UPLOAD_MODE") == "development"
         if dev_remote:
             excluded.add("dev-workspace")
-        return excluded
+        cached = frozenset(excluded)
+        self._excluded_dirnames_cache = cached
+        return cached
 
     def _is_ignored_path(self, path: Path) -> bool:
         """Return True when path is outside workspace or under excluded dirs."""
@@ -541,8 +546,8 @@ class RemoteUploadClient:
         except Exception:
             return True
 
-        parts = set(rel.parts)
-        if parts & self._excluded_dirnames():
+        dir_parts = set(rel.parts[:-1]) if len(rel.parts) > 1 else set()
+        if dir_parts & self._excluded_dirnames():
             return True
         # Ignore hidden directories anywhere under the workspace, but allow
         # extensionless dotfiles like `.gitignore` that we explicitly support.

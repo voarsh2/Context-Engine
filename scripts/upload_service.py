@@ -87,6 +87,10 @@ except Exception:
     delete_collection_everywhere = None
     copy_collection_qdrant = None
 try:
+    from scripts.qdrant_client_manager import pooled_qdrant_client
+except Exception:
+    pooled_qdrant_client = None
+try:
     from scripts.admin_ui import (
         render_admin_acl,
         render_admin_bootstrap,
@@ -1241,23 +1245,39 @@ async def admin_copy_collection(
     graph_copied: Optional[str] = None
     try:
         if not name.endswith("_graph") and not str(new_name).endswith("_graph"):
-            from qdrant_client import QdrantClient  # type: ignore
-
-            cli = QdrantClient(
-                url=QDRANT_URL,
-                api_key=os.environ.get("QDRANT_API_KEY"),
-                timeout=float(os.environ.get("QDRANT_TIMEOUT", "5") or 5),
-            )
-            try:
-                cli.get_collection(collection_name=f"{new_name}_graph")
-                graph_copied = "1"
-            except Exception:
-                graph_copied = "0"
-            finally:
+            used_pooled = False
+            if pooled_qdrant_client is not None:
                 try:
-                    cli.close()
+                    with pooled_qdrant_client(
+                        url=QDRANT_URL,
+                        api_key=os.environ.get("QDRANT_API_KEY"),
+                    ) as cli:
+                        cli.get_collection(collection_name=f"{new_name}_graph")
+                        graph_copied = "1"
+                        used_pooled = True
                 except Exception:
-                    pass
+                    used_pooled = False
+            if not used_pooled:
+                try:
+                    from qdrant_client import QdrantClient  # type: ignore
+
+                    cli = QdrantClient(
+                        url=QDRANT_URL,
+                        api_key=os.environ.get("QDRANT_API_KEY"),
+                        timeout=float(os.environ.get("QDRANT_TIMEOUT", "5") or 5),
+                    )
+                    try:
+                        cli.get_collection(collection_name=f"{new_name}_graph")
+                        graph_copied = "1"
+                    except Exception:
+                        graph_copied = "0"
+                    finally:
+                        try:
+                            cli.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    graph_copied = "0"
     except Exception:
         graph_copied = None
 

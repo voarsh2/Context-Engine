@@ -227,6 +227,53 @@ def _select_dense_text(
     return text
 
 
+def _sync_graph_edges_best_effort(
+    client: QdrantClient,
+    collection: str,
+    file_path: str,
+    repo: str | None,
+    calls: list[str] | None,
+    imports: list[str] | None,
+) -> None:
+    """Best-effort sync of file-level graph edges. Safe to skip on failure."""
+    enabled = str(os.environ.get("GRAPH_EDGES_ENABLE", "1") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return
+    try:
+        from scripts.ingest.graph_edges import (
+            delete_edges_by_path,
+            ensure_graph_collection,
+            upsert_file_edges,
+        )
+
+        ensure_graph_collection(client, collection)
+        # Important: delete stale edges for this file before upserting the new set.
+        delete_edges_by_path(
+            client,
+            collection,
+            caller_path=str(file_path),
+            repo=repo,
+        )
+        upsert_file_edges(
+            client,
+            collection,
+            caller_path=str(file_path),
+            repo=repo,
+            calls=calls,
+            imports=imports,
+        )
+    except Exception as exc:
+        try:
+            print(f"[graph_edges] best-effort sync failed for {file_path}: {exc}")
+        except Exception:
+            pass
+
+
 def build_information(
     language: str, path: Path, start: int, end: int, first_line: str
 ) -> str:
@@ -655,38 +702,14 @@ def _index_single_file_inner(
         upsert_points(client, collection, points)
         # Optional: materialize file-level graph edges in a companion `<collection>_graph` store.
         # This is an accelerator for symbol_graph callers/importers and is safe to skip on failure.
-        try:
-            enabled = str(os.environ.get("GRAPH_EDGES_ENABLE", "1") or "").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-            if enabled:
-                from scripts.ingest.graph_edges import (
-                    delete_edges_by_path as _delete_edges_by_path,
-                    ensure_graph_collection as _ensure_graph_collection,
-                    upsert_file_edges as _upsert_file_edges,
-                )
-
-                _ensure_graph_collection(client, collection)
-                # Important: delete stale edges for this file before upserting the new set.
-                _delete_edges_by_path(
-                    client,
-                    collection,
-                    caller_path=str(file_path),
-                    repo=repo_tag,
-                )
-                _upsert_file_edges(
-                    client,
-                    collection,
-                    caller_path=str(file_path),
-                    repo=repo_tag,
-                    calls=calls,
-                    imports=imports,
-                )
-        except Exception:
-            pass
+        _sync_graph_edges_best_effort(
+            client,
+            collection,
+            str(file_path),
+            repo_tag,
+            calls,
+            imports,
+        )
         try:
             ws = os.environ.get("WATCH_ROOT") or os.environ.get("WORKSPACE_PATH") or "/work"
             if set_cached_file_hash:
@@ -1402,37 +1425,14 @@ def process_file_with_smart_reindexing(
     if all_points:
         _upsert_points_fn(client, current_collection, all_points)
         # Optional: materialize file-level graph edges (best-effort).
-        try:
-            enabled = str(os.environ.get("GRAPH_EDGES_ENABLE", "1") or "").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-            if enabled:
-                from scripts.ingest.graph_edges import (
-                    delete_edges_by_path as _delete_edges_by_path,
-                    ensure_graph_collection as _ensure_graph_collection,
-                    upsert_file_edges as _upsert_file_edges,
-                )
-
-                _ensure_graph_collection(client, current_collection)
-                _delete_edges_by_path(
-                    client,
-                    current_collection,
-                    caller_path=str(file_path),
-                    repo=per_file_repo,
-                )
-                _upsert_file_edges(
-                    client,
-                    current_collection,
-                    caller_path=str(file_path),
-                    repo=per_file_repo,
-                    calls=calls,
-                    imports=imports,
-                )
-        except Exception:
-            pass
+        _sync_graph_edges_best_effort(
+            client,
+            current_collection,
+            str(file_path),
+            per_file_repo,
+            calls,
+            imports,
+        )
 
     try:
         if set_cached_symbols:

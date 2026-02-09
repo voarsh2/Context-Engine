@@ -114,7 +114,12 @@ def ensure_graph_collection(client: Any, base_collection: str) -> Optional[str]:
                 vectors_config={},
             )
             _GRAPH_VECTOR_MODE[graph_coll] = "none"
-        except Exception:
+        except Exception as vec_exc:
+            logger.debug(
+                "Vector-less creation failed for %s, trying named vector: %s",
+                graph_coll,
+                vec_exc,
+            )
             client.create_collection(
                 collection_name=graph_coll,
                 vectors_config={
@@ -145,7 +150,7 @@ def ensure_graph_collection(client: Any, base_collection: str) -> Optional[str]:
 
 
 def _edge_id(edge_type: str, repo: str, caller_path: str, callee_symbol: str) -> str:
-    key = f"{edge_type}:{repo}:{caller_path}:{callee_symbol}"
+    key = f"{edge_type}\x00{repo}\x00{caller_path}\x00{callee_symbol}"
     return hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()[:32]
 
 

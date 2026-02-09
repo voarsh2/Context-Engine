@@ -501,7 +501,12 @@ def copy_collection_qdrant(
                 qdrant_url=base_url,
                 overwrite=overwrite,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "Best-effort graph collection copy %s_graph -> %s_graph failed: %s",
+                src,
+                dest,
+                exc,
+            )
 
     return dest

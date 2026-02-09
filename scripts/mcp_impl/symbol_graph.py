@@ -24,7 +24,12 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-GRAPH_COLLECTION_SUFFIX = "_graph"
+try:
+    from scripts.ingest.graph_edges import GRAPH_COLLECTION_SUFFIX as _GRAPH_SUFFIX
+except Exception:
+    _GRAPH_SUFFIX = "_graph"
+
+GRAPH_COLLECTION_SUFFIX = _GRAPH_SUFFIX
 _MISSING_GRAPH_COLLECTIONS: set[str] = set()
 
 __all__ = [
@@ -339,10 +344,10 @@ async def _query_graph_edges_collection(
             ]
         )
 
-        def _scroll():
+        def _scroll(_flt=flt):
             return client.scroll(
                 collection_name=graph_coll,
-                scroll_filter=flt,
+                scroll_filter=_flt,
                 limit=max(32, limit * 4),
                 with_payload=True,
                 with_vectors=False,
@@ -384,17 +389,17 @@ async def _query_graph_edges_collection(
         if len(hydrated) >= limit:
             break
 
-        def _scroll_main():
+        def _scroll_main(_p=p, _language=language):
             must = [
                 qmodels.FieldCondition(
-                    key="metadata.path", match=qmodels.MatchValue(value=p)
+                    key="metadata.path", match=qmodels.MatchValue(value=_p)
                 )
             ]
-            if language:
+            if _language:
                 must.append(
                     qmodels.FieldCondition(
                         key="metadata.language",
-                        match=qmodels.MatchValue(value=str(language).lower()),
+                        match=qmodels.MatchValue(value=str(_language).lower()),
                     )
                 )
             return client.scroll(

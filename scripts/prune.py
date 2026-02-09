@@ -49,9 +49,10 @@ def delete_graph_edges_by_path(client: QdrantClient, path_str: str, repo: str | 
     if not path_str:
         return 0
     try:
-        path_str = os.path.normpath(str(path_str)).replace("\\", "/")
+        path_str = os.path.normpath(str(path_str))
     except Exception:
         path_str = str(path_str)
+    path_str = str(path_str).replace("\\", "/")
 
     must = [
         models.FieldCondition(key="caller_path", match=models.MatchValue(value=path_str))
