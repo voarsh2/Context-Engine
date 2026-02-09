@@ -754,7 +754,11 @@ class RemoteUploadClient:
         parts = set(rel.parts)
         if parts & self._excluded_dirnames():
             return True
-        if any(p.startswith(".") for p in rel.parts):
+        # Ignore hidden directories anywhere under the workspace, but allow
+        # extensionless dotfiles like `.gitignore` that we explicitly support.
+        if any(p.startswith(".") for p in rel.parts[:-1]):
+            return True
+        if rel.name.startswith(".") and rel.name.lower() not in EXTENSIONLESS_FILES:
             return True
         return False
 
@@ -1751,7 +1755,7 @@ class RemoteUploadClient:
 
             # Single walk with early pruning and set-based matching to reduce IO
             ext_suffixes = {str(ext).lower() for ext in CODE_EXTS if str(ext).startswith('.')}
-            extensionless_names = set(EXTENSIONLESS_FILES.keys())
+            extensionless_names = {k.lower() for k in EXTENSIONLESS_FILES.keys()}
             # Always exclude dev-workspace to prevent recursive upload loops
             # (upload service creates dev-workspace/<collection>/ which would otherwise get re-uploaded)
             excluded = self._excluded_dirnames()
@@ -1767,6 +1771,8 @@ class RemoteUploadClient:
                     if filename.startswith('.') and fname_lower not in extensionless_names:
                         continue
                     candidate = Path(root) / filename
+                    if self._is_ignored_path(candidate):
+                        continue
                     suffix = candidate.suffix.lower()
                     # Match by extension, extensionless name, or Dockerfile.* prefix
                     if (suffix in ext_suffixes or

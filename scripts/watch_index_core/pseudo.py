@@ -49,12 +49,21 @@ def _start_pseudo_backfill_worker(
         max_points = 256
     if max_points <= 0:
         max_points = 1
+    try:
+        graph_max_files = int(
+            os.environ.get("GRAPH_EDGES_BACKFILL_MAX_FILES", "128") or 128
+        )
+    except Exception:
+        graph_max_files = 128
+    if graph_max_files <= 0:
+        graph_max_files = 1
 
     shutdown_event = threading.Event()
 
     def _worker() -> None:
         while not shutdown_event.is_set():
             try:
+                graph_backfill_enabled = get_boolean_env("GRAPH_EDGES_BACKFILL")
                 try:
                     mappings = get_collection_mappings(search_root=str(ROOT))
                 except Exception:
@@ -90,31 +99,34 @@ def _start_pseudo_backfill_worker(
                                     "[pseudo_backfill] repo=%s collection=%s processed=%d",
                                     repo_name or "default", coll, processed,
                                 )
-                            # Optional: backfill graph edge collection from main points.
-                            # Controlled separately because it may scan large collections over time.
-                            if get_boolean_env("GRAPH_EDGES_BACKFILL"):
-                                try:
+                        # Optional: backfill graph edge collection from main points.
+                        # Controlled separately because it may scan large collections over time.
+                        # Run under its own lock to avoid blocking pseudo/tag backfill workers.
+                        if graph_backfill_enabled:
+                            try:
+                                graph_lock_path = state_dir / "graph_edges.lock"
+                                with _cross_process_lock(graph_lock_path):
                                     files_done = idx.graph_edges_backfill_tick(
                                         client,
                                         coll,
                                         repo_name=repo_name,
-                                        max_files=max_points,
+                                        max_files=graph_max_files,
                                     )
-                                    if files_done:
-                                        logger.info(
-                                            "[graph_backfill] repo=%s collection=%s files=%d",
-                                            repo_name or "default",
-                                            coll,
-                                            files_done,
-                                        )
-                                except Exception as exc:
-                                    logger.error(
-                                        "[graph_backfill] error repo=%s collection=%s: %s",
+                                if files_done:
+                                    logger.info(
+                                        "[graph_backfill] repo=%s collection=%s files=%d",
                                         repo_name or "default",
                                         coll,
-                                        exc,
-                                        exc_info=True,
+                                        files_done,
                                     )
+                            except Exception as exc:
+                                logger.error(
+                                    "[graph_backfill] error repo=%s collection=%s: %s",
+                                    repo_name or "default",
+                                    coll,
+                                    exc,
+                                    exc_info=True,
+                                )
                     except Exception as exc:
                         logger.error(
                             "[pseudo_backfill] error repo=%s collection=%s: %s",

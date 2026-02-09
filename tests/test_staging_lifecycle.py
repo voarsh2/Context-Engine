@@ -698,7 +698,9 @@ def test_spawn_ingest_code_without_overrides_uses_system_env(monkeypatch: pytest
     env = captured["env"]
     assert env["BASE_ONLY"] == "system"
     assert env["COLLECTION_NAME"] == "primary-coll"
-    assert "CTXCE_FORCE_COLLECTION_NAME" not in env
+    # Admin-spawned ingests should never enumerate `/work/*` in multi-repo mode;
+    # force exact collection/root handling even when no explicit overrides are provided.
+    assert env.get("CTXCE_FORCE_COLLECTION_NAME") == "1"
 
 
 def test_promote_pending_env_without_pending_config(staging_workspace: dict):

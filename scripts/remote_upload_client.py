@@ -544,7 +544,15 @@ class RemoteUploadClient:
         parts = set(rel.parts)
         if parts & self._excluded_dirnames():
             return True
-        if any(p.startswith(".") for p in rel.parts):
+        # Ignore hidden directories anywhere under the workspace, but allow
+        # extensionless dotfiles like `.gitignore` that we explicitly support.
+        if any(p.startswith(".") for p in rel.parts[:-1]):
+            return True
+        try:
+            extensionless = set((idx.EXTENSIONLESS_FILES or {}).keys())
+        except Exception:
+            extensionless = set()
+        if rel.name.startswith(".") and rel.name.lower() not in extensionless:
             return True
         return False
 
@@ -1326,7 +1334,10 @@ class RemoteUploadClient:
 
             # Single walk with early pruning similar to standalone client
             ext_suffixes = {str(ext).lower() for ext in idx.CODE_EXTS if str(ext).startswith('.')}
-            name_matches = {str(ext) for ext in idx.CODE_EXTS if not str(ext).startswith('.')}
+            try:
+                extensionless_names = {k.lower() for k in (idx.EXTENSIONLESS_FILES or {}).keys()}
+            except Exception:
+                extensionless_names = set()
             excluded = self._excluded_dirnames()
 
             seen = set()
@@ -1334,13 +1345,19 @@ class RemoteUploadClient:
                 dirnames[:] = [d for d in dirnames if d not in excluded and not d.startswith('.')]
 
                 for filename in filenames:
-                    if filename.startswith('.'):
+                    # Allow dotfiles that are in EXTENSIONLESS_FILES (e.g., .gitignore)
+                    fname_lower = filename.lower()
+                    if filename.startswith('.') and fname_lower not in extensionless_names:
                         continue
                     candidate = Path(root) / filename
                     if self._is_ignored_path(candidate):
                         continue
                     suffix = candidate.suffix.lower()
-                    if filename in name_matches or suffix in ext_suffixes:
+                    if (
+                        suffix in ext_suffixes
+                        or fname_lower in extensionless_names
+                        or fname_lower.startswith("dockerfile")
+                    ):
                         resolved = candidate.resolve()
                         if resolved not in seen:
                             seen.add(resolved)

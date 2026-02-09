@@ -67,6 +67,7 @@ def _edge_vector_for_upsert(graph_collection: str) -> dict:
 def ensure_graph_collection(client: Any, base_collection: str) -> Optional[str]:
     """Ensure `<base_collection>_graph` exists and has payload indexes."""
     from qdrant_client import models as qmodels
+    from qdrant_client.http.exceptions import UnexpectedResponse
 
     if not base_collection:
         return None
@@ -91,8 +92,19 @@ def ensure_graph_collection(client: Any, base_collection: str) -> Optional[str]:
         _ENSURED_GRAPH_COLLECTIONS.add(graph_coll)
         _MISSING_GRAPH_COLLECTIONS.discard(graph_coll)
         return graph_coll
-    except Exception:
-        pass
+    except UnexpectedResponse as e:
+        # Only a 404 means "missing"; any other HTTP failure should be visible.
+        if getattr(e, "status_code", None) != 404:
+            logger.exception(
+                "Failed to get graph collection %s (status=%s): %s",
+                graph_coll,
+                getattr(e, "status_code", None),
+                e,
+            )
+            return None
+    except Exception as e:
+        logger.exception("Failed to get graph collection %s: %s", graph_coll, e)
+        return None
 
     try:
         # Prefer vector-less collection when supported by server/client.
@@ -298,17 +310,34 @@ def graph_edges_backfill_tick(
     # We may need to overscan because the main collection is chunked.
     overscan = max_files * 8
     while processed_files < max_files:
-        try:
-            points, next_offset = client.scroll(
-                collection_name=base_collection,
-                scroll_filter=flt,
-                limit=min(64, overscan),
-                with_payload=True,
-                with_vectors=False,
-                offset=next_offset,
-            )
-        except Exception:
-            break
+        attempts = 0
+        while True:
+            try:
+                points, next_offset = client.scroll(
+                    collection_name=base_collection,
+                    scroll_filter=flt,
+                    limit=min(64, overscan),
+                    with_payload=True,
+                    with_vectors=False,
+                    offset=next_offset,
+                )
+                break
+            except Exception as e:
+                attempts += 1
+                logger.exception(
+                    "Graph edge backfill scroll failed (collection=%s repo=%s offset=%s attempt=%d): %s",
+                    base_collection,
+                    repo_name or "default",
+                    next_offset,
+                    attempts,
+                    e,
+                )
+                # Retry a couple times for transient errors, then raise so failures are not silent.
+                if attempts >= 3:
+                    raise
+                import time
+
+                time.sleep(0.25 * (2 ** (attempts - 1)))
 
         if not points:
             break
