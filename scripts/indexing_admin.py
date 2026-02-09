@@ -996,12 +996,9 @@ def spawn_ingest_code(
                 env.pop(k, None)
             else:
                 env[str(k)] = str(v)
-        # When we provide env overrides for a run (e.g. staging rebuild), we also want to
-        # force ingest_code to honor the explicit COLLECTION_NAME instead of routing based
-        # on per-repo state/serving_collection in multi-repo mode.
-        # CTXCE_FORCE_COLLECTION_NAME is only used for these subprocess runs; normal watcher
-        # and indexer flows do not set it.
-        env["CTXCE_FORCE_COLLECTION_NAME"] = "1"  # Force ingest_code to use COLLECTION_NAME for staging/pending env overrides
+    # For admin-triggered subprocess runs (recreate/reindex/staging), force ingest_code to
+    # honor explicit COLLECTION_NAME and avoid multi-repo enumeration.
+    env["CTXCE_FORCE_COLLECTION_NAME"] = "1"
     env["COLLECTION_NAME"] = collection
     env["WATCH_ROOT"] = work_dir
     env["WORKSPACE_PATH"] = work_dir

@@ -15,6 +15,7 @@ from scripts.ingest.config import (
     is_multi_repo_mode,
     get_collection_name,
 )
+from scripts import workspace_state as _ws
 from scripts.ingest.pipeline import index_repo
 from scripts.ingest.pseudo import generate_pseudo_tags
 
@@ -39,6 +40,11 @@ def parse_args():
         "--no-skip-unchanged",
         action="store_true",
         help="Do not skip files whose content hash matches existing index",
+    )
+    parser.add_argument(
+        "--clear-indexing-caches",
+        action="store_true",
+        help="Clear local indexing caches (file hash/symbol caches) before indexing",
     )
     parser.add_argument(
         "--schema-mode",
@@ -186,13 +192,35 @@ def main():
         )
         return
 
+    def _clear_indexing_caches(workspace_root: Path, repo_name: str | None) -> None:
+        try:
+            _ws.clear_symbol_cache(workspace_path=str(workspace_root), repo_name=repo_name)
+        except Exception:
+            pass
+        try:
+            if _ws.is_multi_repo_mode() and repo_name:
+                state_dir = _ws._get_repo_state_dir(repo_name)
+                cache_path = state_dir / _ws.CACHE_FILENAME
+            else:
+                cache_path = _ws._get_cache_path(workspace_root)
+            if cache_path.exists():
+                cache_path.unlink()
+        except Exception:
+            pass
+
     qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:6333")
     api_key = os.environ.get("QDRANT_API_KEY")
     collection = os.environ.get("COLLECTION_NAME") or os.environ.get("DEFAULT_COLLECTION") or "codebase"
     model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
 
     # Resolve collection name based on multi-repo mode
-    multi_repo = bool(is_multi_repo_mode and is_multi_repo_mode())
+    force_collection = (os.environ.get("CTXCE_FORCE_COLLECTION_NAME") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    multi_repo = bool(is_multi_repo_mode and is_multi_repo_mode()) and not force_collection
     if multi_repo:
         print("[multi_repo] Multi-repo mode enabled - will create separate collections per repository")
 
@@ -231,6 +259,9 @@ def main():
             if not repo_collection:
                 repo_collection = "codebase"
 
+            if args.clear_indexing_caches:
+                _clear_indexing_caches(root_path, repo_name)
+
             index_repo(
                 repo_root,
                 qdrant_url,
@@ -249,7 +280,7 @@ def main():
             try:
                 resolved = get_collection_name(str(Path(args.root).resolve()))
                 placeholders = {"", "default-collection", "my-collection", "codebase"}
-                if resolved and collection in placeholders:
+                if resolved and collection in placeholders and not force_collection:
                     collection = resolved
             except Exception:
                 pass
@@ -259,6 +290,9 @@ def main():
 
     flag = (os.environ.get("PSEUDO_DEFER_TO_WORKER") or "").strip().lower()
     pseudo_mode = "off" if flag in {"1", "true", "yes", "on"} else "full"
+
+    if args.clear_indexing_caches:
+        _clear_indexing_caches(Path(args.root).resolve(), None)
 
     index_repo(
         Path(args.root).resolve(),
