@@ -39,26 +39,33 @@ def delete_by_path(client: QdrantClient, path_str: str) -> int:
         return 0
 
 
-def delete_graph_edges_by_path(client: QdrantClient, path_str: str) -> int:
+def delete_graph_edges_by_path(client: QdrantClient, path_str: str, repo: str | None = None) -> int:
     """Best-effort deletion for graph-edge collections (if present).
 
     Some deployments store symbol-graph edges in a separate Qdrant collection
-    (commonly `${COLLECTION}_graph`). Those points may reference a file path as
-    either caller or callee; delete both to prevent stale graph results.
+    (commonly `${COLLECTION}_graph`). On this branch, edge docs are file-level and
+    reference a file path as `caller_path`.
     """
     if not path_str:
         return 0
+    try:
+        path_str = os.path.normpath(str(path_str)).replace("\\", "/")
+    except Exception:
+        path_str = str(path_str)
 
-    flt = models.Filter(
-        should=[
-            models.FieldCondition(
-                key="caller_path", match=models.MatchValue(value=path_str)
-            ),
-            models.FieldCondition(
-                key="callee_path", match=models.MatchValue(value=path_str)
-            ),
-        ]
-    )
+    must = [
+        models.FieldCondition(key="caller_path", match=models.MatchValue(value=path_str))
+    ]
+    if repo:
+        try:
+            r = str(repo).strip()
+        except Exception:
+            r = ""
+        if r and r != "*":
+            must.append(
+                models.FieldCondition(key="repo", match=models.MatchValue(value=r))
+            )
+    flt = models.Filter(must=must)
     try:
         res = client.delete(
             collection_name=GRAPH_COLLECTION,
@@ -116,13 +123,13 @@ def main():
             )
             if not abs_path.exists():
                 removed_missing += delete_by_path(client, path_str)
-                removed_graph_edges += delete_graph_edges_by_path(client, path_str)
+                removed_graph_edges += delete_graph_edges_by_path(client, path_str, md.get("repo"))
                 print(f"[prune] removed missing file points: {path_str}")
                 continue
             current_hash = sha1_file(abs_path)
             if file_hash and current_hash and current_hash != file_hash:
                 removed_mismatch += delete_by_path(client, path_str)
-                removed_graph_edges += delete_graph_edges_by_path(client, path_str)
+                removed_graph_edges += delete_graph_edges_by_path(client, path_str, md.get("repo"))
                 print(f"[prune] removed outdated points (hash mismatch): {path_str}")
 
         if next_page is None:

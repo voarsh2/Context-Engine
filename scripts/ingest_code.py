@@ -212,6 +212,24 @@ from scripts.ingest.pipeline import (
     index_repo,
     process_file_with_smart_reindexing,
 )
+
+# ---------------------------------------------------------------------------
+# Graph edges (optional accelerator)
+# ---------------------------------------------------------------------------
+try:
+    from scripts.ingest.graph_edges import (
+        graph_edges_backfill_tick,
+        delete_edges_by_path as delete_graph_edges_by_path,
+        upsert_file_edges as upsert_graph_edges_for_file,
+    )
+except ImportError:
+    graph_edges_backfill_tick = None  # type: ignore[assignment]
+
+    def delete_graph_edges_by_path(*_args, **_kwargs) -> int:
+        return 0
+
+    def upsert_graph_edges_for_file(*_args, **_kwargs) -> int:
+        return 0
 # ---------------------------------------------------------------------------
 # Re-exports from ingest/cli.py
 # ---------------------------------------------------------------------------
@@ -338,6 +356,10 @@ __all__ = [
     "index_repo",
     "process_file_with_smart_reindexing",
     "pseudo_backfill_tick",
+    # Graph edges (optional)
+    "graph_edges_backfill_tick",
+    "delete_graph_edges_by_path",
+    "upsert_graph_edges_for_file",
     # CLI
     "main",
     # Backward compat

@@ -542,6 +542,54 @@ def test_admin_staging_endpoints_exercise_http_layer(monkeypatch: pytest.MonkeyP
     assert calls["abort"] == 1
 
 
+def test_admin_copy_endpoint_reports_graph_clone_in_redirect(monkeypatch: pytest.MonkeyPatch):
+    import sys
+    import types
+    from urllib.parse import parse_qs, urlparse
+
+    from scripts import upload_service
+
+    monkeypatch.setattr(upload_service, "AUTH_ENABLED", True)
+    monkeypatch.setattr(upload_service, "_require_admin_session", lambda request: {"user_id": "admin"})
+    monkeypatch.setattr(upload_service, "WORK_DIR", "/fake/work")
+    monkeypatch.setenv("WORK_DIR", "/fake/work")
+
+    def fake_copy_collection_qdrant(**kwargs):
+        assert kwargs.get("source") == "src"
+        assert kwargs.get("target") == "dst"
+        return "dst"
+
+    monkeypatch.setattr(upload_service, "copy_collection_qdrant", fake_copy_collection_qdrant)
+
+    class _FakeQdrantClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_collection(self, collection_name: str):
+            if collection_name == "dst_graph":
+                return {"name": collection_name}
+            raise RuntimeError("not found")
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "qdrant_client", types.SimpleNamespace(QdrantClient=_FakeQdrantClient))
+
+    client = TestClient(upload_service.app)
+    resp = client.post(
+        "/admin/staging/copy",
+        data={"collection": "src", "target": "dst", "overwrite": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    loc = resp.headers.get("location") or ""
+    parsed = urlparse(loc)
+    qs = parse_qs(parsed.query)
+    assert qs.get("copied") == ["src"]
+    assert qs.get("new") == ["dst"]
+    assert qs.get("graph_copied") == ["1"]
+
+
 def test_watcher_collection_resolution_prefers_serving_state_when_staging_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from scripts.watch_index_core import utils as watch_utils
 

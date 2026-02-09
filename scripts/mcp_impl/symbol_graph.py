@@ -24,6 +24,9 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+GRAPH_COLLECTION_SUFFIX = "_graph"
+_MISSING_GRAPH_COLLECTIONS: set[str] = set()
+
 __all__ = [
     "_symbol_graph_impl",
     "_format_symbol_graph_toon",
@@ -195,16 +198,28 @@ async def _symbol_graph_impl(
 
     try:
         if query_type == "callers":
-            # Find chunks where metadata.calls array contains the symbol (exact match)
-            results = await _query_array_field(
+            # Prefer graph edges collection when available (fast keyword filters).
+            results = await _query_graph_edges_collection(
                 client=client,
                 collection=coll,
-                field_key="metadata.calls",
-                value=symbol,
+                symbol=symbol,
+                edge_type="calls",
                 limit=limit,
                 language=language,
+                repo_filter=None,
                 under=_norm_under(under),
             )
+            if not results:
+                # Fall back to array field lookup in the main collection.
+                results = await _query_array_field(
+                    client=client,
+                    collection=coll,
+                    field_key="metadata.calls",
+                    value=symbol,
+                    limit=limit,
+                    language=language,
+                    under=_norm_under(under),
+                )
         elif query_type == "definition":
             # Find chunks where symbol_path matches the symbol
             results = await _query_definition(
@@ -216,16 +231,27 @@ async def _symbol_graph_impl(
                 under=_norm_under(under),
             )
         elif query_type == "importers":
-            # Find chunks where metadata.imports array contains the symbol
-            results = await _query_array_field(
+            results = await _query_graph_edges_collection(
                 client=client,
                 collection=coll,
-                field_key="metadata.imports",
-                value=symbol,
+                symbol=symbol,
+                edge_type="imports",
                 limit=limit,
                 language=language,
+                repo_filter=None,
                 under=_norm_under(under),
             )
+            if not results:
+                # Fall back to array field lookup in the main collection.
+                results = await _query_array_field(
+                    client=client,
+                    collection=coll,
+                    field_key="metadata.imports",
+                    value=symbol,
+                    limit=limit,
+                    language=language,
+                    under=_norm_under(under),
+                )
 
         # If no results, fall back to semantic search
         if not results:
@@ -257,6 +283,153 @@ async def _symbol_graph_impl(
         "count": len(results),
         "collection": coll,
     }
+
+
+async def _query_graph_edges_collection(
+    client: Any,
+    collection: str,
+    symbol: str,
+    edge_type: str,
+    limit: int,
+    language: Optional[str] = None,
+    repo_filter: str | None = None,
+    under: str | None = None,
+) -> List[Dict[str, Any]]:
+    """Query `<collection>_graph` and hydrate results from the main collection.
+
+    The graph collection stores file-level edges:
+    - caller_path -> callee_symbol (calls/imports)
+    """
+    from qdrant_client import models as qmodels
+
+    graph_coll = f"{collection}{GRAPH_COLLECTION_SUFFIX}"
+    if graph_coll in _MISSING_GRAPH_COLLECTIONS:
+        return []
+
+    # Build graph filter
+    must: list[Any] = [
+        qmodels.FieldCondition(
+            key="edge_type", match=qmodels.MatchValue(value=str(edge_type))
+        )
+    ]
+    if repo_filter:
+        rf = str(repo_filter).strip()
+        if rf and rf != "*":
+            must.append(
+                qmodels.FieldCondition(key="repo", match=qmodels.MatchValue(value=rf))
+            )
+
+    # Try exact match, then symbol variants.
+    callee_variants = _symbol_variants(symbol) or [symbol]
+    seen_paths: set[str] = set()
+    caller_paths: List[str] = []
+
+    for variant in callee_variants:
+        if len(caller_paths) >= limit:
+            break
+        v = str(variant).strip()
+        if not v:
+            continue
+        flt = qmodels.Filter(
+            must=must
+            + [
+                qmodels.FieldCondition(
+                    key="callee_symbol", match=qmodels.MatchValue(value=v)
+                )
+            ]
+        )
+
+        def _scroll():
+            return client.scroll(
+                collection_name=graph_coll,
+                scroll_filter=flt,
+                limit=max(32, limit * 4),
+                with_payload=True,
+                with_vectors=False,
+            )
+
+        try:
+            points, _ = await asyncio.to_thread(_scroll)
+        except Exception as e:
+            err = str(e).lower()
+            if "404" in err or "doesn't exist" in err or "not found" in err:
+                _MISSING_GRAPH_COLLECTIONS.add(graph_coll)
+                return []
+            logger.exception(
+                "_query_graph_edges_collection scroll failed for %s", graph_coll
+            )
+            raise
+
+        for rec in points or []:
+            payload = getattr(rec, "payload", None) or {}
+            p = payload.get("caller_path") or ""
+            if not p:
+                continue
+            path_s = str(p)
+            if under and not str(path_s).startswith(str(under)):
+                continue
+            if path_s in seen_paths:
+                continue
+            seen_paths.add(path_s)
+            caller_paths.append(path_s)
+            if len(caller_paths) >= limit:
+                break
+
+    if not caller_paths:
+        return []
+
+    # Hydrate caller paths back into normal symbol_graph point-shaped results.
+    hydrated: List[Dict[str, Any]] = []
+    for p in caller_paths[:limit]:
+        if len(hydrated) >= limit:
+            break
+
+        def _scroll_main():
+            must = [
+                qmodels.FieldCondition(
+                    key="metadata.path", match=qmodels.MatchValue(value=p)
+                )
+            ]
+            if language:
+                must.append(
+                    qmodels.FieldCondition(
+                        key="metadata.language",
+                        match=qmodels.MatchValue(value=str(language).lower()),
+                    )
+                )
+            return client.scroll(
+                collection_name=collection,
+                scroll_filter=qmodels.Filter(
+                    must=must
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+        try:
+            pts, _ = await asyncio.to_thread(_scroll_main)
+        except Exception:
+            pts = []
+
+        if pts:
+            hydrated.append(_format_point(pts[0]))
+        else:
+            # If language filtering was requested but no matching main-collection doc
+            # exists (or hydration failed), skip returning a placeholder to avoid
+            # producing language-inconsistent results.
+            if not language:
+                hydrated.append(
+                    {
+                        "path": p,
+                        "symbol": "",
+                        "symbol_path": "",
+                        "start_line": 0,
+                        "end_line": 0,
+                    }
+                )
+
+    return hydrated
 
 
 async def _query_array_field(

@@ -653,6 +653,40 @@ def _index_single_file_inner(
             for i, v, lx, m, lt, ct in zip(batch_ids, vectors, batch_lex, batch_meta, batch_lex_text, batch_code)
         ]
         upsert_points(client, collection, points)
+        # Optional: materialize file-level graph edges in a companion `<collection>_graph` store.
+        # This is an accelerator for symbol_graph callers/importers and is safe to skip on failure.
+        try:
+            enabled = str(os.environ.get("GRAPH_EDGES_ENABLE", "1") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if enabled:
+                from scripts.ingest.graph_edges import (
+                    delete_edges_by_path as _delete_edges_by_path,
+                    ensure_graph_collection as _ensure_graph_collection,
+                    upsert_file_edges as _upsert_file_edges,
+                )
+
+                _ensure_graph_collection(client, collection)
+                # Important: delete stale edges for this file before upserting the new set.
+                _delete_edges_by_path(
+                    client,
+                    collection,
+                    caller_path=str(file_path),
+                    repo=repo_tag,
+                )
+                _upsert_file_edges(
+                    client,
+                    collection,
+                    caller_path=str(file_path),
+                    repo=repo_tag,
+                    calls=calls,
+                    imports=imports,
+                )
+        except Exception:
+            pass
         try:
             ws = os.environ.get("WATCH_ROOT") or os.environ.get("WORKSPACE_PATH") or "/work"
             if set_cached_file_hash:
@@ -1367,6 +1401,38 @@ def process_file_with_smart_reindexing(
 
     if all_points:
         _upsert_points_fn(client, current_collection, all_points)
+        # Optional: materialize file-level graph edges (best-effort).
+        try:
+            enabled = str(os.environ.get("GRAPH_EDGES_ENABLE", "1") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if enabled:
+                from scripts.ingest.graph_edges import (
+                    delete_edges_by_path as _delete_edges_by_path,
+                    ensure_graph_collection as _ensure_graph_collection,
+                    upsert_file_edges as _upsert_file_edges,
+                )
+
+                _ensure_graph_collection(client, current_collection)
+                _delete_edges_by_path(
+                    client,
+                    current_collection,
+                    caller_path=str(file_path),
+                    repo=per_file_repo,
+                )
+                _upsert_file_edges(
+                    client,
+                    current_collection,
+                    caller_path=str(file_path),
+                    repo=per_file_repo,
+                    calls=calls,
+                    imports=imports,
+                )
+        except Exception:
+            pass
 
     try:
         if set_cached_symbols:

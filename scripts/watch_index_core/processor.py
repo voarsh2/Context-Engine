@@ -251,6 +251,15 @@ def _process_paths(
             if client is not None:
                 try:
                     idx.delete_points_by_path(client, collection, str(p))
+                    try:
+                        idx.delete_graph_edges_by_path(
+                            client,
+                            collection,
+                            caller_path=str(p),
+                            repo=repo_name,
+                        )
+                    except Exception:
+                        pass
                     safe_print(f"[deleted] {p} -> {collection}")
                 except Exception:
                     pass

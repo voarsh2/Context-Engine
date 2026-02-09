@@ -927,6 +927,12 @@ def delete_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], collect
         return
     try:
         cli.delete_collection(collection_name=name)
+        # Best-effort: also delete companion graph edges collection when present.
+        if not name.endswith("_graph"):
+            try:
+                cli.delete_collection(collection_name=f"{name}_graph")
+            except Exception:
+                pass
     except Exception:
         pass
     finally:
@@ -951,6 +957,12 @@ def recreate_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], colle
             cli.delete_collection(collection_name=name)
         except Exception as delete_error:
             raise RuntimeError(f"Failed to delete existing collection '{name}' in Qdrant: {delete_error}") from delete_error
+        # Best-effort: also delete companion graph edges collection when present.
+        if not name.endswith("_graph"):
+            try:
+                cli.delete_collection(collection_name=f"{name}_graph")
+            except Exception:
+                pass
     finally:
         try:
             cli.close()

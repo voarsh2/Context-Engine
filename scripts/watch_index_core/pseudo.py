@@ -90,6 +90,31 @@ def _start_pseudo_backfill_worker(
                                     "[pseudo_backfill] repo=%s collection=%s processed=%d",
                                     repo_name or "default", coll, processed,
                                 )
+                            # Optional: backfill graph edge collection from main points.
+                            # Controlled separately because it may scan large collections over time.
+                            if get_boolean_env("GRAPH_EDGES_BACKFILL"):
+                                try:
+                                    files_done = idx.graph_edges_backfill_tick(
+                                        client,
+                                        coll,
+                                        repo_name=repo_name,
+                                        max_files=max_points,
+                                    )
+                                    if files_done:
+                                        logger.info(
+                                            "[graph_backfill] repo=%s collection=%s files=%d",
+                                            repo_name or "default",
+                                            coll,
+                                            files_done,
+                                        )
+                                except Exception as exc:
+                                    logger.error(
+                                        "[graph_backfill] error repo=%s collection=%s: %s",
+                                        repo_name or "default",
+                                        coll,
+                                        exc,
+                                        exc_info=True,
+                                    )
                     except Exception as exc:
                         logger.error(
                             "[pseudo_backfill] error repo=%s collection=%s: %s",
@@ -110,4 +135,3 @@ def _start_pseudo_backfill_worker(
 
 
 __all__ = ["_start_pseudo_backfill_worker"]
-

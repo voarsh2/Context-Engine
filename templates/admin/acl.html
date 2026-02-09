@@ -1,6 +1,32 @@
 {% extends "admin/base.html" %}
 
 {% block content %}
+  {% set qp = request.query_params %}
+  {% if qp and ((qp.get("copied") and qp.get("new")) or qp.get("deleted")) %}
+    <div class="card">
+      {% if qp.get("copied") and qp.get("new") %}
+        <div>
+          Copied collection <code>{{ qp.get("copied") }}</code> → <code>{{ qp.get("new") }}</code>.
+          {% if qp.get("graph_copied") == "1" %}
+            <span class="muted">(graph clone copied)</span>
+          {% elif qp.get("graph_copied") == "0" %}
+            <span class="muted">(graph clone not copied; will rebuild/backfill)</span>
+          {% endif %}
+        </div>
+      {% endif %}
+      {% if qp.get("deleted") %}
+        <div>
+          Deleted collection <code>{{ qp.get("deleted") }}</code>.
+          {% if qp.get("graph_deleted") == "1" %}
+            <span class="muted">(graph clone deleted)</span>
+          {% elif qp.get("graph_deleted") == "0" %}
+            <span class="muted">(graph clone not deleted or missing)</span>
+          {% endif %}
+        </div>
+      {% endif %}
+    </div>
+  {% endif %}
+
   <div class="card" data-staging-enabled="{{ '1' if staging_enabled else '0' }}">
     <h2>Users</h2>
 

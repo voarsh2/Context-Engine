@@ -53,6 +53,29 @@ def test_admin_role_gate_blocks_non_admin(monkeypatch):
 
 
 @pytest.mark.unit
+def test_delete_redirect_includes_graph_deleted_param(monkeypatch):
+    monkeypatch.setenv("CTXCE_AUTH_ENABLED", "1")
+    monkeypatch.setenv("CTXCE_ADMIN_COLLECTION_DELETE_ENABLED", "1")
+
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+
+    monkeypatch.setattr(srv, "_require_admin_session", lambda _req: {"user_id": "admin"})
+
+    def _fake_delete_collection_everywhere(**_kwargs):
+        return {"qdrant_deleted": True, "qdrant_graph_deleted": True}
+
+    monkeypatch.setattr(srv, "delete_collection_everywhere", _fake_delete_collection_everywhere)
+
+    client = TestClient(srv.app)
+    resp = client.post("/admin/collections/delete", data={"collection": "c1", "delete_fs": ""}, follow_redirects=False)
+    assert resp.status_code == 302
+    loc = resp.headers.get("location") or ""
+    assert "deleted=c1" in loc
+    assert "graph_deleted=1" in loc
+
+
+@pytest.mark.unit
 def test_collection_admin_refuses_when_env_disabled(monkeypatch):
     monkeypatch.setenv("CTXCE_ADMIN_COLLECTION_DELETE_ENABLED", "0")
     ca = importlib.import_module("scripts.collection_admin")

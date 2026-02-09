@@ -935,7 +935,7 @@ async def admin_delete_collection(
         cleanup_fs = False
 
     try:
-        delete_collection_everywhere(
+        out = delete_collection_everywhere(
             collection=name,
             work_dir=WORK_DIR,
             qdrant_url=QDRANT_URL,
@@ -949,7 +949,23 @@ async def admin_delete_collection(
             back_href="/admin/acl",
         )
 
-    return RedirectResponse(url="/admin/acl", status_code=302)
+    graph_deleted: Optional[str] = None
+    try:
+        if isinstance(out, dict) and not name.endswith("_graph"):
+            graph_deleted = "1" if bool(out.get("qdrant_graph_deleted")) else "0"
+    except Exception:
+        graph_deleted = None
+
+    try:
+        from urllib.parse import urlencode
+
+        params = {"deleted": name}
+        if graph_deleted is not None:
+            params["graph_deleted"] = graph_deleted
+        url = "/admin/acl?" + urlencode(params)
+    except Exception:
+        url = "/admin/acl"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/admin/staging/start")
@@ -1222,7 +1238,39 @@ async def admin_copy_collection(
             back_href="/admin/acl",
         )
 
-    return RedirectResponse(url="/admin/acl", status_code=302)
+    graph_copied: Optional[str] = None
+    try:
+        if not name.endswith("_graph") and not str(new_name).endswith("_graph"):
+            from qdrant_client import QdrantClient  # type: ignore
+
+            cli = QdrantClient(
+                url=QDRANT_URL,
+                api_key=os.environ.get("QDRANT_API_KEY"),
+                timeout=float(os.environ.get("QDRANT_TIMEOUT", "5") or 5),
+            )
+            try:
+                cli.get_collection(collection_name=f"{new_name}_graph")
+                graph_copied = "1"
+            except Exception:
+                graph_copied = "0"
+            finally:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+    except Exception:
+        graph_copied = None
+
+    try:
+        from urllib.parse import urlencode
+
+        params = {"copied": name, "new": new_name}
+        if graph_copied is not None:
+            params["graph_copied"] = graph_copied
+        url = "/admin/acl?" + urlencode(params)
+    except Exception:
+        url = "/admin/acl"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/admin/users")
