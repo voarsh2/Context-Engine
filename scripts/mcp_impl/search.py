@@ -54,6 +54,43 @@ SNIPPET_MAX_BYTES = safe_int(
 )
 
 
+# Fields to strip from results when debug=False (internal/debugging fields)
+_DEBUG_RESULT_FIELDS = {
+    "components",  # Internal scoring breakdown (dense_rrf, lexical, fname_boost, etc.)
+    "doc_id",  # Internal benchmark ID (often null/opaque)
+    "code_id",  # Internal benchmark ID (often null/opaque)
+    "payload",  # Duplicates other fields (information, document, pseudo, tags)
+    "why",  # Often empty []; debugging explanation list
+    "span_budgeted",  # Internal budget flag
+    "relations",  # Call graph info (imports, calls) - useful but often noise
+    "related_paths",  # Optional related file paths
+    "budget_tokens_used",  # Internal token accounting
+    "fname_boost",  # Internal boost value (already applied to score)
+    "host_path",  # Internal dual-path (host side) - use path/client_path instead
+    "container_path",  # Internal dual-path (container side) - use path/client_path instead
+}
+
+# Top-level response fields to strip when debug=False
+_DEBUG_TOP_LEVEL_FIELDS = {
+    "rerank_counters",  # Internal reranking metrics (inproc_hybrid, timeout, etc.)
+    "code_signals",  # Internal code signal detection results
+}
+
+
+def _strip_debug_fields(item: dict, keep_paths: bool = True) -> dict:
+    """Strip internal/debug fields from a result item.
+
+    Args:
+        item: Result dict to strip
+        keep_paths: If True, keep host_path/container_path (client paths)
+
+    Returns:
+        New dict with debug fields removed
+    """
+    result = {k: v for k, v in item.items() if k not in _DEBUG_RESULT_FIELDS}
+    return result
+
+
 async def _repo_search_impl(
     query: Any = None,
     queries: Any = None,  # Alias for query (many clients use this)
@@ -89,6 +126,7 @@ async def _repo_search_impl(
     repo: Any = None,  # str, list[str], or "*" to search all repos
     # Response shaping
     compact: Any = None,
+    debug: Any = None,  # When True, include verbose internal fields (components, rerank_counters, etc.)
     output_format: Any = None,  # "json" (default) or "toon" for token-efficient format
     args: Any = None,  # Compatibility shim for mcp-remote/Claude wrappers that send args/kwargs
     kwargs: Any = None,
@@ -119,16 +157,21 @@ async def _repo_search_impl(
       Use repo=["frontend","backend"] to search related repos together.
     - Filters (optional): language, under (path prefix), kind, symbol, ext, path_regex,
       path_glob (str or list[str]), not_glob (str or list[str]), not_ (negative text), case.
+    - debug: bool (default false). When true, includes verbose internal fields like
+      components, rerank_counters, code_signals. Default false saves ~60-80% tokens.
 
     Returns:
     - Dict with keys:
-      - results: list of {score, path, symbol, start_line, end_line, why[, components][, relations][, related_paths][, snippet]}
-      - total: int; used_rerank: bool; rerank_counters: dict
+      - results: list of {score, path, symbol, start_line, end_line[, snippet][, tags][, host_path][, container_path]}
+        When debug=true, also includes: components, why, relations, related_paths, doc_id, code_id
+      - total: int; used_rerank: bool
     - If compact=true (and snippets not requested), results contain only {path,start_line,end_line}.
+    - If debug=true, response also includes: rerank_counters, code_signals
 
     Examples:
     - path_glob=["scripts/**","**/*.py"], language="python"
     - symbol="context_answer", under="scripts"
+    - debug=true  # Include internal scoring details for query tuning
     """
     sess = require_auth_session_fn(session) if require_auth_session_fn else session
 
@@ -252,6 +295,8 @@ async def _repo_search_impl(
                 case = _extra.get("case")
             if compact in (None, "") and _extra.get("compact") is not None:
                 compact = _extra.get("compact")
+            if debug in (None, "") and _extra.get("debug") is not None:
+                debug = _extra.get("debug")
             # Optional mode hint: "code_first", "docs_first", "balanced"
             if (
                 mode is None or (isinstance(mode, str) and str(mode).strip() == "")
@@ -445,6 +490,11 @@ async def _repo_search_impl(
     # If snippets are requested, do not compact (we need snippet field in results)
     if include_snippet:
         compact = False
+
+    # Debug mode: when False (default), strip internal/debug fields from results
+    # to reduce token bloat. Set debug=True to see components, rerank_counters, etc.
+    debug_raw = debug
+    debug = _to_bool(debug, False)
 
     # Default behavior: exclude commit-history docs (which use path=".git") from
     # generic repo_search calls, unless the caller explicitly asks for git
@@ -1491,6 +1541,11 @@ async def _repo_search_impl(
             }
             for r in results
         ]
+    elif not debug:
+        # Strip debug/internal fields from results to reduce token bloat
+        # Keeps: score, path, host_path, container_path, symbol, snippet,
+        #        start_line, end_line, tags, pseudo
+        results = [_strip_debug_fields(r) for r in results]
 
     response = {
         "args": {
@@ -1518,12 +1573,16 @@ async def _repo_search_impl(
             "compact": (_to_bool(compact_raw, compact)),
         },
         "used_rerank": bool(used_rerank),
-        "rerank_counters": rerank_counters,
-        "code_signals": code_signals if code_signals.get("has_code_signals") else None,
         "total": len(results),
         "results": results,
         **res,
     }
+
+    # Only include debug fields when explicitly requested
+    if debug:
+        response["rerank_counters"] = rerank_counters
+        if code_signals.get("has_code_signals"):
+            response["code_signals"] = code_signals
 
     # Apply TOON formatting if requested or enabled globally
     # Full mode (compact=False) still saves tokens vs JSON while preserving all fields

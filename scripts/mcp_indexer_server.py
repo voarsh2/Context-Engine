@@ -1082,6 +1082,7 @@ async def repo_search(
     case: Any = None,
     repo: Any = None,
     compact: Any = None,
+    debug: Any = None,
     output_format: Any = None,
     args: Any = None,
     kwargs: Any = None,
@@ -1098,12 +1099,13 @@ async def repo_search(
     - per_path: int (default 2). Max results per file.
     - include_snippet/context_lines: return inline snippets near hits when true.
     - rerank_*: ONNX reranker is ON by default for best relevance; timeouts fall back to hybrid.
+    - debug: bool (default false). Include verbose internal fields (components, rerank_counters, etc).
     - output_format: "json" (default) or "toon" for token-efficient TOON format.
     - collection: str. Target collection; defaults to workspace state or env COLLECTION_NAME.
     - repo: str or list[str]. Filter by repo name(s). Use "*" to search all repos.
 
     Returns:
-    - Dict with keys: results, total, used_rerank, rerank_counters
+    - Dict with keys: results, total, used_rerank, [rerank_counters if debug=true]
     """
     return await _repo_search_impl(
         query=query,
@@ -1134,6 +1136,7 @@ async def repo_search(
         case=case,
         repo=repo,
         compact=compact,
+        debug=debug,
         output_format=output_format,
         args=args,
         kwargs=kwargs,
