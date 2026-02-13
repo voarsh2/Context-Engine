@@ -1,11 +1,14 @@
+import logging
 import os
 import json
 import re
 import shutil
 import time
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional, List
+
+logger = logging.getLogger(__name__)
 
 from scripts.auth_backend import mark_collection_deleted
 
