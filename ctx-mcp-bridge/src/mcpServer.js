@@ -8,7 +8,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { loadAnyAuthEntry, loadAuthEntry, readConfig, saveAuthEntry } from "./authConfig.js";
 import { maybeRemapToolArgs, maybeRemapToolResult } from "./resultPathMapping.js";
 import * as oauthHandler from "./oauthHandler.js";
@@ -58,19 +64,87 @@ function dedupeTools(tools) {
   return out;
 }
 
+function dedupeResources(resources) {
+  const seen = new Set();
+  const out = [];
+  for (const resource of resources) {
+    const uri = resource && typeof resource.uri === "string" ? resource.uri : "";
+    if (!uri || seen.has(uri)) {
+      continue;
+    }
+    seen.add(uri);
+    out.push(resource);
+  }
+  return out;
+}
+
+function dedupeResourceTemplates(templates) {
+  const seen = new Set();
+  const out = [];
+  for (const template of templates) {
+    const uri =
+      template && template.resourceTemplate && typeof template.resourceTemplate.uriTemplate === "string"
+        ? template.resourceTemplate.uriTemplate
+        : "";
+    if (!uri || seen.has(uri)) {
+      continue;
+    }
+    seen.add(uri);
+    out.push(template);
+  }
+  return out;
+}
+
 async function listMemoryTools(client) {
   if (!client) {
     return [];
   }
   try {
+    const timeoutMs = getBridgeListTimeoutMs();
     const remote = await withTimeout(
       client.listTools(),
-      5000,
+      timeoutMs,
       "memory tools/list",
     );
     return Array.isArray(remote?.tools) ? remote.tools.slice() : [];
   } catch (err) {
     debugLog("[ctxce] Error calling memory tools/list: " + String(err));
+    return [];
+  }
+}
+
+async function listResourcesSafe(client, label) {
+  if (!client) {
+    return [];
+  }
+  try {
+    const timeoutMs = getBridgeListTimeoutMs();
+    const remote = await withTimeout(
+      client.listResources(),
+      timeoutMs,
+      `${label} resources/list`,
+    );
+    return Array.isArray(remote?.resources) ? remote.resources.slice() : [];
+  } catch (err) {
+    debugLog(`[ctxce] Error calling ${label} resources/list: ` + String(err));
+    return [];
+  }
+}
+
+async function listResourceTemplatesSafe(client, label) {
+  if (!client) {
+    return [];
+  }
+  try {
+    const timeoutMs = getBridgeListTimeoutMs();
+    const remote = await withTimeout(
+      client.listResourceTemplates(),
+      timeoutMs,
+      `${label} resources/templates/list`,
+    );
+    return Array.isArray(remote?.resourceTemplates) ? remote.resourceTemplates.slice() : [];
+  } catch (err) {
+    debugLog(`[ctxce] Error calling ${label} resources/templates/list: ` + String(err));
     return [];
   }
 }
@@ -122,6 +196,25 @@ function getBridgeToolTimeoutMs() {
     return parsed;
   } catch {
     return 300000;
+  }
+}
+
+function getBridgeListTimeoutMs() {
+  try {
+    // Keep list operations on a separate budget from tools/call.
+    // Some streamable-http clients (including Codex) probe tools/resources early,
+    // and a short timeout here can make the bridge appear unavailable.
+    const raw = process.env.CTXCE_LIST_TIMEOUT_MSEC;
+    if (!raw) {
+      return 60000;
+    }
+    const parsed = Number.parseInt(String(raw), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return 60000;
+    }
+    return parsed;
+  } catch {
+    return 60000;
   }
 }
 
@@ -651,6 +744,7 @@ async function createBridgeServer(options) {
     {
       capabilities: {
         tools: {},
+        resources: {},
       },
     },
   );
@@ -664,9 +758,10 @@ async function createBridgeServer(options) {
       if (!indexerClient) {
         throw new Error("Indexer MCP client not initialized");
       }
+      const timeoutMs = getBridgeListTimeoutMs();
       remote = await withTimeout(
         indexerClient.listTools(),
-        10000,
+        timeoutMs,
         "indexer tools/list",
       );
     } catch (err) {
@@ -691,6 +786,57 @@ async function createBridgeServer(options) {
     const tools = dedupeTools([...indexerTools, ...memoryTools]);
     debugLog(`[ctxce] tools/list: returning ${tools.length} tools`);
     return { tools };
+  });
+
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    // Proxy resource discovery/read-through so clients that use MCP resources
+    // (not only tools) can access upstream indexer/memory resources directly.
+    await initializeRemoteClients(false);
+    const indexerResources = await listResourcesSafe(indexerClient, "indexer");
+    const memoryResources = await listResourcesSafe(memoryClient, "memory");
+    const resources = dedupeResources([...indexerResources, ...memoryResources]);
+    debugLog(`[ctxce] resources/list: returning ${resources.length} resources`);
+    return { resources };
+  });
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+    await initializeRemoteClients(false);
+    const indexerTemplates = await listResourceTemplatesSafe(indexerClient, "indexer");
+    const memoryTemplates = await listResourceTemplatesSafe(memoryClient, "memory");
+    const resourceTemplates = dedupeResourceTemplates([...indexerTemplates, ...memoryTemplates]);
+    debugLog(`[ctxce] resources/templates/list: returning ${resourceTemplates.length} templates`);
+    return { resourceTemplates };
+  });
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    await initializeRemoteClients(false);
+    const params = request.params || {};
+    const timeoutMs = getBridgeToolTimeoutMs();
+    const uri =
+      params && typeof params.uri === "string" ? params.uri : "<missing-uri>";
+    debugLog(`[ctxce] resources/read: ${uri}`);
+
+    const tryRead = async (client, label) => {
+      if (!client) {
+        return null;
+      }
+      try {
+        return await client.readResource(params, { timeout: timeoutMs });
+      } catch (err) {
+        debugLog(`[ctxce] resources/read failed on ${label}: ` + String(err));
+        return null;
+      }
+    };
+
+    const indexerResult = await tryRead(indexerClient, "indexer");
+    if (indexerResult) {
+      return indexerResult;
+    }
+    const memoryResult = await tryRead(memoryClient, "memory");
+    if (memoryResult) {
+      return memoryResult;
+    }
+    throw new Error(`Resource ${uri} not available on any configured MCP server`);
   });
 
   // tools/call → proxied to indexer or memory server
@@ -843,6 +989,13 @@ export async function runHttpMcpServer(options) {
     typeof options.port === "number"
       ? options.port
       : Number.parseInt(process.env.CTXCE_HTTP_PORT || "30810", 10) || 30810;
+  // TODO(auth): replace this boolean toggle with explicit auth modes (none|required).
+  // In required mode, enforce Bearer auth on /mcp with consistent 401 challenges and
+  // only advertise OAuth metadata/endpoints when authentication is mandatory.
+  // In local/dev mode, leaving OAuth discovery off avoids clients entering an
+  // unnecessary OAuth path for otherwise unauthenticated bridge usage.
+  const oauthEnabled = String(process.env.CTXCE_ENABLE_OAUTH || "").trim().toLowerCase();
+  const oauthEndpointsEnabled = oauthEnabled === "1" || oauthEnabled === "true" || oauthEnabled === "yes";
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -865,34 +1018,36 @@ export async function runHttpMcpServer(options) {
       // OAuth 2.0 Endpoints (RFC9728 Protected Resource Metadata + RFC7591)
       // ================================================================
 
-      // OAuth metadata endpoint (RFC9728)
-      if (parsedUrl.pathname === "/.well-known/oauth-authorization-server") {
-        oauthHandler.handleOAuthMetadata(req, res, issuerUrl);
-        return;
-      }
+      if (oauthEndpointsEnabled) {
+        // OAuth metadata endpoint (RFC9728)
+        if (parsedUrl.pathname === "/.well-known/oauth-authorization-server") {
+          oauthHandler.handleOAuthMetadata(req, res, issuerUrl);
+          return;
+        }
 
-      // OAuth Dynamic Client Registration endpoint (RFC7591)
-      if (parsedUrl.pathname === "/oauth/register" && req.method === "POST") {
-        oauthHandler.handleOAuthRegister(req, res);
-        return;
-      }
+        // OAuth Dynamic Client Registration endpoint (RFC7591)
+        if (parsedUrl.pathname === "/oauth/register" && req.method === "POST") {
+          oauthHandler.handleOAuthRegister(req, res);
+          return;
+        }
 
-      // OAuth authorize endpoint
-      if (parsedUrl.pathname === "/oauth/authorize") {
-        oauthHandler.handleOAuthAuthorize(req, res, parsedUrl.searchParams);
-        return;
-      }
+        // OAuth authorize endpoint
+        if (parsedUrl.pathname === "/oauth/authorize") {
+          oauthHandler.handleOAuthAuthorize(req, res, parsedUrl.searchParams);
+          return;
+        }
 
-      // Store session endpoint (helper for login page)
-      if (parsedUrl.pathname === "/oauth/store-session" && req.method === "POST") {
-        oauthHandler.handleOAuthStoreSession(req, res);
-        return;
-      }
+        // Store session endpoint (helper for login page)
+        if (parsedUrl.pathname === "/oauth/store-session" && req.method === "POST") {
+          oauthHandler.handleOAuthStoreSession(req, res);
+          return;
+        }
 
-      // OAuth token endpoint
-      if (parsedUrl.pathname === "/oauth/token" && req.method === "POST") {
-        oauthHandler.handleOAuthToken(req, res);
-        return;
+        // OAuth token endpoint
+        if (parsedUrl.pathname === "/oauth/token" && req.method === "POST") {
+          oauthHandler.handleOAuthToken(req, res);
+          return;
+        }
       }
 
       // ================================================================
@@ -1058,4 +1213,3 @@ function detectRepoName(workspace, config) {
   const leaf = workspace ? path.basename(workspace) : "";
   return leaf && SLUGGED_REPO_RE.test(leaf) ? leaf : null;
 }
-

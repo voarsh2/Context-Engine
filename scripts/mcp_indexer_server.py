@@ -300,6 +300,23 @@ _security_settings = (
 )
 mcp = FastMCP(APP_NAME, transport_security=_security_settings)
 
+# Minimal resource so MCP clients can verify resource wiring.
+@mcp.resource(
+    "resource://context-engine/indexer/info",
+    name="context-engine-indexer-info",
+    title="Context Engine Indexer Info",
+    description="Basic metadata about the running indexer MCP server.",
+    mime_type="application/json",
+)
+def _indexer_info_resource():
+    return {
+        "app": APP_NAME,
+        "host": HOST,
+        "port": PORT,
+        "qdrant_url": QDRANT_URL,
+        "default_collection": DEFAULT_COLLECTION,
+    }
+
 
 # Capture tool registry automatically by wrapping the decorator once
 _TOOLS_REGISTRY: list[dict] = []
