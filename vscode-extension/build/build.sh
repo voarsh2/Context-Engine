@@ -76,6 +76,27 @@ if [[ "$BUNDLE_DEPS" == "--bundle-deps" ]]; then
     fi
 fi
 
+# Bundle MCP bridge npm package into the staged extension
+BRIDGE_SRC="$SCRIPT_DIR/../../ctx-mcp-bridge"
+BRIDGE_DIR="ctx-mcp-bridge"
+
+if [[ -d "$BRIDGE_SRC" && -f "$BRIDGE_SRC/package.json" ]]; then
+    echo "Bundling MCP bridge npm package into staged extension..."
+    mkdir -p "$STAGE_DIR/$BRIDGE_DIR"
+    cp -a "$BRIDGE_SRC/bin" "$STAGE_DIR/$BRIDGE_DIR/"
+    cp -a "$BRIDGE_SRC/src" "$STAGE_DIR/$BRIDGE_DIR/"
+    cp "$BRIDGE_SRC/package.json" "$STAGE_DIR/$BRIDGE_DIR/"
+
+    if [[ -d "$BRIDGE_SRC/node_modules" ]]; then
+        cp -a "$BRIDGE_SRC/node_modules" "$STAGE_DIR/$BRIDGE_DIR/"
+    else
+        echo "Warning: Bridge node_modules not found. Run 'npm install' in ctx-mcp-bridge first."
+    fi
+    echo "MCP bridge bundled successfully."
+else
+    echo "Warning: MCP bridge source not found at $BRIDGE_SRC"
+fi
+
 pushd "$STAGE_DIR" >/dev/null
 echo "Packaging extension..."
 npx @vscode/vsce package --no-dependencies --out "$OUT_DIR"

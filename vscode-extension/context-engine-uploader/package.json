@@ -297,7 +297,17 @@
         "contextEngineUploader.mcpBridgeLocalOnly": {
           "type": "boolean",
           "default": false,
-          "description": "Development toggle. When true (default) the extension prefers local bridge binaries resolved from mcpBridgeBinPath or CTXCE_BRIDGE_BIN before falling back to the published npm build via npx."
+          "description": "Development toggle. When true and mcpBridgeMode='external', prefers local bridge binaries resolved from mcpBridgeBinPath or CTXCE_BRIDGE_BIN before falling back to the published npm build via npx. Ignored when mcpBridgeMode='bundled'."
+        },
+        "contextEngineUploader.mcpBridgeMode": {
+          "type": "string",
+          "enum": ["bundled", "external"],
+          "default": "bundled",
+          "description": "Bridge invocation mode. 'bundled' uses the bundled bridge inside the extension (offline, no npx required). 'external' uses external binary path or npx (current behavior).",
+          "enumDescriptions": [
+            "Use the bundled MCP bridge inside the extension (works offline).",
+            "Use external binary path or npx to run the bridge (requires internet for first npx install)."
+          ]
         },
         "contextEngineUploader.mcpServerMode": {
           "type": "string",

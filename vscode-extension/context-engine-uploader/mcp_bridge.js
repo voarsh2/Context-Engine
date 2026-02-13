@@ -4,6 +4,7 @@ function createBridgeManager(deps) {
   const path = deps.path;
   const fs = deps.fs;
   const log = deps.log;
+  const extensionRoot = deps.extensionRoot;
 
   const getEffectiveConfig = deps.getEffectiveConfig;
   const resolveBridgeWorkspacePath = deps.resolveBridgeWorkspacePath;
@@ -42,7 +43,36 @@ function createBridgeManager(deps) {
     }
   }
 
+  function getBridgeMode() {
+    try {
+      const settings = getEffectiveConfig();
+      return (settings.get('mcpBridgeMode') || 'bundled').trim();
+    } catch (_) {
+      return 'bundled';
+    }
+  }
+
+  function findBundledBridgeBin() {
+    if (!extensionRoot) return undefined;
+    const bundledPath = path.join(extensionRoot, 'ctx-mcp-bridge', 'bin', 'ctxce.js');
+    if (fs.existsSync(bundledPath)) {
+      return path.resolve(bundledPath);
+    }
+    return undefined;
+  }
+
   function findLocalBridgeBin() {
+    // First check for bundled bridge if mode is 'bundled'
+    const mode = getBridgeMode();
+    if (mode === 'bundled') {
+      const bundledBin = findBundledBridgeBin();
+      if (bundledBin) {
+        return bundledBin;
+      }
+      log('Bundled bridge requested but not found; falling back to external resolution');
+    }
+
+    // External mode logic (existing behavior)
     let localOnly = true;
     let configured = '';
     try {
@@ -68,11 +98,12 @@ function createBridgeManager(deps) {
 
   function resolveBridgeCliInvocation() {
     const binPath = findLocalBridgeBin();
+    const mode = getBridgeMode();
     if (binPath) {
       return {
         command: 'node',
         args: [binPath],
-        kind: 'local'
+        kind: mode === 'bundled' ? 'bundled' : 'local'
       };
     }
     const isWindows = process.platform === 'win32';

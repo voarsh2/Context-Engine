@@ -230,6 +230,7 @@ function activate(context) {
       path,
       fs,
       log,
+      extensionRoot,
       getEffectiveConfig,
       resolveBridgeWorkspacePath: () => configResolver ? configResolver.resolveBridgeWorkspacePath() : undefined,
       attachOutput: (child, label) => processManager ? processManager.attachOutput(child, label) : undefined,
@@ -425,6 +426,7 @@ function activate(context) {
       event.affectsConfiguration('contextEngineUploader.mcpBridgeBinPath') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgePort') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgeLocalOnly') ||
+      event.affectsConfiguration('contextEngineUploader.mcpBridgeMode') ||
       event.affectsConfiguration('contextEngineUploader.windsurfMcpPath') ||
       event.affectsConfiguration('contextEngineUploader.augmentMcpPath') ||
       event.affectsConfiguration('contextEngineUploader.antigravityMcpPath') ||
@@ -439,6 +441,7 @@ function activate(context) {
       event.affectsConfiguration('contextEngineUploader.mcpBridgePort') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgeBinPath') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgeLocalOnly') ||
+      event.affectsConfiguration('contextEngineUploader.mcpBridgeMode') ||
       event.affectsConfiguration('contextEngineUploader.mcpIndexerUrl') ||
       event.affectsConfiguration('contextEngineUploader.mcpMemoryUrl') ||
       event.affectsConfiguration('contextEngineUploader.mcpServerMode') ||
