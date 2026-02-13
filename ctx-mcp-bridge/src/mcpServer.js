@@ -83,8 +83,8 @@ function dedupeResourceTemplates(templates) {
   const out = [];
   for (const template of templates) {
     const uri =
-      template && template.resourceTemplate && typeof template.resourceTemplate.uriTemplate === "string"
-        ? template.resourceTemplate.uriTemplate
+      template && typeof template.uriTemplate === "string"
+        ? template.uriTemplate
         : "";
     if (!uri || seen.has(uri)) {
       continue;

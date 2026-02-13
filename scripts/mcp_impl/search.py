@@ -82,12 +82,15 @@ def _strip_debug_fields(item: dict, keep_paths: bool = True) -> dict:
 
     Args:
         item: Result dict to strip
-        keep_paths: If True, keep host_path/container_path (client paths)
+        keep_paths: If True, keep host_path/container_path
 
     Returns:
         New dict with debug fields removed
     """
-    result = {k: v for k, v in item.items() if k not in _DEBUG_RESULT_FIELDS}
+    strip_fields = _DEBUG_RESULT_FIELDS
+    if keep_paths:
+        strip_fields = _DEBUG_RESULT_FIELDS - {"host_path", "container_path"}
+    result = {k: v for k, v in item.items() if k not in strip_fields}
     return result
 
 
@@ -493,7 +496,6 @@ async def _repo_search_impl(
 
     # Debug mode: when False (default), strip internal/debug fields from results
     # to reduce token bloat. Set debug=True to see components, rerank_counters, etc.
-    debug_raw = debug
     debug = _to_bool(debug, False)
 
     # Default behavior: exclude commit-history docs (which use path=".git") from
