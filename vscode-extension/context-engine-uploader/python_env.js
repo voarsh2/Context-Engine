@@ -339,10 +339,7 @@ function createPythonEnvManager(deps) {
         }
 
         // As a last resort, offer to create a private venv and install deps via pip
-        if (!allowPrompt) {
-            log('Skipping auto-install prompt; interpreter was auto-detected and missing modules.');
-            return false;
-        }
+        // Always prompt at this point - we've exhausted all other options (initial Python + auto-detected both failed)
         const choice = await vscode.window.showErrorMessage(
             'Context Engine Uploader: missing Python modules. Create isolated environment and auto-install?',
             'Auto-install to private venv',
