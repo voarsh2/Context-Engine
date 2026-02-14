@@ -520,8 +520,12 @@ class RemoteUploadClient:
         logger.info(f"  source_path: {info['source_path']}")
         logger.info(f"  container_path: {info['container_path']}")
 
-    def _excluded_dirnames(self) -> set:
+    def _excluded_dirnames(self) -> frozenset:
         # Keep in sync with standalone_upload_client exclusions.
+        # NOTE: This caches the exclusion set per RemoteUploadClient instance.
+        # Runtime changes to DEV_REMOTE_MODE/REMOTE_UPLOAD_MODE won't be reflected
+        # until a new client is created (typically via process restart), which is
+        # acceptable for the upload client use case.
         cached = getattr(self, "_excluded_dirnames_cache", None)
         if cached is not None:
             return cached

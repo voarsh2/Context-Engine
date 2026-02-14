@@ -1662,6 +1662,9 @@ async def code_search(
     case: Any = None,
     session: Any = None,
     compact: Any = None,
+    debug: Any = None,
+    output_format: Any = None,
+    repo: Any = None,
     kwargs: Any = None,
 ) -> Dict[str, Any]:
     """Exact alias of repo_search (hybrid code search with reranking enabled by default).
@@ -1694,6 +1697,9 @@ async def code_search(
         case=case,
         session=session,
         compact=compact,
+        debug=debug,
+        output_format=output_format,
+        repo=repo,
         kwargs=kwargs,
     )
 

@@ -1247,15 +1247,19 @@ async def admin_copy_collection(
         if not name.endswith("_graph") and not str(new_name).endswith("_graph"):
             used_pooled = False
             if pooled_qdrant_client is not None:
+                used_pooled = True
                 try:
                     with pooled_qdrant_client(
                         url=QDRANT_URL,
                         api_key=os.environ.get("QDRANT_API_KEY"),
                     ) as cli:
-                        cli.get_collection(collection_name=f"{new_name}_graph")
-                        graph_copied = "1"
-                        used_pooled = True
+                        try:
+                            cli.get_collection(collection_name=f"{new_name}_graph")
+                            graph_copied = "1"
+                        except Exception:
+                            graph_copied = "0"
                 except Exception:
+                    # Failed to acquire pooled client; fall back to non-pooled
                     used_pooled = False
             if not used_pooled:
                 try:
