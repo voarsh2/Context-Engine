@@ -726,6 +726,7 @@ async function createBridgeServer(options) {
     indexerClient = nextIndexerClient;
     memoryClient = nextMemoryClient;
 
+    defaultsPayload.session = sessionId;
     if (Object.keys(defaultsPayload).length > 1 && indexerClient) {
       await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
       if (memoryClient) {
@@ -847,16 +848,22 @@ async function createBridgeServer(options) {
 
     debugLog(`[ctxce] tools/call: ${name || "<no-name>"}`);
 
-    // Refresh session before each call; re-init clients if session changes.
+    // Check if session changed (e.g., after auth login), and re-send defaults if so.
     const freshSession = resolveSessionId() || sessionId;
     if (freshSession && freshSession !== sessionId) {
       sessionId = freshSession;
-      try {
-        await initializeRemoteClients(true);
-      } catch (err) {
-        debugLog("[ctxce] Failed to reinitialize clients after session refresh: " + String(err));
+      defaultsPayload.session = sessionId;
+      if (Object.keys(defaultsPayload).length > 1) {
+        await initializeRemoteClients(false);
+        if (indexerClient) {
+          await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
+        }
+        if (memoryClient) {
+          await sendSessionDefaults(memoryClient, defaultsPayload, "memory");
+        }
       }
     }
+
     if (sessionId && (args === undefined || args === null || typeof args === "object")) {
       const obj = args && typeof args === "object" ? { ...args } : {};
       if (!Object.prototype.hasOwnProperty.call(obj, "session")) {
