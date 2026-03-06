@@ -33,16 +33,18 @@ function debugLog(message) {
 
 async function sendSessionDefaults(client, payload, label) {
   if (!client) {
-    return;
+    return false;
   }
   try {
     await client.callTool({
       name: "set_session_defaults",
       arguments: payload,
     });
+    return true;
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(`[ctxce] Failed to call set_session_defaults on ${label}:`, err);
+    return false;
   }
 }
 function dedupeTools(tools) {
@@ -533,6 +535,7 @@ async function createBridgeServer(options) {
 
   let indexerClient = null;
   let memoryClient = null;
+  let lastDefaultsSyncedSessionId = "";
 
   // Derive a simple session identifier for this bridge process. In the
   // future this can be made user-aware (e.g. from auth), but for now we
@@ -661,6 +664,23 @@ async function createBridgeServer(options) {
     defaultsPayload.under = defaultUnder;
   }
 
+  async function ensureRemoteDefaults(force = false) {
+    defaultsPayload.session = sessionId;
+    if (!sessionId || Object.keys(defaultsPayload).length <= 1) {
+      return;
+    }
+    if (!force && lastDefaultsSyncedSessionId === sessionId) {
+      return;
+    }
+    const indexerOk = await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
+    if (memoryClient) {
+      await sendSessionDefaults(memoryClient, defaultsPayload, "memory");
+    }
+    if (indexerOk) {
+      lastDefaultsSyncedSessionId = sessionId;
+    }
+  }
+
   async function initializeRemoteClients(forceRecreate = false) {
     if (!forceRecreate && indexerClient) {
       return;
@@ -726,13 +746,7 @@ async function createBridgeServer(options) {
     indexerClient = nextIndexerClient;
     memoryClient = nextMemoryClient;
 
-    defaultsPayload.session = sessionId;
-    if (Object.keys(defaultsPayload).length > 1 && indexerClient) {
-      await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
-      if (memoryClient) {
-        await sendSessionDefaults(memoryClient, defaultsPayload, "memory");
-      }
-    }
+    await ensureRemoteDefaults(true);
   }
 
   await initializeRemoteClients(false);
@@ -853,15 +867,8 @@ async function createBridgeServer(options) {
     if (freshSession && freshSession !== sessionId) {
       sessionId = freshSession;
       defaultsPayload.session = sessionId;
-      if (Object.keys(defaultsPayload).length > 1) {
-        await initializeRemoteClients(false);
-        if (indexerClient) {
-          await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
-        }
-        if (memoryClient) {
-          await sendSessionDefaults(memoryClient, defaultsPayload, "memory");
-        }
-      }
+      await initializeRemoteClients(false);
+      await ensureRemoteDefaults(true);
     }
 
     if (sessionId && (args === undefined || args === null || typeof args === "object")) {
@@ -887,6 +894,7 @@ async function createBridgeServer(options) {
     }
 
     await initializeRemoteClients(false);
+    await ensureRemoteDefaults(false);
 
     const timeoutMs = getBridgeToolTimeoutMs();
     const maxAttempts = getBridgeRetryAttempts();
@@ -923,6 +931,7 @@ async function createBridgeServer(options) {
             String(err),
           );
           await initializeRemoteClients(true);
+          await ensureRemoteDefaults(true);
           sessionRetried = true;
           continue;
         }
