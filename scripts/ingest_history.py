@@ -37,8 +37,7 @@ except ImportError:
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+logger.addHandler(logging.NullHandler())
 
 
 def _manifest_run_id(manifest_path: str) -> str:
@@ -444,7 +443,10 @@ def _ingest_from_manifest(
             except Exception as e:
                 embed_failures += 1
                 logger.warning(
-                    f"[ingest_history] embed failed for commit={commit_id} idx={idx}: {e}",
+                    "[ingest_history] embed failed for commit=%s idx=%d: %s",
+                    commit_id,
+                    idx,
+                    e,
                 )
                 _log_progress()
                 continue
@@ -507,10 +509,12 @@ def _ingest_from_manifest(
                 finally:
                     points.clear()
             _log_progress()
-        except Exception as e:
+        except Exception:
             point_build_failures += 1
             logger.warning(
-                f"[ingest_history] commit processing failed idx={idx}: {e}",
+                "[ingest_history] commit processing failed idx=%d",
+                idx,
+                exc_info=True,
             )
             _log_progress()
             continue
@@ -552,6 +556,7 @@ def _ingest_from_manifest(
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(
         description="Ingest Git history into Qdrant deterministically"
     )
@@ -662,10 +667,33 @@ def main():
         point = models.PointStruct(id=pid, vector={vec_name: vec}, payload=payload)
         points.append(point)
         if len(points) >= args.per_batch:
-            client.upsert(collection_name=COLLECTION, points=points)
-            points.clear()
+            batch_size = len(points)
+            try:
+                client.upsert(collection_name=COLLECTION, points=points)
+            except Exception as e:
+                logger.error(
+                    "[ingest_history] batch upsert failed collection=%s repo=%s size=%d path=%s: %s",
+                    COLLECTION,
+                    REPO_NAME,
+                    batch_size,
+                    args.path or "",
+                    e,
+                )
+            finally:
+                points.clear()
     if points:
-        client.upsert(collection_name=COLLECTION, points=points)
+        final_size = len(points)
+        try:
+            client.upsert(collection_name=COLLECTION, points=points)
+        except Exception as e:
+            logger.error(
+                "[ingest_history] final upsert failed collection=%s repo=%s size=%d path=%s: %s",
+                COLLECTION,
+                REPO_NAME,
+                final_size,
+                args.path or "",
+                e,
+            )
     print(f"Ingested {len(commits)} commits into {COLLECTION}.")
 
 

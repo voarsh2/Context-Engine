@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import atexit
 import threading
 import time
 from collections import deque
@@ -58,6 +59,16 @@ _GIT_HISTORY_EXECUTOR = ThreadPoolExecutor(
     max_workers=_GIT_HISTORY_MAX_WORKERS,
     thread_name_prefix="git-history",
 )
+
+
+def _shutdown_git_history_executor() -> None:
+    try:
+        _GIT_HISTORY_EXECUTOR.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_git_history_executor)
 _GIT_HISTORY_INFLIGHT: set[str] = set()
 _GIT_HISTORY_INFLIGHT_LOCK = threading.Lock()
 
@@ -103,14 +114,20 @@ def _run_git_history_ingest(
     timeout = _GIT_HISTORY_TIMEOUT_SECONDS if _GIT_HISTORY_TIMEOUT_SECONDS > 0 else None
     stdout_tail: deque[str] = deque(maxlen=20)
     stderr_tail: deque[str] = deque(maxlen=20)
+    tail_lock = threading.Lock()
 
-    def _stream_pipe(pipe, label: str, tail: deque[str]) -> None:
+    def _tail_snapshot(tail: deque[str], limit: int = 5) -> str:
+        with tail_lock:
+            return " | ".join(list(tail)[-limit:])
+
+    def _stream_pipe(pipe, label: str, tail: deque[str], lock: threading.Lock) -> None:
         try:
             for raw in iter(pipe.readline, ""):
                 line = (raw or "").rstrip()
                 if not line:
                     continue
-                tail.append(line)
+                with lock:
+                    tail.append(line)
                 logger.info("[git_history_manifest][%s] %s", label, line)
         except Exception:
             pass
@@ -132,12 +149,12 @@ def _run_git_history_ingest(
         )
         t_out = threading.Thread(
             target=_stream_pipe,
-            args=(proc.stdout, "stdout", stdout_tail),
+            args=(proc.stdout, "stdout", stdout_tail, tail_lock),
             daemon=True,
         )
         t_err = threading.Thread(
             target=_stream_pipe,
-            args=(proc.stderr, "stderr", stderr_tail),
+            args=(proc.stderr, "stderr", stderr_tail, tail_lock),
             daemon=True,
         )
         t_out.start()
@@ -174,7 +191,7 @@ def _run_git_history_ingest(
                 logger.warning(
                     "[git_history_manifest] timeout stderr tail for %s: %s",
                     p,
-                    " | ".join(list(stderr_tail)[-5:]),
+                    _tail_snapshot(stderr_tail),
                 )
             return
 
@@ -195,7 +212,7 @@ def _run_git_history_ingest(
             p,
             returncode,
             elapsed_ms,
-            " | ".join(list(stderr_tail)[-5:]),
+            _tail_snapshot(stderr_tail),
         )
         return
 
@@ -208,13 +225,13 @@ def _run_git_history_ingest(
         logger.info(
             "[git_history_manifest] stdout tail for %s: %s",
             p,
-            " | ".join(list(stdout_tail)[-5:]),
+            _tail_snapshot(stdout_tail),
         )
     if stderr_tail:
         logger.warning(
             "[git_history_manifest] stderr tail for %s: %s",
             p,
-            " | ".join(list(stderr_tail)[-5:]),
+            _tail_snapshot(stderr_tail),
         )
 
 
