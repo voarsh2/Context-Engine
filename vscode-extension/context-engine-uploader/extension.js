@@ -543,8 +543,9 @@ async function runSequence(mode = 'auto') {
     if (code === 0) {
       setStatusBarState('indexed');
       if (processManager) { processManager.ensureIndexedWatcher(options.targetPath); }
-      // Only start watching after a regular force sync, not after git history upload
-      if (mode === 'force' && options.startWatchAfterForce && processManager) {
+      // Start watch after successful force sync in normal flows (`force` and `auto`),
+      // but keep git-history upload as one-shot.
+      if (mode !== 'uploadGitHistory' && options.startWatchAfterForce && processManager) {
         processManager.startWatch(options);
       }
     } else {
