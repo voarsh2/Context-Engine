@@ -204,6 +204,7 @@ app.add_middleware(
 
 # In-memory sequence tracking (in production, use persistent storage)
 _sequence_tracker: Dict[str, int] = {}
+_upload_result_tracker: Dict[str, Dict[str, Any]] = {}
 
 
 def _int_env(name: str, default: int) -> int:
@@ -484,14 +485,33 @@ async def _process_bundle_background(
     sequence_number: Optional[int],
     bundle_id: Optional[str],
 ) -> None:
+    key = get_workspace_key(workspace_path)
     try:
         start_time = datetime.now()
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": None,
+            "processing_time_ms": None,
+            "status": "processing",
+            "completed_at": None,
+        }
         operations_count = await asyncio.to_thread(
             process_delta_bundle, workspace_path, bundle_path, manifest
         )
+        processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
         if sequence_number is not None:
-            key = get_workspace_key(workspace_path)
             _sequence_tracker[key] = sequence_number
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": operations_count,
+            "processing_time_ms": processing_time,
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+        }
         if log_activity:
             try:
                 repo = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
@@ -507,11 +527,21 @@ async def _process_bundle_background(
                 )
             except Exception as activity_err:
                 logger.debug(f"[upload_service] Failed to log activity for bundle {bundle_id}: {activity_err}")
-        processing_time = (datetime.now() - start_time).total_seconds() * 1000
         logger.info(
-            f"[upload_service] Finished processing bundle {bundle_id} seq {sequence_number} in {int(processing_time)}ms"
+            f"[upload_service] Finished processing bundle {bundle_id} seq {sequence_number} "
+            f"in {processing_time}ms ops={operations_count}"
         )
     except Exception as e:
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": None,
+            "processing_time_ms": None,
+            "status": "error",
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e),
+        }
         logger.error(f"[upload_service] Error in background processing for bundle {bundle_id}: {e}")
     finally:
         try:
@@ -1427,8 +1457,12 @@ async def get_status(workspace_path: str):
 
         # Get last sequence
         last_sequence = get_last_sequence(workspace_path)
+        key = get_workspace_key(workspace_path)
+        upload_result = _upload_result_tracker.get(key, {})
 
-        last_upload = None
+        last_upload = upload_result.get("completed_at")
+        upload_status = str(upload_result.get("status") or "")
+        status = "processing" if upload_status == "processing" else "ready"
 
         return StatusResponse(
             workspace_path=workspace_path,
@@ -1436,11 +1470,16 @@ async def get_status(workspace_path: str):
             last_sequence=last_sequence,
             last_upload=last_upload,
             pending_operations=0,
-            status="ready",
+            status=status,
             server_info={
                 "version": "1.0.0",
                 "max_bundle_size_mb": MAX_BUNDLE_SIZE_MB,
-                "supported_formats": ["tar.gz"]
+                "supported_formats": ["tar.gz"],
+                "last_bundle_id": upload_result.get("bundle_id"),
+                "last_processing_time_ms": upload_result.get("processing_time_ms"),
+                "last_processed_operations": upload_result.get("processed_operations"),
+                "last_upload_status": upload_status or None,
+                "last_error": upload_result.get("error"),
             }
         )
 

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tarfile
 from pathlib import Path
 
@@ -50,6 +51,59 @@ def _write_bundle_with_created_file(tmp_path: Path, rel_path: str, content: byte
         tar.addfile(file_info, io.BytesIO(content))
 
     return bundle_path
+
+
+def _write_bundle_with_hash_metadata(
+    tmp_path: Path,
+    *,
+    operations: list[dict],
+    file_hashes: dict[str, str] | None = None,
+    created_files: dict[str, bytes] | None = None,
+    updated_files: dict[str, bytes] | None = None,
+) -> Path:
+    bundle_path = tmp_path / "bundle-hashes.tar.gz"
+    payload = json.dumps({"operations": operations}).encode("utf-8")
+    hashes_payload = json.dumps({"file_hashes": file_hashes or {}}).encode("utf-8")
+
+    with tarfile.open(bundle_path, "w:gz") as tar:
+        info = tarfile.TarInfo(name="metadata/operations.json")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+
+        hashes_info = tarfile.TarInfo(name="metadata/hashes.json")
+        hashes_info.size = len(hashes_payload)
+        tar.addfile(hashes_info, io.BytesIO(hashes_payload))
+
+        for rel_path, content in (created_files or {}).items():
+            file_info = tarfile.TarInfo(name=f"files/created/{rel_path}")
+            file_info.size = len(content)
+            tar.addfile(file_info, io.BytesIO(content))
+
+        for rel_path, content in (updated_files or {}).items():
+            file_info = tarfile.TarInfo(name=f"files/updated/{rel_path}")
+            file_info.size = len(content)
+            tar.addfile(file_info, io.BytesIO(content))
+
+    return bundle_path
+
+
+def _write_repo_cache(work_dir: Path, slug: str, rel_path: str, file_hash: str) -> None:
+    target = (work_dir / slug / rel_path).resolve()
+    cache_path = work_dir / ".codebase" / "repos" / slug / "cache.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "file_hashes": {
+                    str(target): {
+                        "hash": file_hash,
+                    }
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_process_delta_bundle_rejects_traversal_created(tmp_path, monkeypatch):
@@ -197,3 +251,123 @@ def test_process_delta_bundle_rejects_traversal_moved_source(tmp_path, monkeypat
             bundle_path=bundle,
             manifest={"bundle_id": "b1"},
         )
+
+
+def test_process_delta_bundle_skips_created_write_when_server_hash_matches(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    rel_path = "src/file.txt"
+    content = b"same-content"
+    file_hash = "sha1:efb5d7d4d38013264f2c00fceeb401f8c8d77d9f"
+
+    target = work_dir / slug / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    os.utime(target, ns=(1_000_000_000, 1_000_000_000))
+    before_mtime_ns = target.stat().st_mtime_ns
+    _write_repo_cache(work_dir, slug, rel_path, file_hash)
+
+    bundle = _write_bundle_with_hash_metadata(
+        tmp_path,
+        operations=[
+            {
+                "operation": "created",
+                "path": rel_path,
+                "content_hash": file_hash,
+            }
+        ],
+        file_hashes={rel_path: file_hash},
+        created_files={rel_path: content},
+    )
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-skip-created"},
+    )
+
+    assert counts.get("created") == 0
+    assert counts.get("skipped") == 1
+    assert counts.get("skipped_hash_match") == 1
+    assert target.read_bytes() == content
+    assert target.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_process_delta_bundle_uses_hashes_metadata_for_updated_skip(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    rel_path = "src/keep.txt"
+    content = b"existing-content"
+    file_hash = "sha1:2910e29d6f6d3d2f01f8cc52ec386a4936ca9d2f"
+
+    target = work_dir / slug / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    os.utime(target, ns=(2_000_000_000, 2_000_000_000))
+    before_mtime_ns = target.stat().st_mtime_ns
+    _write_repo_cache(work_dir, slug, rel_path, file_hash)
+
+    bundle = _write_bundle_with_hash_metadata(
+        tmp_path,
+        operations=[
+            {
+                "operation": "updated",
+                "path": rel_path,
+            }
+        ],
+        file_hashes={rel_path: file_hash},
+        updated_files={rel_path: content},
+    )
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-skip-updated"},
+    )
+
+    assert counts.get("updated") == 0
+    assert counts.get("skipped") == 1
+    assert counts.get("skipped_hash_match") == 1
+    assert target.read_bytes() == content
+    assert target.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_normalize_hash_value_strips_algorithm_prefixes():
+    import scripts.upload_delta_bundle as us
+
+    assert us._normalize_hash_value("sha1:ABCDEF") == "abcdef"
+    assert us._normalize_hash_value("md5:ABCDEF") == "abcdef"
+    assert us._normalize_hash_value("sha256:ABCDEF") == "abcdef"
+    assert us._normalize_hash_value("ABCDEF") == "abcdef"
+
+
+def test_process_delta_bundle_uses_first_marker_match_for_created_members(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    rel_path = "nested/files/created/path.txt"
+    content = b"marker-safe"
+    bundle = _write_bundle_with_created_file(tmp_path, rel_path, content)
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-created-marker"},
+    )
+
+    assert counts.get("created") == 1
+    assert (work_dir / slug / rel_path).read_bytes() == content

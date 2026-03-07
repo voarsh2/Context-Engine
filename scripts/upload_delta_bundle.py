@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional
 
 try:
     from scripts.workspace_state import (
+        _normalize_cache_key_path,
         _extract_repo_name_from_path,
         get_staging_targets,
         get_collection_state_snapshot,
@@ -25,6 +26,53 @@ logger = logging.getLogger(__name__)
 
 WORK_DIR = os.environ.get("WORK_DIR") or os.environ.get("WORKDIR") or "/work"
 _SLUGGED_REPO_RE = re.compile(r"^.+-[0-9a-f]{16}(?:_old)?$")
+
+
+def _normalize_hash_value(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if ":" in raw:
+        _, _, digest = raw.partition(":")
+        if digest.strip():
+            return digest.strip().lower()
+    return raw.lower()
+
+
+def _load_cache_hashes(cache_path: Path) -> Dict[str, str]:
+    try:
+        with cache_path.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+    file_hashes = data.get("file_hashes", {})
+    if not isinstance(file_hashes, dict):
+        return {}
+
+    normalized: Dict[str, str] = {}
+    for path_key, value in file_hashes.items():
+        if isinstance(value, dict):
+            hash_value = value.get("hash")
+        else:
+            hash_value = value
+        digest = _normalize_hash_value(hash_value)
+        if digest:
+            normalized[_normalize_cache_key_path(str(path_key))] = digest
+    return normalized
+
+
+def _load_replica_cache_hashes(workspace_root: Path, slug: str) -> Dict[str, str]:
+    merged: Dict[str, str] = {}
+    cache_paths = (
+        Path(WORK_DIR) / ".codebase" / "repos" / slug / "cache.json",
+        workspace_root / ".codebase" / "cache.json",
+    )
+    for cache_path in cache_paths:
+        if not cache_path.exists():
+            continue
+        merged.update(_load_cache_hashes(cache_path))
+    return merged
 
 
 def get_workspace_key(workspace_path: str) -> str:
@@ -69,6 +117,7 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
         "deleted": 0,
         "moved": 0,
         "skipped": 0,
+        "skipped_hash_match": 0,
         "failed": 0,
     }
 
@@ -224,12 +273,42 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                 raise ValueError(f"Path escapes workspace: {rel}")
             return candidate
 
+        def _member_suffix(name: str, marker: str) -> Optional[str]:
+            idx = name.find(marker)
+            if idx < 0:
+                return None
+            suffix = name[idx + len(marker):]
+            return suffix or None
+
         with tarfile.open(bundle_path, "r:gz") as tar:
             ops_member = None
-            for member in tar.getnames():
-                if member.endswith("metadata/operations.json"):
+            hashes_member = None
+            git_member = None
+            created_members: Dict[str, tarfile.TarInfo] = {}
+            updated_members: Dict[str, tarfile.TarInfo] = {}
+            moved_members: Dict[str, tarfile.TarInfo] = {}
+            for member in tar.getmembers():
+                name = member.name
+                if name.endswith("metadata/operations.json"):
                     ops_member = member
-                    break
+                    continue
+                if name.endswith("metadata/hashes.json"):
+                    hashes_member = member
+                    continue
+                if name.endswith("metadata/git_history.json"):
+                    git_member = member
+                    continue
+                created_rel = _member_suffix(name, "files/created/")
+                if created_rel:
+                    created_members[created_rel] = member
+                    continue
+                updated_rel = _member_suffix(name, "files/updated/")
+                if updated_rel:
+                    updated_members[updated_rel] = member
+                    continue
+                moved_rel = _member_suffix(name, "files/moved/")
+                if moved_rel:
+                    moved_members[moved_rel] = member
 
             if not ops_member:
                 raise ValueError("operations.json not found in bundle")
@@ -240,14 +319,25 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
 
             operations_data = json.loads(ops_file.read().decode("utf-8"))
             operations = operations_data.get("operations", [])
+            bundle_hashes: Dict[str, str] = {}
+            if hashes_member:
+                hashes_file = tar.extractfile(hashes_member)
+                if hashes_file:
+                    hashes_data = json.loads(hashes_file.read().decode("utf-8"))
+                    raw_hashes = hashes_data.get("file_hashes", {})
+                    if isinstance(raw_hashes, dict):
+                        for rel_path, hash_value in raw_hashes.items():
+                            digest = _normalize_hash_value(hash_value)
+                            if digest:
+                                bundle_hashes[str(rel_path)] = digest
+
+            replica_cache_hashes = {
+                slug: _load_replica_cache_hashes(root, slug)
+                for slug, root in replica_roots.items()
+            }
 
             # Best-effort: extract git history metadata for watcher to ingest
             try:
-                git_member = None
-                for member in tar.getnames():
-                    if member.endswith("metadata/git_history.json"):
-                        git_member = member
-                        break
                 if git_member:
                     git_file = tar.extractfile(git_member)
                     if git_file:
@@ -266,11 +356,16 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
             except Exception as git_err:
                 logger.debug(f"[upload_service] Error extracting git history metadata: {git_err}")
 
-            def _apply_operation_to_workspace(workspace_root: Path) -> bool:
-                """Apply a single file operation to a workspace. Returns True on success."""
-                nonlocal operations_count, op_type, rel_path, tar
+            def _apply_operation_to_workspace(slug: str, workspace_root: Path) -> str:
+                """Apply a single file operation to a workspace."""
+                nonlocal operations_count, op_type, rel_path, tar, operation
                 
                 target_path = _safe_join(workspace_root, rel_path)
+                target_key = _normalize_cache_key_path(str(target_path))
+                replica_hashes = replica_cache_hashes.setdefault(slug, {})
+                op_content_hash = _normalize_hash_value(
+                    operation.get("content_hash") or bundle_hashes.get(rel_path)
+                )
 
                 safe_source_path = None
                 source_rel_path = None
@@ -281,76 +376,84 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
 
                 try:
                     if op_type == "created":
-                        file_member = None
-                        for member in tar.getnames():
-                            if member.endswith(f"files/created/{rel_path}"):
-                                file_member = member
-                                break
-
+                        if op_content_hash and target_path.exists():
+                            cached_hash = replica_hashes.get(target_key)
+                            if cached_hash and cached_hash == op_content_hash:
+                                return "skipped_hash_match"
+                        file_member = created_members.get(rel_path)
                         if file_member:
                             file_content = tar.extractfile(file_member)
                             if file_content:
                                 target_path.parent.mkdir(parents=True, exist_ok=True)
                                 target_path.write_bytes(file_content.read())
-                                return True
+                                if op_content_hash:
+                                    replica_hashes[target_key] = op_content_hash
+                                return "applied"
                             else:
-                                return False
+                                return "failed"
                         else:
-                            return False
+                            return "failed"
 
                     elif op_type == "updated":
-                        file_member = None
-                        for member in tar.getnames():
-                            if member.endswith(f"files/updated/{rel_path}"):
-                                file_member = member
-                                break
-
+                        if op_content_hash and target_path.exists():
+                            cached_hash = replica_hashes.get(target_key)
+                            if cached_hash and cached_hash == op_content_hash:
+                                return "skipped_hash_match"
+                        file_member = updated_members.get(rel_path)
                         if file_member:
                             file_content = tar.extractfile(file_member)
                             if file_content:
                                 target_path.parent.mkdir(parents=True, exist_ok=True)
                                 target_path.write_bytes(file_content.read())
-                                return True
+                                if op_content_hash:
+                                    replica_hashes[target_key] = op_content_hash
+                                return "applied"
                             else:
-                                return False
+                                return "failed"
                         else:
-                            return False
+                            return "failed"
 
                     elif op_type == "deleted":
                         if target_path.exists():
                             target_path.unlink(missing_ok=True)
-                            return True
+                            replica_hashes.pop(target_key, None)
+                            return "applied"
                         else:
-                            return True  # Already deleted
+                            replica_hashes.pop(target_key, None)
+                            return "applied"  # Already deleted
 
                     elif op_type == "moved":
                         if safe_source_path and safe_source_path.exists():
                             target_path.parent.mkdir(parents=True, exist_ok=True)
                             safe_source_path.rename(target_path)
-                            return True
+                            source_key = _normalize_cache_key_path(str(safe_source_path))
+                            moved_hash = replica_hashes.pop(source_key, None)
+                            if op_content_hash:
+                                replica_hashes[target_key] = op_content_hash
+                            elif moved_hash:
+                                replica_hashes[target_key] = moved_hash
+                            return "applied"
                         # Remote uploads may not have the source file on the server (e.g. staging
                         # mirrors). In that case, clients can embed the destination content under
                         # files/moved/<dest>.
-                        file_member = None
-                        for member in tar.getnames():
-                            if member.endswith(f"files/moved/{rel_path}"):
-                                file_member = member
-                                break
+                        file_member = moved_members.get(rel_path)
                         if file_member:
                             file_content = tar.extractfile(file_member)
                             if file_content:
                                 target_path.parent.mkdir(parents=True, exist_ok=True)
                                 target_path.write_bytes(file_content.read())
-                                return True
-                            return False
-                        return False
+                                if op_content_hash:
+                                    replica_hashes[target_key] = op_content_hash
+                                return "applied"
+                            return "failed"
+                        return "failed"
 
                     else:
                         logger.warning(f"[upload_service] Unknown operation type: {op_type}")
-                        return False
+                        return "failed"
                 except Exception as e:
                     logger.debug(f"[upload_service] Failed to apply {op_type} to {rel_path} in {workspace_root}: {e}")
-                    return False
+                    return "failed"
 
             for operation in operations:
                 op_type = operation.get("operation")
@@ -381,19 +484,25 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
 
                 rel_path = sanitized_path
 
-                replica_results: Dict[str, bool] = {}
+                replica_results: Dict[str, str] = {}
                 for slug, root in replica_roots.items():
-                    replica_results[slug] = _apply_operation_to_workspace(root)
+                    replica_results[slug] = _apply_operation_to_workspace(slug, root)
 
-                success_any = any(replica_results.values())
-                success_all = all(replica_results.values())
-                if success_any:
+                applied_any = any(result == "applied" for result in replica_results.values())
+                skipped_hash_match = bool(replica_results) and all(
+                    result == "skipped_hash_match" for result in replica_results.values()
+                )
+                success_all = all(result in {"applied", "skipped_hash_match"} for result in replica_results.values())
+                if applied_any:
                     operations_count.setdefault(op_type, 0)
                     operations_count[op_type] = operations_count.get(op_type, 0) + 1
                     if not success_all:
                         logger.debug(
                             f"[upload_service] Partial success for {op_type} {rel_path}: {replica_results}"
                         )
+                elif skipped_hash_match:
+                    operations_count["skipped"] += 1
+                    operations_count["skipped_hash_match"] += 1
                 else:
                     operations_count["failed"] += 1
 

@@ -49,6 +49,31 @@ logger = logging.getLogger(__name__)
 _git_history_skip_log_key: Optional[str] = None
 
 
+def _is_usable_delta_status(status: Any) -> bool:
+    if not isinstance(status, dict):
+        return False
+    state = str(status.get("status") or "").strip().lower()
+    return (
+        bool(status.get("success")) and
+        "workspace_path" in status and
+        "collection_name" in status and
+        state in {"ready", "processing", "completed"}
+    )
+
+
+def _server_status_error_message(status: Any) -> str:
+    if isinstance(status, dict):
+        error = status.get("error")
+        if isinstance(error, dict):
+            msg = str(error.get("message") or "").strip()
+            if msg:
+                return msg
+        state = str(status.get("status") or "").strip()
+        if state:
+            return f"Server status is {state}"
+    return "Invalid server status response"
+
+
 def _log_git_history_skip_once(reason: str, key: str) -> None:
     global _git_history_skip_log_key
     marker = f"{reason}:{key}"
@@ -1236,7 +1261,16 @@ class RemoteUploadClient:
             )
 
             if response.status_code == 200:
-                return response.json()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "STATUS_INVALID",
+                            "message": "Invalid status response payload",
+                        },
+                    }
+                return {"success": True, **payload}
 
             # Handle error response
             error_msg = f"Status check failed with HTTP {response.status_code}"
@@ -1933,15 +1967,8 @@ Examples:
                 # Test server connection first
                 logger.info("Checking server status...")
                 status = client.get_server_status()
-                is_success = (
-                    isinstance(status, dict) and
-                    'workspace_path' in status and
-                    'collection_name' in status and
-                    status.get('status') == 'ready'
-                )
-                if not is_success:
-                    error = status.get("error", {})
-                    logger.error(f"Cannot connect to server: {error.get('message', 'Unknown error')}")
+                if not _is_usable_delta_status(status):
+                    logger.error("Cannot connect to server: %s", _server_status_error_message(status))
                     return 1
 
                 logger.info("Server connection successful")
@@ -1977,16 +2004,8 @@ Examples:
             # Test server connection
             logger.info("Checking server status...")
             status = client.get_server_status()
-            # For delta endpoint, success is indicated by having expected fields (not a "success" boolean)
-            is_success = (
-                isinstance(status, dict) and
-                'workspace_path' in status and
-                'collection_name' in status and
-                status.get('status') == 'ready'
-            )
-            if not is_success:
-                error = status.get("error", {})
-                logger.error(f"Cannot connect to server: {error.get('message', 'Unknown error')}")
+            if not _is_usable_delta_status(status):
+                logger.error("Cannot connect to server: %s", _server_status_error_message(status))
                 return 1
 
             logger.info("Server connection successful")
