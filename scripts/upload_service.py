@@ -5,7 +5,7 @@ HTTP Upload Service for Delta Bundles in Context-Engine.
 This FastAPI service receives delta bundles from remote upload clients,
 processes them, and integrates with the existing indexing pipeline.
 """
-
+# 
 import os
 import json
 import tarfile
@@ -45,7 +45,12 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, sta
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from scripts.upload_delta_bundle import get_workspace_key, process_delta_bundle
+from scripts.upload_delta_bundle import (
+    apply_delta_operations,
+    get_workspace_key,
+    plan_delta_upload,
+    process_delta_bundle,
+)
 
 from scripts.indexing_admin import (
     build_admin_collections_view,
@@ -228,6 +233,39 @@ class UploadResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     next_sequence: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+
+
+class PlanRequest(BaseModel):
+    workspace_path: str
+    collection_name: Optional[str] = None
+    source_path: Optional[str] = None
+    logical_repo_id: Optional[str] = None
+    session: Optional[str] = None
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    operations: List[Dict[str, Any]] = Field(default_factory=list)
+    file_hashes: Dict[str, str] = Field(default_factory=dict)
+
+
+class PlanResponse(BaseModel):
+    success: bool
+    workspace_path: str
+    needed_files: Dict[str, List[str]]
+    operation_counts_preview: Dict[str, int]
+    needed_size_bytes: int
+    replica_targets: List[str]
+    fallback_used: bool = False
+    error: Optional[Dict[str, Any]] = None
+
+
+class ApplyOperationsRequest(BaseModel):
+    workspace_path: str
+    collection_name: Optional[str] = None
+    source_path: Optional[str] = None
+    logical_repo_id: Optional[str] = None
+    session: Optional[str] = None
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    operations: List[Dict[str, Any]] = Field(default_factory=list)
+    file_hashes: Dict[str, str] = Field(default_factory=dict)
 
 class StatusResponse(BaseModel):
     workspace_path: str
@@ -1486,6 +1524,197 @@ async def get_status(workspace_path: str):
     except Exception as e:
         logger.error(f"Error getting status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/delta/plan", response_model=PlanResponse)
+async def plan_delta(request: PlanRequest):
+    """Plan which file bodies are needed before uploading content."""
+    try:
+        workspace = Path(request.workspace_path)
+        if not workspace.is_absolute():
+            workspace = Path(WORK_DIR) / workspace
+        workspace_path = str(workspace.resolve())
+
+        if AUTH_ENABLED:
+            session_value = str(request.session or "").strip()
+            try:
+                record = validate_session(session_value)
+            except AuthDisabledError:
+                record = None
+            except Exception as e:
+                logger.error(f"[upload_service] Failed to validate auth session for plan: {e}")
+                raise HTTPException(status_code=500, detail="Failed to validate auth session")
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired session",
+                )
+
+        plan = plan_delta_upload(
+            workspace_path=workspace_path,
+            operations=request.operations,
+            file_hashes=request.file_hashes,
+        )
+        return PlanResponse(
+            success=True,
+            workspace_path=workspace_path,
+            needed_files=plan.get("needed_files", {"created": [], "updated": [], "moved": []}),
+            operation_counts_preview=plan.get(
+                "operation_counts_preview",
+                {
+                    "created": 0,
+                    "updated": 0,
+                    "deleted": 0,
+                    "moved": 0,
+                    "skipped": 0,
+                    "skipped_hash_match": 0,
+                    "failed": 0,
+                },
+            ),
+            needed_size_bytes=int(plan.get("needed_size_bytes", 0) or 0),
+            replica_targets=list(plan.get("replica_targets", []) or []),
+            fallback_used=False,
+            error=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[upload_service] Error planning delta upload: {e}")
+        return PlanResponse(
+            success=False,
+            workspace_path=request.workspace_path,
+            needed_files={"created": [], "updated": [], "moved": []},
+            operation_counts_preview={
+                "created": 0,
+                "updated": 0,
+                "deleted": 0,
+                "moved": 0,
+                "skipped": 0,
+                "skipped_hash_match": 0,
+                "failed": 0,
+            },
+            needed_size_bytes=0,
+            replica_targets=[],
+            fallback_used=True,
+            error={
+                "code": "PLAN_ERROR",
+                "message": str(e),
+            },
+        )
+
+
+@app.post("/api/v1/delta/apply_ops", response_model=UploadResponse)
+async def apply_delta_ops(request: ApplyOperationsRequest):
+    """Apply metadata-only delta operations without uploading a tar bundle."""
+    key: Optional[str] = None
+    bundle_id: Optional[str] = None
+    sequence_number: Optional[int] = None
+    try:
+        workspace = Path(request.workspace_path)
+        if not workspace.is_absolute():
+            workspace = Path(WORK_DIR) / workspace
+        workspace_path = str(workspace.resolve())
+
+        if AUTH_ENABLED:
+            session_value = str(request.session or "").strip()
+            try:
+                record = validate_session(session_value)
+            except AuthDisabledError:
+                record = None
+            except Exception as e:
+                logger.error(f"[upload_service] Failed to validate auth session for apply_ops: {e}")
+                raise HTTPException(status_code=500, detail="Failed to validate auth session")
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired session",
+                )
+
+        manifest = request.manifest or {}
+        bundle_id = manifest.get("bundle_id")
+        manifest_sequence = manifest.get("sequence_number")
+        key = get_workspace_key(workspace_path)
+        last_sequence = get_last_sequence(workspace_path)
+        sequence_number = manifest_sequence if manifest_sequence is not None else last_sequence + 1
+
+        if sequence_number is not None and sequence_number != last_sequence + 1:
+            return UploadResponse(
+                success=False,
+                error={
+                    "code": "SEQUENCE_MISMATCH",
+                    "message": f"Expected sequence {last_sequence + 1}, got {sequence_number}",
+                    "expected_sequence": last_sequence + 1,
+                    "received_sequence": sequence_number,
+                    "retry_after": 5000,
+                },
+            )
+
+        start_time = datetime.now()
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": None,
+            "processing_time_ms": None,
+            "status": "processing",
+            "completed_at": None,
+        }
+
+        operations_count = await asyncio.to_thread(
+            apply_delta_operations,
+            workspace_path,
+            request.operations,
+            request.file_hashes,
+        )
+        processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        _sequence_tracker[key] = sequence_number
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": operations_count,
+            "processing_time_ms": processing_time,
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+        }
+        logger.info(
+            "[upload_service] Applied metadata-only operations bundle=%s seq=%s in %sms ops=%s",
+            bundle_id,
+            sequence_number,
+            processing_time,
+            operations_count,
+        )
+        return UploadResponse(
+            success=True,
+            bundle_id=bundle_id,
+            sequence_number=sequence_number,
+            processed_operations=operations_count,
+            processing_time_ms=processing_time,
+            next_sequence=sequence_number + 1 if sequence_number is not None else None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[upload_service] Error applying metadata-only operations: {e}")
+        if key:
+            _upload_result_tracker[key] = {
+                "workspace_path": request.workspace_path,
+                "bundle_id": bundle_id,
+                "sequence_number": sequence_number,
+                "processed_operations": None,
+                "processing_time_ms": None,
+                "status": "error",
+                "error": str(e),
+                "message": str(e),
+                "completed_at": datetime.now().isoformat(),
+            }
+        return UploadResponse(
+            success=False,
+            error={
+                "code": "APPLY_OPS_ERROR",
+                "message": str(e),
+            },
+        )
 
 @app.post("/api/v1/delta/upload", response_model=UploadResponse)
 async def upload_delta_bundle(

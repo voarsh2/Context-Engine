@@ -600,3 +600,177 @@ def test_process_delta_bundle_preserves_nested_dirs_under_protected_top_level(tm
     )
 
     assert protected_nested.exists()
+
+
+def test_plan_delta_upload_skips_matching_created_files(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    rel_path = "src/file.txt"
+    content = b"same-content"
+    file_hash = "sha1:efb5d7d4d38013264f2c00fceeb401f8c8d77d9f"
+
+    target = work_dir / slug / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    _write_repo_cache(work_dir, slug, rel_path, file_hash)
+
+    plan = us.plan_delta_upload(
+        workspace_path=f"/work/{slug}",
+        operations=[
+            {
+                "operation": "created",
+                "path": rel_path,
+                "content_hash": file_hash,
+                "size_bytes": len(content),
+            }
+        ],
+        file_hashes={rel_path: file_hash},
+    )
+
+    assert plan["needed_files"]["created"] == []
+    assert plan["operation_counts_preview"]["skipped_hash_match"] == 1
+    assert plan["needed_size_bytes"] == 0
+
+
+def test_plan_delta_upload_marks_updated_file_needed_when_hash_missing(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    rel_path = "src/keep.txt"
+    file_hash = "sha1:2910e29d6f6d3d2f01f8cc52ec386a4936ca9d2f"
+
+    plan = us.plan_delta_upload(
+        workspace_path=f"/work/{slug}",
+        operations=[
+            {
+                "operation": "updated",
+                "path": rel_path,
+                "content_hash": file_hash,
+                "size_bytes": 17,
+            }
+        ],
+        file_hashes={rel_path: file_hash},
+    )
+
+    assert plan["needed_files"]["updated"] == [rel_path]
+    assert plan["operation_counts_preview"]["updated"] == 1
+    assert plan["needed_size_bytes"] == 17
+
+
+def test_plan_delta_upload_skips_move_content_when_source_exists_on_server(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    source_rel = "src/old.py"
+    dest_rel = "src/new.py"
+    source = work_dir / slug / source_rel
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("print('move')\n", encoding="utf-8")
+
+    plan = us.plan_delta_upload(
+        workspace_path=f"/work/{slug}",
+        operations=[
+            {
+                "operation": "moved",
+                "path": dest_rel,
+                "source_path": source_rel,
+                "content_hash": "sha1:abc123",
+                "size_bytes": 12,
+            }
+        ],
+        file_hashes={dest_rel: "sha1:abc123"},
+    )
+
+    assert plan["needed_files"]["moved"] == []
+    assert plan["operation_counts_preview"]["moved"] == 1
+    assert plan["needed_size_bytes"] == 0
+
+
+def test_plan_delta_upload_marks_move_needed_when_source_path_is_invalid(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    dest_rel = "src/new.py"
+
+    plan = us.plan_delta_upload(
+        workspace_path=f"/work/{slug}",
+        operations=[
+            {
+                "operation": "moved",
+                "path": dest_rel,
+                "source_path": "../escape.py",
+                "content_hash": "sha1:abc123",
+                "size_bytes": 12,
+            }
+        ],
+        file_hashes={dest_rel: "sha1:abc123"},
+    )
+
+    assert plan["needed_files"]["moved"] == [dest_rel]
+    assert plan["operation_counts_preview"]["moved"] == 1
+    assert plan["needed_size_bytes"] == 12
+
+
+def test_apply_delta_operations_moves_file_without_bundle(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    source_rel = "src/old.py"
+    dest_rel = "src/new.py"
+    source = work_dir / slug / source_rel
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("print('move')\n", encoding="utf-8")
+
+    counts = us.apply_delta_operations(
+        workspace_path=f"/work/{slug}",
+        operations=[
+            {
+                "operation": "moved",
+                "path": dest_rel,
+                "source_path": source_rel,
+                "content_hash": "sha1:abc123",
+            }
+        ],
+        file_hashes={dest_rel: "sha1:abc123"},
+    )
+
+    assert counts["moved"] == 1
+    assert not source.exists()
+    assert (work_dir / slug / dest_rel).exists()
+
+
+def test_apply_delta_operations_raises_clear_error_when_no_replica_roots(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+    monkeypatch.setattr(us, "_resolve_replica_roots", lambda workspace_path: {})
+
+    with pytest.raises(ValueError, match="No replica roots available"):
+        us.apply_delta_operations(
+            workspace_path="/work/repo",
+            operations=[],
+            file_hashes={},
+        )

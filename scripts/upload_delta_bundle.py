@@ -220,6 +220,420 @@ def _record_empty_dir_sweep(workspace_root: Path, slug: str) -> None:
         )
 
 
+def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) -> Dict[str, Path]:
+    workspace_leaf = Path(workspace_path).name
+
+    repo_name_for_state: Optional[str] = None
+    serving_slug: Optional[str] = None
+    active_slug: Optional[str] = None
+    if _extract_repo_name_from_path and get_collection_state_snapshot:
+        try:
+            repo_name_for_state = _extract_repo_name_from_path(workspace_path)
+            if repo_name_for_state:
+                snapshot = get_collection_state_snapshot(
+                    workspace_path=None,
+                    repo_name=repo_name_for_state,
+                )  # type: ignore[arg-type]
+                serving_slug = snapshot.get("serving_repo_slug")
+                active_slug = snapshot.get("active_repo_slug")
+        except Exception:
+            serving_slug = None
+            active_slug = None
+
+    slug_order: list[str] = []
+    serving_candidate: Optional[str] = None
+    if serving_slug and _SLUGGED_REPO_RE.match(serving_slug):
+        serving_candidate = serving_slug
+    if active_slug and _SLUGGED_REPO_RE.match(active_slug) and active_slug not in slug_order:
+        slug_order.append(active_slug)
+
+    staging_active = False
+    staging_gate = bool(is_staging_enabled() if callable(is_staging_enabled) else False)
+    try:
+        if serving_slug and str(serving_slug).endswith("_old"):
+            staging_active = True
+    except Exception:
+        staging_active = False
+
+    if not staging_gate:
+        staging_active = False
+
+    def _append_slug(slug: Optional[str]) -> None:
+        if slug and _SLUGGED_REPO_RE.match(slug) and slug not in slug_order:
+            slug_order.append(slug)
+
+    if repo_name_for_state and _SLUGGED_REPO_RE.match(repo_name_for_state):
+        canonical_slug = (
+            repo_name_for_state[:-4]
+            if repo_name_for_state.endswith("_old")
+            else repo_name_for_state
+        )
+        old_slug_candidate = (
+            repo_name_for_state
+            if repo_name_for_state.endswith("_old")
+            else f"{canonical_slug}_old"
+        )
+        if staging_active:
+            slug_order = []
+            _append_slug(canonical_slug)
+            _append_slug(old_slug_candidate)
+        elif not slug_order:
+            _append_slug(canonical_slug)
+            old_slug_path = Path(WORK_DIR) / old_slug_candidate
+            if old_slug_path.exists():
+                _append_slug(old_slug_candidate)
+
+    if not slug_order:
+        if _SLUGGED_REPO_RE.match(workspace_leaf):
+            slug_order.append(workspace_leaf)
+        else:
+            if _extract_repo_name_from_path:
+                repo_name = _extract_repo_name_from_path(workspace_path) or workspace_leaf
+            else:
+                repo_name = workspace_leaf
+            workspace_key = get_workspace_key(workspace_path)
+            slug_order.append(f"{repo_name}-{workspace_key}")
+
+    if staging_gate and (not staging_active) and get_staging_targets and _extract_repo_name_from_path:
+        try:
+            repo_name_for_staging = _extract_repo_name_from_path(workspace_path) or slug_order[0]
+            targets = get_staging_targets(
+                workspace_path=workspace_path,
+                repo_name=repo_name_for_staging,
+            )
+            if isinstance(targets, dict) and targets.get("staging"):
+                staging_active = True
+        except Exception as staging_err:
+            logger.debug("[upload_service] Failed to detect staging: %s", staging_err)
+
+    def _slug_exists(slug: str) -> bool:
+        try:
+            return (
+                (Path(WORK_DIR) / slug).exists()
+                or (Path(WORK_DIR) / ".codebase" / "repos" / slug).exists()
+            )
+        except Exception:
+            return False
+
+    if staging_gate and (not staging_active) and slug_order:
+        primary = slug_order[0]
+        if _SLUGGED_REPO_RE.match(primary):
+            canonical = primary[:-4] if primary.endswith("_old") else primary
+            inferred_old = primary if primary.endswith("_old") else f"{canonical}_old"
+            if _slug_exists(inferred_old):
+                staging_active = True
+
+    if staging_gate and staging_active and slug_order:
+        primary = slug_order[0]
+        if _SLUGGED_REPO_RE.match(primary):
+            canonical = primary[:-4] if primary.endswith("_old") else primary
+            old_slug = primary if primary.endswith("_old") else f"{canonical}_old"
+            desired = [canonical, old_slug]
+            slug_order = [s for s in desired if _SLUGGED_REPO_RE.match(s)]
+    elif staging_gate and not staging_active and serving_candidate:
+        if serving_candidate in slug_order:
+            slug_order = [s for s in slug_order if s != serving_candidate]
+
+    if staging_gate:
+        try:
+            logger.info("[upload_service] Delta bundle targets (staging=%s): %s", staging_active, slug_order)
+        except Exception:
+            pass
+
+    replica_roots: Dict[str, Path] = {}
+    for slug in slug_order:
+        path = Path(WORK_DIR) / slug
+        if create_missing:
+            path.mkdir(parents=True, exist_ok=True)
+            try:
+                marker_dir = Path(WORK_DIR) / ".codebase" / "repos" / slug
+                marker_dir.mkdir(parents=True, exist_ok=True)
+                (marker_dir / ".ctxce_managed_upload").write_text("1\n")
+            except Exception:
+                pass
+        replica_roots[slug] = path.resolve()
+    return replica_roots
+
+
+def _safe_join(base: Path, rel: str) -> Path:
+    rp = Path(str(rel))
+    if str(rp) in {".", ""}:
+        raise ValueError("Invalid operation path")
+    if rp.is_absolute():
+        raise ValueError(f"Absolute paths are not allowed: {rel}")
+    base_resolved = base.resolve()
+    candidate = (base_resolved / rp).resolve()
+    try:
+        ok = candidate.is_relative_to(base_resolved)
+    except Exception:
+        ok = os.path.commonpath([str(base_resolved), str(candidate)]) == str(base_resolved)
+    if not ok:
+        raise ValueError(f"Path escapes workspace: {rel}")
+    return candidate
+
+
+def _sanitize_operation_path(rel_path: str, replica_roots: Dict[str, Path]) -> Optional[str]:
+    sanitized_path = rel_path
+    skipped_due_to_exact_slug = False
+    for slug in replica_roots.keys():
+        if sanitized_path == slug:
+            skipped_due_to_exact_slug = True
+            break
+        prefix = f"{slug}/"
+        if sanitized_path.startswith(prefix):
+            sanitized_path = sanitized_path[len(prefix):]
+            break
+    if skipped_due_to_exact_slug or not sanitized_path:
+        return None
+    return sanitized_path
+
+
+def plan_delta_upload(
+    workspace_path: str,
+    operations: list[Dict[str, Any]],
+    file_hashes: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    needed_files = {
+        "created": [],
+        "updated": [],
+        "moved": [],
+    }
+    operations_count = {
+        "created": 0,
+        "updated": 0,
+        "deleted": 0,
+        "moved": 0,
+        "skipped": 0,
+        "skipped_hash_match": 0,
+        "failed": 0,
+    }
+    needed_size_bytes = 0
+    replica_roots = _resolve_replica_roots(workspace_path, create_missing=False)
+    replica_cache_hashes = {
+        slug: _load_replica_cache_hashes(root, slug)
+        for slug, root in replica_roots.items()
+    }
+    normalized_hashes = {
+        str(rel_path): _normalize_hash_value(hash_value)
+        for rel_path, hash_value in (file_hashes or {}).items()
+        if _normalize_hash_value(hash_value)
+    }
+
+    for operation in operations:
+        op_type = str(operation.get("operation") or "")
+        rel_path = operation.get("path")
+        if not rel_path:
+            operations_count["skipped"] += 1
+            continue
+
+        sanitized = _sanitize_operation_path(str(rel_path), replica_roots)
+        if not sanitized:
+            operations_count["skipped"] += 1
+            continue
+
+        if op_type == "deleted":
+            operations_count["deleted"] += 1
+            continue
+        if op_type == "moved":
+            operations_count["moved"] += 1
+            source_rel_path = operation.get("source_path") or operation.get("source_relative_path")
+            if not source_rel_path:
+                needed_files["moved"].append(sanitized)
+                needed_size_bytes += int(operation.get("size_bytes") or 0)
+                continue
+
+            move_needs_content = False
+            for _slug, root in replica_roots.items():
+                try:
+                    safe_source_path = _safe_join(root, str(source_rel_path))
+                except ValueError:
+                    logger.warning(
+                        "[upload_service] Invalid move source path during plan: %s (root=%s)",
+                        source_rel_path,
+                        root,
+                    )
+                    move_needs_content = True
+                    break
+                if not safe_source_path.exists():
+                    move_needs_content = True
+                    break
+            if move_needs_content:
+                needed_files["moved"].append(sanitized)
+                needed_size_bytes += int(operation.get("size_bytes") or 0)
+            continue
+        if op_type not in {"created", "updated"}:
+            operations_count["failed"] += 1
+            continue
+
+        op_content_hash = _normalize_hash_value(
+            operation.get("content_hash") or normalized_hashes.get(sanitized)
+        )
+        if not op_content_hash:
+            needed_files[op_type].append(sanitized)
+            operations_count[op_type] += 1
+            needed_size_bytes += int(operation.get("size_bytes") or 0)
+            continue
+
+        needs_content = False
+        for slug, root in replica_roots.items():
+            target_path = _safe_join(root, sanitized)
+            target_key = _normalize_cache_key_path(str(target_path))
+            cached_hash = replica_cache_hashes.get(slug, {}).get(target_key)
+            if cached_hash != op_content_hash:
+                needs_content = True
+                break
+
+        if needs_content:
+            needed_files[op_type].append(sanitized)
+            operations_count[op_type] += 1
+            needed_size_bytes += int(operation.get("size_bytes") or 0)
+        else:
+            operations_count["skipped"] += 1
+            operations_count["skipped_hash_match"] += 1
+
+    return {
+        "needed_files": needed_files,
+        "operation_counts_preview": operations_count,
+        "needed_size_bytes": needed_size_bytes,
+        "replica_targets": list(replica_roots.keys()),
+    }
+
+
+def apply_delta_operations(
+    workspace_path: str,
+    operations: list[Dict[str, Any]],
+    file_hashes: Optional[Dict[str, str]] = None,
+) -> Dict[str, int]:
+    """Apply metadata-only delta operations without requiring a tar bundle."""
+    operations_count = {
+        "created": 0,
+        "updated": 0,
+        "deleted": 0,
+        "moved": 0,
+        "skipped": 0,
+        "skipped_hash_match": 0,
+        "failed": 0,
+    }
+
+    try:
+        replica_roots = _resolve_replica_roots(workspace_path)
+        if not replica_roots:
+            raise ValueError(f"No replica roots available for workspace: {workspace_path}")
+        replica_cache_hashes = {
+            slug: _load_replica_cache_hashes(root, slug)
+            for slug, root in replica_roots.items()
+        }
+        normalized_hashes = {
+            str(rel_path): _normalize_hash_value(hash_value)
+            for rel_path, hash_value in (file_hashes or {}).items()
+            if _normalize_hash_value(hash_value)
+        }
+
+        for operation in operations:
+            op_type = str(operation.get("operation") or "")
+            rel_path = operation.get("path")
+
+            if not rel_path:
+                operations_count["skipped"] += 1
+                continue
+
+            sanitized_path = _sanitize_operation_path(str(rel_path), replica_roots)
+            if not sanitized_path:
+                operations_count["skipped"] += 1
+                continue
+
+            rel_path = sanitized_path
+
+            if op_type not in {"deleted", "moved"}:
+                operations_count["failed"] += 1
+                continue
+
+            source_rel_path = None
+            if op_type == "moved":
+                raw_source = operation.get("source_path") or operation.get("source_relative_path")
+                if not raw_source:
+                    operations_count["failed"] += 1
+                    continue
+                source_rel_path = _sanitize_operation_path(str(raw_source), replica_roots)
+                if not source_rel_path:
+                    operations_count["failed"] += 1
+                    continue
+
+            replica_results: Dict[str, str] = {}
+            for slug, root in replica_roots.items():
+                target_path = _safe_join(root, rel_path)
+                target_key = _normalize_cache_key_path(str(target_path))
+                replica_hashes = replica_cache_hashes.setdefault(slug, {})
+                op_content_hash = _normalize_hash_value(
+                    operation.get("content_hash") or normalized_hashes.get(rel_path)
+                )
+
+                try:
+                    if op_type == "deleted":
+                        if target_path.exists():
+                            target_path.unlink(missing_ok=True)
+                        _cleanup_empty_dirs(target_path.parent, root)
+                        replica_hashes.pop(target_key, None)
+                        replica_results[slug] = "applied"
+                        continue
+
+                    safe_source_path = _safe_join(root, source_rel_path or "")
+                    if not safe_source_path.exists():
+                        replica_results[slug] = "failed"
+                        continue
+
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    if target_path.exists():
+                        if target_path.is_dir():
+                            shutil.rmtree(target_path)
+                        else:
+                            target_path.unlink()
+                    shutil.move(str(safe_source_path), str(target_path))
+                    _cleanup_empty_dirs(safe_source_path.parent, root)
+                    source_key = _normalize_cache_key_path(str(safe_source_path))
+                    moved_hash = replica_hashes.pop(source_key, None)
+                    if op_content_hash:
+                        replica_hashes[target_key] = op_content_hash
+                    elif moved_hash:
+                        replica_hashes[target_key] = moved_hash
+                    replica_results[slug] = "applied"
+                except Exception as exc:
+                    logger.debug(
+                        "[upload_service] Failed to apply metadata-only %s to %s in %s: %s",
+                        op_type,
+                        rel_path,
+                        root,
+                        exc,
+                    )
+                    replica_results[slug] = "failed"
+
+            applied_any = any(result == "applied" for result in replica_results.values())
+            success_all = all(result == "applied" for result in replica_results.values())
+            if applied_any:
+                operations_count[op_type] += 1
+                if not success_all:
+                    logger.debug(
+                        "[upload_service] Partial metadata-only success for %s %s: %s",
+                        op_type,
+                        rel_path,
+                        replica_results,
+                    )
+            else:
+                operations_count["failed"] += 1
+
+        for slug, root in replica_roots.items():
+            if not _should_run_empty_dir_sweep(root, slug):
+                continue
+            logger.info("[upload_service] Sweeping empty directories under %s", root)
+            _sweep_empty_workspace_dirs(root)
+            _record_empty_dir_sweep(root, slug)
+
+        return operations_count
+    except Exception as e:
+        logger.error(f"Error applying metadata-only delta operations: {e}")
+        raise
+
+
 def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[str, Any]) -> Dict[str, int]:
     """Process delta bundle and return operation counts."""
     operations_count = {
@@ -233,156 +647,11 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
     }
 
     try:
-        # CRITICAL: Always materialize writes under WORK_DIR using a slugged repo directory.
-        # Do NOT write directly into the client-supplied workspace_path, since that may be a host
-        # path (e.g. /home/user/repo) that is not mounted/visible to the watcher/indexer.
-        workspace_leaf = Path(workspace_path).name
-
-        repo_name_for_state: Optional[str] = None
-
-        serving_slug: Optional[str] = None
-        active_slug: Optional[str] = None
-        if _extract_repo_name_from_path and get_collection_state_snapshot:
-            try:
-                repo_name_for_state = _extract_repo_name_from_path(workspace_path)
-                if repo_name_for_state:
-                    snapshot = get_collection_state_snapshot(workspace_path=None, repo_name=repo_name_for_state)  # type: ignore[arg-type]
-                    serving_slug = snapshot.get("serving_repo_slug")
-                    active_slug = snapshot.get("active_repo_slug")
-            except Exception:
-                serving_slug = None
-                active_slug = None
-
-        slug_order: list[str] = []
-        serving_candidate: Optional[str] = None
-        if serving_slug and _SLUGGED_REPO_RE.match(serving_slug):
-            serving_candidate = serving_slug
-        if active_slug and _SLUGGED_REPO_RE.match(active_slug) and active_slug not in slug_order:
-            slug_order.append(active_slug)
-
-        # If staging is active, we must mirror uploads into BOTH the canonical slug and
-        # the "*_old" slug. Relying purely on snapshot detection is brittle (e.g. when
-        # the client workspace_path is a host path). When we can infer a canonical slug,
-        # force both targets.
-        staging_active = False
-        staging_gate = bool(is_staging_enabled() if callable(is_staging_enabled) else False)
-        try:
-            if serving_slug and str(serving_slug).endswith("_old"):
-                staging_active = True
-        except Exception:
-            staging_active = False
-
-        if not staging_gate:
-            staging_active = False
-
-        def _append_slug(slug: Optional[str]) -> None:
-            if slug and _SLUGGED_REPO_RE.match(slug) and slug not in slug_order:
-                slug_order.append(slug)
-
-        if repo_name_for_state and _SLUGGED_REPO_RE.match(repo_name_for_state):
-            canonical_slug = repo_name_for_state[:-4] if repo_name_for_state.endswith("_old") else repo_name_for_state
-            old_slug_candidate = (
-                repo_name_for_state if repo_name_for_state.endswith("_old") else f"{canonical_slug}_old"
-            )
-            if staging_active:
-                slug_order = []
-                _append_slug(canonical_slug)
-                _append_slug(old_slug_candidate)
-            elif not slug_order:
-                _append_slug(canonical_slug)
-                old_slug_path = Path(WORK_DIR) / old_slug_candidate
-                if old_slug_path.exists():
-                    _append_slug(old_slug_candidate)
-
-        if not slug_order:
-            if _SLUGGED_REPO_RE.match(workspace_leaf):
-                slug_order.append(workspace_leaf)
-            else:
-                if _extract_repo_name_from_path:
-                    repo_name = _extract_repo_name_from_path(workspace_path) or workspace_leaf
-                else:
-                    repo_name = workspace_leaf
-                workspace_key = get_workspace_key(workspace_path)
-                slug_order.append(f"{repo_name}-{workspace_key}")
-
-        # Best-effort: if staging is active according to workspace_state, ensure we mirror to
-        # both the canonical slug and its *_old slug.
-        if staging_gate and (not staging_active) and get_staging_targets and _extract_repo_name_from_path:
-            try:
-                repo_name_for_staging = _extract_repo_name_from_path(workspace_path) or slug_order[0]
-                targets = get_staging_targets(workspace_path=workspace_path, repo_name=repo_name_for_staging)
-                if isinstance(targets, dict) and targets.get("staging"):
-                    staging_active = True
-            except Exception as staging_err:
-                logger.debug(f"[upload_service] Failed to detect staging: {staging_err}")
-
-        def _slug_exists(slug: str) -> bool:
-            try:
-                return (
-                    (Path(WORK_DIR) / slug).exists()
-                    or (Path(WORK_DIR) / ".codebase" / "repos" / slug).exists()
-                )
-            except Exception:
-                return False
-
-        if staging_gate and (not staging_active) and slug_order:
-            primary = slug_order[0]
-            if _SLUGGED_REPO_RE.match(primary):
-                canonical = primary[:-4] if primary.endswith("_old") else primary
-                inferred_old = primary if primary.endswith("_old") else f"{canonical}_old"
-                if _slug_exists(inferred_old):
-                    staging_active = True
-
-        if staging_gate and staging_active and slug_order:
-            primary = slug_order[0]
-            if _SLUGGED_REPO_RE.match(primary):
-                canonical = primary[:-4] if primary.endswith("_old") else primary
-                old_slug = primary if primary.endswith("_old") else f"{canonical}_old"
-                desired = [canonical, old_slug]
-                slug_order = [s for s in desired if _SLUGGED_REPO_RE.match(s)]
-        elif staging_gate and not staging_active and serving_candidate:
-            # Ignore serving slugs when staging is disabled; keep deterministic non-staging writes.
-            if serving_candidate in slug_order:
-                slug_order = [s for s in slug_order if s != serving_candidate]
-
-        if staging_gate:
-            try:
-                logger.info(f"[upload_service] Delta bundle targets (staging={staging_active}): {slug_order}")
-            except Exception:
-                pass
-
-        replica_roots: Dict[str, Path] = {}
-        for slug in slug_order:
-            path = Path(WORK_DIR) / slug
-            path.mkdir(parents=True, exist_ok=True)
-            try:
-                marker_dir = Path(WORK_DIR) / ".codebase" / "repos" / slug
-                marker_dir.mkdir(parents=True, exist_ok=True)
-                (marker_dir / ".ctxce_managed_upload").write_text("1\n")
-            except Exception:
-                pass
-            replica_roots[slug] = path.resolve()
-
-        primary_slug = slug_order[0]
+        replica_roots = _resolve_replica_roots(workspace_path)
+        if not replica_roots:
+            raise ValueError(f"No replica roots available for workspace: {workspace_path}")
+        primary_slug = next(iter(replica_roots))
         workspace_root = replica_roots[primary_slug]
-
-        def _safe_join(base: Path, rel: str) -> Path:
-            # SECURITY: Prevent path traversal / absolute-path writes by ensuring the resolved
-            # candidate path stays within the intended workspace root.
-            rp = Path(str(rel))
-            if str(rp) in {".", ""}:
-                raise ValueError("Invalid operation path")
-            if rp.is_absolute():
-                raise ValueError(f"Absolute paths are not allowed: {rel}")
-            base_resolved = base.resolve()
-            candidate = (base_resolved / rp).resolve()
-            try:
-                ok = candidate.is_relative_to(base_resolved)
-            except Exception:
-                ok = os.path.commonpath([str(base_resolved), str(candidate)]) == str(base_resolved)
-            if not ok:
-                raise ValueError(f"Path escapes workspace: {rel}")
-            return candidate
 
         def _member_suffix(name: str, marker: str) -> Optional[str]:
             idx = name.find(marker)
@@ -582,18 +851,8 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     operations_count["skipped"] += 1
                     continue
 
-                sanitized_path = rel_path
-                skipped_due_to_exact_slug = False
-                for slug in replica_roots.keys():
-                    if sanitized_path == slug:
-                        skipped_due_to_exact_slug = True
-                        break
-                    prefix = f"{slug}/"
-                    if sanitized_path.startswith(prefix):
-                        sanitized_path = sanitized_path[len(prefix):]
-                        break
-
-                if skipped_due_to_exact_slug or not sanitized_path:
+                sanitized_path = _sanitize_operation_path(str(rel_path), replica_roots)
+                if not sanitized_path:
                     logger.debug(
                         f"[upload_service] Skipping operation {op_type} for path {rel_path}: "
                         "appears to reference slug root directly.",

@@ -74,6 +74,13 @@ def _server_status_error_message(status: Any) -> str:
     return "Invalid server status response"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _log_git_history_skip_once(reason: str, key: str) -> None:
     global _git_history_skip_log_key
     marker = f"{reason}:{key}"
@@ -549,6 +556,94 @@ class RemoteUploadClient:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        self.last_upload_result: Dict[str, Any] = {"outcome": "idle"}
+        self._last_plan_payload: Optional[Dict[str, Any]] = None
+
+    def _set_last_upload_result(self, outcome: str, **details: Any) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"outcome": outcome}
+        result.update(details)
+        self.last_upload_result = result
+        return result
+
+    def log_watch_upload_result(self) -> None:
+        outcome = str((self.last_upload_result or {}).get("outcome") or "")
+        if outcome == "skipped_by_plan":
+            logger.info("[watch] No upload needed after plan")
+        elif outcome == "queued":
+            logger.info("[watch] Upload request accepted; server processing asynchronously")
+        elif outcome == "uploaded_async":
+            processed = (self.last_upload_result or {}).get("processed_operations")
+            logger.info("[watch] Upload processed asynchronously: %s", processed or {})
+        elif outcome == "uploaded":
+            logger.info("[watch] Successfully uploaded changes")
+        elif outcome == "no_changes":
+            logger.info("[watch] No meaningful changes to upload")
+        else:
+            logger.info("[watch] Upload handling completed")
+
+    def _finalize_successful_changes(self, changes: Dict[str, List]) -> None:
+        for path in changes.get("deleted", []):
+            try:
+                abs_path = str(path.resolve())
+                remove_cached_file(abs_path, self.repo_name)
+                self._stat_cache.pop(abs_path, None)
+            except Exception:
+                continue
+        for source_path, _dest_path in changes.get("moved", []):
+            try:
+                abs_path = str(source_path.resolve())
+                remove_cached_file(abs_path, self.repo_name)
+                self._stat_cache.pop(abs_path, None)
+            except Exception:
+                continue
+
+    def _await_async_upload_result(
+        self,
+        bundle_id: Optional[str],
+        sequence_number: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            max_wait = float(os.environ.get("CTXCE_REMOTE_UPLOAD_STATUS_WAIT_SECS", "5"))
+        except Exception:
+            max_wait = 5.0
+        if max_wait <= 0:
+            return None
+
+        try:
+            poll_interval = float(os.environ.get("CTXCE_REMOTE_UPLOAD_STATUS_POLL_INTERVAL_SECS", "1"))
+        except Exception:
+            poll_interval = 1.0
+        poll_interval = max(0.1, poll_interval)
+
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            status = self.get_server_status()
+            if not status.get("success"):
+                return None
+            server_info = status.get("server_info", {}) if isinstance(status, dict) else {}
+            last_bundle_id = server_info.get("last_bundle_id")
+            last_upload_status = server_info.get("last_upload_status")
+            last_sequence = status.get("last_sequence")
+            bundle_matches = bool(bundle_id) and last_bundle_id == bundle_id
+            sequence_matches = sequence_number is not None and last_sequence == sequence_number
+            if bundle_matches or sequence_matches:
+                if last_upload_status == "completed":
+                    return {
+                        "outcome": "uploaded_async",
+                        "bundle_id": last_bundle_id or bundle_id,
+                        "sequence_number": last_sequence if last_sequence is not None else sequence_number,
+                        "processed_operations": server_info.get("last_processed_operations"),
+                        "processing_time_ms": server_info.get("last_processing_time_ms"),
+                    }
+                if last_upload_status == "failed":
+                    return {
+                        "outcome": "failed",
+                        "bundle_id": last_bundle_id or bundle_id,
+                        "sequence_number": last_sequence if last_sequence is not None else sequence_number,
+                        "error": server_info.get("last_error"),
+                    }
+            time.sleep(poll_interval)
+        return None
 
     def __enter__(self):
         """Context manager entry."""
@@ -628,6 +723,10 @@ class RemoteUploadClient:
         if rel.name.startswith(".") and rel.name.lower() not in extensionless:
             return True
         return False
+
+    def _is_watchable_path(self, path: Path) -> bool:
+        """Return True when a filesystem event path is eligible for upload processing."""
+        return not self._is_ignored_path(path) and idx.CODE_EXTS.get(path.suffix.lower(), "unknown") != "unknown"
 
     def _get_temp_bundle_dir(self) -> Path:
         """Get or create temporary directory for bundle creation."""
@@ -1030,6 +1129,264 @@ class RemoteUploadClient:
                 tar.add(temp_path, arcname=f"{bundle_id}")
 
             return str(bundle_path), manifest
+
+    def _build_plan_payload(self, changes: Dict[str, List]) -> Dict[str, Any]:
+        created_at = datetime.now().isoformat()
+        bundle_id = str(uuid.uuid4())
+        operations: List[Dict[str, Any]] = []
+        file_hashes: Dict[str, str] = {}
+        total_size = 0
+
+        for path in changes["created"]:
+            rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                content = path.read_bytes()
+                file_hash = hashlib.sha1(content).hexdigest()
+                stat = path.stat()
+                operations.append(
+                    {
+                        "operation": "created",
+                        "path": rel_path,
+                        "size_bytes": stat.st_size,
+                        "content_hash": f"sha1:{file_hash}",
+                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                    }
+                )
+                file_hashes[rel_path] = f"sha1:{file_hash}"
+                total_size += stat.st_size
+            except Exception as e:
+                logger.warning("[remote_upload] Failed to prepare created plan entry for %s: %s", path, e)
+
+        for path in changes["updated"]:
+            rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                content = path.read_bytes()
+                file_hash = hashlib.sha1(content).hexdigest()
+                stat = path.stat()
+                operations.append(
+                    {
+                        "operation": "updated",
+                        "path": rel_path,
+                        "size_bytes": stat.st_size,
+                        "content_hash": f"sha1:{file_hash}",
+                        "previous_hash": get_cached_file_hash(str(path.resolve()), self.repo_name),
+                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                    }
+                )
+                file_hashes[rel_path] = f"sha1:{file_hash}"
+                total_size += stat.st_size
+            except Exception as e:
+                logger.warning("[remote_upload] Failed to prepare updated plan entry for %s: %s", path, e)
+
+        for source_path, dest_path in changes["moved"]:
+            dest_rel_path = dest_path.relative_to(Path(self.workspace_path)).as_posix()
+            source_rel_path = source_path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                content = dest_path.read_bytes()
+                file_hash = hashlib.sha1(content).hexdigest()
+                stat = dest_path.stat()
+                operations.append(
+                    {
+                        "operation": "moved",
+                        "path": dest_rel_path,
+                        "source_path": source_rel_path,
+                        "size_bytes": stat.st_size,
+                        "content_hash": f"sha1:{file_hash}",
+                        "language": idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown"),
+                    }
+                )
+                file_hashes[dest_rel_path] = f"sha1:{file_hash}"
+                total_size += stat.st_size
+            except Exception as e:
+                logger.warning(
+                    "[remote_upload] Failed to prepare moved plan entry for %s -> %s: %s",
+                    source_path,
+                    dest_path,
+                    e,
+                )
+
+        for path in changes["deleted"]:
+            rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                operations.append(
+                    {
+                        "operation": "deleted",
+                        "path": rel_path,
+                        "previous_hash": get_cached_file_hash(str(path.resolve()), self.repo_name),
+                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                    }
+                )
+            except Exception as e:
+                logger.warning("[remote_upload] Failed to prepare deleted plan entry for %s: %s", path, e)
+
+        manifest = {
+            "version": "1.0",
+            "bundle_id": bundle_id,
+            "workspace_path": self.workspace_path,
+            "collection_name": self.collection_name,
+            "created_at": created_at,
+            "sequence_number": None,
+            "parent_sequence": None,
+            "operations": {
+                "created": len(changes["created"]),
+                "updated": len(changes["updated"]),
+                "deleted": len(changes["deleted"]),
+                "moved": len(changes["moved"]),
+            },
+            "total_files": len(operations),
+            "total_size_bytes": total_size,
+            "compression": "gzip",
+            "encoding": "utf-8",
+        }
+        return {
+            "manifest": manifest,
+            "operations": operations,
+            "file_hashes": file_hashes,
+        }
+
+    def _plan_delta_upload(self, changes: Dict[str, List]) -> Optional[Dict[str, Any]]:
+        if not _env_flag("CTXCE_REMOTE_UPLOAD_PLAN_ENABLED", True):
+            return None
+        try:
+            payload = self._build_plan_payload(changes)
+            self._last_plan_payload = payload
+            data = {
+                "workspace_path": self._translate_to_container_path(self.workspace_path),
+                "collection_name": self.collection_name,
+                "source_path": self.workspace_path,
+                "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
+                "manifest": payload["manifest"],
+                "operations": payload["operations"],
+                "file_hashes": payload["file_hashes"],
+            }
+            sess = get_auth_session(self.upload_endpoint)
+            if sess:
+                data["session"] = sess
+            if getattr(self, "logical_repo_id", None):
+                data["logical_repo_id"] = self.logical_repo_id
+
+            response = self.session.post(
+                f"{self.upload_endpoint}/api/v1/delta/plan",
+                json=data,
+                timeout=min(self.timeout, 60),
+            )
+            if response.status_code in {404, 405}:
+                logger.info("[remote_upload] Plan endpoint unavailable; falling back to full bundle upload")
+                return None
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("success", False):
+                logger.warning("[remote_upload] Plan request failed; falling back: %s", body.get("error"))
+                return None
+            return body
+        except Exception as e:
+            logger.warning("[remote_upload] Plan request failed; falling back to full bundle upload: %s", e)
+            return None
+
+    def _build_apply_only_payload(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._last_plan_payload or self._build_plan_payload(changes)
+        needed = plan.get("needed_files", {}) if isinstance(plan, dict) else {}
+        moved_needed = set(needed.get("moved", []) or [])
+        filtered_ops: List[Dict[str, Any]] = []
+        filtered_hashes: Dict[str, str] = {}
+        for operation in payload.get("operations", []):
+            op_type = str(operation.get("operation") or "")
+            rel_path = str(operation.get("path") or "")
+            if op_type == "deleted":
+                filtered_ops.append(operation)
+                continue
+            if op_type == "moved" and rel_path not in moved_needed:
+                filtered_ops.append(operation)
+                hash_value = payload.get("file_hashes", {}).get(rel_path)
+                if hash_value:
+                    filtered_hashes[rel_path] = hash_value
+        return {
+            "manifest": payload.get("manifest", {}),
+            "operations": filtered_ops,
+            "file_hashes": filtered_hashes,
+        }
+
+    def _apply_operations_without_content(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Optional[bool]:
+        payload = self._build_apply_only_payload(changes, plan)
+        operations = payload.get("operations", [])
+        if not operations:
+            return None
+        try:
+            data = {
+                "workspace_path": self._translate_to_container_path(self.workspace_path),
+                "collection_name": self.collection_name,
+                "source_path": self.workspace_path,
+                "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
+                "manifest": payload["manifest"],
+                "operations": operations,
+                "file_hashes": payload["file_hashes"],
+            }
+            sess = get_auth_session(self.upload_endpoint)
+            if sess:
+                data["session"] = sess
+            if getattr(self, "logical_repo_id", None):
+                data["logical_repo_id"] = self.logical_repo_id
+
+            logger.info(
+                "[remote_upload] Applying metadata-only operations without bundle: deleted=%s moved=%s",
+                sum(1 for op in operations if op.get("operation") == "deleted"),
+                sum(1 for op in operations if op.get("operation") == "moved"),
+            )
+            response = self.session.post(
+                f"{self.upload_endpoint}/api/v1/delta/apply_ops",
+                json=data,
+                timeout=min(self.timeout, 60),
+            )
+            if response.status_code in {404, 405}:
+                logger.info("[remote_upload] apply_ops endpoint unavailable; falling back to bundle upload")
+                return None
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("success", False):
+                logger.warning("[remote_upload] apply_ops failed; falling back to bundle upload: %s", body.get("error"))
+                return None
+            self._finalize_successful_changes(changes)
+            self._set_last_upload_result(
+                "uploaded",
+                bundle_id=body.get("bundle_id"),
+                sequence_number=body.get("sequence_number"),
+                processed_operations=body.get("processed_operations"),
+            )
+            logger.info(
+                "[remote_upload] Metadata-only operations applied: %s",
+                body.get("processed_operations") or {},
+            )
+            return True
+        except Exception as e:
+            logger.warning("[remote_upload] apply_ops failed; falling back to bundle upload: %s", e)
+            return None
+
+    def _filter_changes_by_plan(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Dict[str, List]:
+        needed = plan.get("needed_files", {}) if isinstance(plan, dict) else {}
+        created_needed = set(needed.get("created", []) or [])
+        updated_needed = set(needed.get("updated", []) or [])
+        moved_needed = set(needed.get("moved", []) or [])
+
+        filtered_created = [
+            path for path in changes["created"]
+            if path.relative_to(Path(self.workspace_path)).as_posix() in created_needed
+        ]
+        filtered_updated = [
+            path for path in changes["updated"]
+            if path.relative_to(Path(self.workspace_path)).as_posix() in updated_needed
+        ]
+        filtered_moved = [
+            (source_path, dest_path)
+            for source_path, dest_path in changes["moved"]
+            if dest_path.relative_to(Path(self.workspace_path)).as_posix() in moved_needed
+        ]
+        return {
+            "created": filtered_created,
+            "updated": filtered_updated,
+            "deleted": list(changes["deleted"]),
+            "moved": filtered_moved,
+            "unchanged": [],
+        }
 
     def upload_bundle(self, bundle_path: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1442,10 +1799,13 @@ class RemoteUploadClient:
             # Validate input
             if not changes:
                 logger.info("[remote_upload] No changes provided")
+                self._set_last_upload_result("no_changes")
                 return True
+
 
             if not self.has_meaningful_changes(changes):
                 logger.info("[remote_upload] No meaningful changes detected, skipping upload")
+                self._set_last_upload_result("no_changes")
                 return True
 
             # Log change summary
@@ -1454,10 +1814,43 @@ class RemoteUploadClient:
                        f"{len(changes['created'])} created, {len(changes['updated'])} updated, "
                        f"{len(changes['deleted'])} deleted, {len(changes['moved'])} moved")
 
+            planned_changes = changes
+            plan = self._plan_delta_upload(changes)
+            if plan:
+                preview = plan.get("operation_counts_preview", {})
+                logger.info(
+                    "[remote_upload] Plan preview: needed created=%s updated=%s deleted=%s moved=%s "
+                    "skipped_hash_match=%s needed_bytes=%s",
+                    preview.get("created", 0),
+                    preview.get("updated", 0),
+                    preview.get("deleted", 0),
+                    preview.get("moved", 0),
+                    preview.get("skipped_hash_match", 0),
+                    plan.get("needed_size_bytes", 0),
+                )
+                planned_changes = self._filter_changes_by_plan(changes, plan)
+                has_content_work = bool(
+                    planned_changes.get("created")
+                    or planned_changes.get("updated")
+                    or planned_changes.get("moved")
+                )
+                if not has_content_work:
+                    apply_only_result = self._apply_operations_without_content(changes, plan)
+                    if apply_only_result is True:
+                        return True
+                if not self.has_meaningful_changes(planned_changes):
+                    logger.info("[remote_upload] Plan found no upload work; skipping bundle upload")
+                    self._set_last_upload_result(
+                        "skipped_by_plan",
+                        plan_preview=preview,
+                        needed_size_bytes=plan.get("needed_size_bytes", 0),
+                    )
+                    return True
+
             # Create delta bundle
             bundle_path = None
             try:
-                bundle_path, manifest = self.create_delta_bundle(changes)
+                bundle_path, manifest = self.create_delta_bundle(planned_changes)
                 logger.info(f"[remote_upload] Created delta bundle: {manifest['bundle_id']} "
                            f"(size: {manifest['total_size_bytes']} bytes)")
 
@@ -1469,6 +1862,7 @@ class RemoteUploadClient:
                 logger.error(f"[remote_upload] Error creating delta bundle: {e}")
                 # Clean up any temporary files on failure
                 self.cleanup()
+                self._set_last_upload_result("failed", stage="bundle_creation", error=str(e))
                 return False
 
             # Upload bundle with retry logic
@@ -1476,9 +1870,47 @@ class RemoteUploadClient:
                 response = self.upload_bundle(bundle_path, manifest)
 
                 if response.get("success", False):
-                    processed_ops = response.get('processed_operations', {})
-                    logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
-                    logger.info(f"[remote_upload] Processed operations: {processed_ops}")
+                    processed_ops = response.get("processed_operations")
+                    if processed_ops is None:
+                        logger.info(
+                            "[remote_upload] Bundle %s accepted by server; processing asynchronously (sequence=%s)",
+                            manifest["bundle_id"],
+                            response.get("sequence_number"),
+                        )
+                        self._set_last_upload_result(
+                            "queued",
+                            bundle_id=manifest["bundle_id"],
+                            sequence_number=response.get("sequence_number"),
+                        )
+                        async_result = self._await_async_upload_result(
+                            manifest["bundle_id"],
+                            response.get("sequence_number"),
+                        )
+                        if async_result:
+                            self.last_upload_result = async_result
+                            if async_result["outcome"] == "uploaded_async":
+                                self._finalize_successful_changes(planned_changes)
+                                logger.info(
+                                    "[remote_upload] Async processing completed for bundle %s: %s",
+                                    manifest["bundle_id"],
+                                    async_result.get("processed_operations") or {},
+                                )
+                            elif async_result["outcome"] == "failed":
+                                logger.warning(
+                                    "[remote_upload] Async processing failed for bundle %s: %s",
+                                    manifest["bundle_id"],
+                                    async_result.get("error"),
+                                )
+                    else:
+                        logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
+                        logger.info(f"[remote_upload] Processed operations: {processed_ops}")
+                        self._finalize_successful_changes(planned_changes)
+                        self._set_last_upload_result(
+                            "uploaded",
+                            bundle_id=manifest["bundle_id"],
+                            sequence_number=response.get("sequence_number"),
+                            processed_operations=processed_ops,
+                        )
 
                     # Clean up temporary bundle after successful upload
                     try:
@@ -1494,15 +1926,19 @@ class RemoteUploadClient:
                 else:
                     error_msg = response.get('error', {}).get('message', 'Unknown upload error')
                     logger.error(f"[remote_upload] Upload failed: {error_msg}")
+                    self._set_last_upload_result("failed", stage="upload", error=error_msg)
                     return False
 
             except Exception as e:
                 logger.error(f"[remote_upload] Error uploading bundle: {e}")
+                self._set_last_upload_result("failed", stage="upload", error=str(e))
                 return False
 
         except Exception as e:
             logger.error(f"[remote_upload] Unexpected error in process_changes_and_upload: {e}")
+            self._set_last_upload_result("failed", stage="unexpected", error=str(e))
             return False
+
 
     def get_all_code_files(self) -> List[Path]:
         """Get all code files in the workspace."""
@@ -1589,13 +2025,13 @@ class RemoteUploadClient:
 
                 # Always check src_path
                 src_path = Path(event.src_path)
-                if not self.client._is_ignored_path(src_path) and idx.CODE_EXTS.get(src_path.suffix.lower(), "unknown") != "unknown":
+                if self.client._is_watchable_path(src_path):
                     paths_to_process.append(src_path)
 
                 # For FileMovedEvent, also process the destination path
                 if hasattr(event, 'dest_path') and event.dest_path:
                     dest_path = Path(event.dest_path)
-                    if not self.client._is_ignored_path(dest_path) and idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown") != "unknown":
+                    if self.client._is_watchable_path(dest_path):
                         paths_to_process.append(dest_path)
 
                 if not paths_to_process:
@@ -1639,6 +2075,7 @@ class RemoteUploadClient:
                     else:
                         all_paths = pending
 
+
                     changes = self.client.detect_file_changes(all_paths)
                     meaningful_changes = (
                         len(changes.get("created", [])) +
@@ -1651,7 +2088,7 @@ class RemoteUploadClient:
                         logger.info(f"[watch] Detected {meaningful_changes} changes: { {k: len(v) for k, v in changes.items() if k != 'unchanged'} }")
                         success = self.client.process_changes_and_upload(changes)
                         if success:
-                            logger.info("[watch] Successfully uploaded changes")
+                            self.client.log_watch_upload_result()
                         else:
                             logger.error("[watch] Failed to upload changes")
                     else:
@@ -1746,7 +2183,7 @@ class RemoteUploadClient:
                         success = self.process_changes_and_upload(changes)
 
                         if success:
-                            logger.info(f"[watch] Successfully uploaded changes")
+                            self.log_watch_upload_result()
                         else:
                             logger.error(f"[watch] Failed to upload changes")
                     else:
@@ -1804,80 +2241,7 @@ class RemoteUploadClient:
             except Exception as e:
                 logger.error(f"[remote_upload] Error detecting file changes: {e}")
                 return False
-
-            if not self.has_meaningful_changes(changes):
-                logger.info("[remote_upload] No meaningful changes detected, skipping upload")
-                return True
-
-            # Log change summary
-            total_changes = sum(len(files) for op, files in changes.items() if op != "unchanged")
-            logger.info(f"[remote_upload] Detected {total_changes} meaningful changes: "
-                       f"{len(changes['created'])} created, {len(changes['updated'])} updated, "
-                       f"{len(changes['deleted'])} deleted, {len(changes['moved'])} moved")
-
-            # Create delta bundle
-            bundle_path = None
-            try:
-                bundle_path, manifest = self.create_delta_bundle(changes)
-                logger.info(f"[remote_upload] Created delta bundle: {manifest['bundle_id']} "
-                           f"(size: {manifest['total_size_bytes']} bytes)")
-
-                # Validate bundle was created successfully
-                if not bundle_path or not os.path.exists(bundle_path):
-                    raise RuntimeError(f"Failed to create bundle at {bundle_path}")
-
-            except Exception as e:
-                logger.error(f"[remote_upload] Error creating delta bundle: {e}")
-                # Clean up any temporary files on failure
-                self.cleanup()
-                return False
-
-            # Upload bundle with retry logic
-            try:
-                response = self.upload_bundle(bundle_path, manifest)
-
-                if response.get("success", False):
-                    processed_ops = response.get('processed_operations', {})
-                    logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
-                    logger.info(f"[remote_upload] Processed operations: {processed_ops}")
-
-                    # Clean up temporary bundle after successful upload
-                    try:
-                        if os.path.exists(bundle_path):
-                            os.remove(bundle_path)
-                            logger.debug(f"[remote_upload] Cleaned up temporary bundle: {bundle_path}")
-                        # Also clean up the entire temp directory if this is the last bundle
-                        self.cleanup()
-                    except Exception as cleanup_error:
-                        logger.warning(f"[remote_upload] Failed to cleanup bundle {bundle_path}: {cleanup_error}")
-
-                    return True
-                else:
-                    error = response.get("error", {})
-                    error_code = error.get("code", "UNKNOWN")
-                    error_msg = error.get("message", "Unknown error")
-
-                    logger.error(f"[remote_upload] Upload failed: {error_msg}")
-
-                    # Handle specific error types
-                    # CLI is stateless - server handles sequence management
-                    if error_code in ["BUNDLE_TOO_LARGE", "BUNDLE_NOT_FOUND"]:
-                        # These are unrecoverable errors
-                        logger.error(f"[remote_upload] Unrecoverable error ({error_code}): {error_msg}")
-                        return False
-                    elif error_code in ["TIMEOUT_ERROR", "CONNECTION_ERROR", "NETWORK_ERROR"]:
-                        # These might be temporary, suggest fallback
-                        logger.warning(f"[remote_upload] Network-related error ({error_code}): {error_msg}")
-                        logger.warning("[remote_upload] Consider falling back to local mode if this persists")
-                        return False
-                    else:
-                        # Other errors
-                        logger.error(f"[remote_upload] Upload error ({error_code}): {error_msg}")
-                        return False
-
-            except Exception as e:
-                logger.error(f"[remote_upload] Unexpected error during upload: {e}")
-                return False
+            return self.process_changes_and_upload(changes)
 
         except Exception as e:
             logger.error(f"[remote_upload] Critical error in process_and_upload_changes: {e}")
@@ -2142,7 +2506,18 @@ Examples:
             success = client.process_changes_and_upload(changes)
 
             if success:
-                logger.info("Repository upload completed successfully!")
+                outcome = str((client.last_upload_result or {}).get("outcome") or "")
+                if outcome == "skipped_by_plan":
+                    logger.info("No upload needed after plan")
+                elif outcome == "queued":
+                    logger.info("Repository upload request accepted; server processing asynchronously")
+                elif outcome == "uploaded_async":
+                    logger.info(
+                        "Repository upload processed asynchronously: %s",
+                        (client.last_upload_result or {}).get("processed_operations") or {},
+                    )
+                else:
+                    logger.info("Repository upload completed successfully!")
                 logger.info(f"Collection name: {config['collection_name']}")
                 logger.info(f"Files uploaded: {len(all_files)}")
             else:

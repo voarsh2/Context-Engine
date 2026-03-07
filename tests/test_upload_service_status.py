@@ -6,10 +6,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+def _disable_auth(srv, monkeypatch) -> None:
+    monkeypatch.setattr(srv, "AUTH_ENABLED", False)
+
+
 @pytest.mark.unit
 def test_delta_status_exposes_last_processed_operations(monkeypatch):
     srv = importlib.import_module("scripts.upload_service")
     srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
 
     monkeypatch.setattr(srv, "get_collection_name", lambda _repo=None: "test-coll")
     monkeypatch.setattr(srv, "_extract_repo_name_from_path", lambda _path: "repo")
@@ -52,6 +57,7 @@ def test_delta_status_exposes_last_processed_operations(monkeypatch):
 def test_process_bundle_background_tracks_completed_operations(monkeypatch, tmp_path: Path):
     srv = importlib.import_module("scripts.upload_service")
     srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
 
     bundle_path = tmp_path / "bundle.tar.gz"
     bundle_path.write_bytes(b"placeholder")
@@ -94,6 +100,7 @@ def test_process_bundle_background_tracks_completed_operations(monkeypatch, tmp_
 def test_delta_status_reports_processing_while_upload_in_progress(monkeypatch):
     srv = importlib.import_module("scripts.upload_service")
     srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
 
     monkeypatch.setattr(srv, "get_collection_name", lambda _repo=None: "test-coll")
     monkeypatch.setattr(srv, "_extract_repo_name_from_path", lambda _path: "repo")
@@ -115,3 +122,151 @@ def test_delta_status_reports_processing_while_upload_in_progress(monkeypatch):
     body = resp.json()
     assert body["status"] == "processing"
     assert body["server_info"]["last_upload_status"] == "processing"
+
+
+@pytest.mark.unit
+def test_delta_plan_endpoint_returns_needed_files(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(
+        srv,
+        "plan_delta_upload",
+        lambda workspace_path, operations, file_hashes=None: {
+            "needed_files": {"created": ["src/app.py"], "updated": [], "moved": []},
+            "operation_counts_preview": {
+                "created": 1,
+                "updated": 0,
+                "deleted": 0,
+                "moved": 0,
+                "skipped": 2,
+                "skipped_hash_match": 2,
+                "failed": 0,
+            },
+            "needed_size_bytes": 123,
+            "replica_targets": ["repo-0123456789abcdef"],
+        },
+    )
+
+    client = TestClient(srv.app)
+    resp = client.post(
+        "/api/v1/delta/plan",
+        json={
+            "workspace_path": "/work/repo",
+            "manifest": {"bundle_id": "b1"},
+            "operations": [{"operation": "created", "path": "src/app.py"}],
+            "file_hashes": {"src/app.py": "sha1:abc"},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["needed_files"]["created"] == ["src/app.py"]
+    assert body["operation_counts_preview"]["skipped_hash_match"] == 2
+    assert body["needed_size_bytes"] == 123
+
+
+@pytest.mark.unit
+def test_delta_plan_endpoint_uses_safe_defaults_for_sparse_plan(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(
+        srv,
+        "plan_delta_upload",
+        lambda workspace_path, operations, file_hashes=None: {},
+    )
+
+    client = TestClient(srv.app)
+    resp = client.post(
+        "/api/v1/delta/plan",
+        json={
+            "workspace_path": "/work/repo",
+            "manifest": {"bundle_id": "b1"},
+            "operations": [{"operation": "created", "path": "src/app.py"}],
+            "file_hashes": {"src/app.py": "sha1:abc"},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["needed_files"] == {"created": [], "updated": [], "moved": []}
+    assert body["operation_counts_preview"]["failed"] == 0
+    assert body["needed_size_bytes"] == 0
+    assert body["replica_targets"] == []
+
+
+@pytest.mark.unit
+def test_apply_ops_endpoint_returns_processed_operations(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(
+        srv,
+        "apply_delta_operations",
+        lambda workspace_path, operations, file_hashes=None: {
+            "created": 0,
+            "updated": 0,
+            "deleted": 1,
+            "moved": 0,
+            "skipped": 0,
+            "skipped_hash_match": 0,
+            "failed": 0,
+        },
+    )
+
+    client = TestClient(srv.app)
+    resp = client.post(
+        "/api/v1/delta/apply_ops",
+        json={
+            "workspace_path": "/work/repo",
+            "manifest": {"bundle_id": "b2"},
+            "operations": [{"operation": "deleted", "path": "src/old.py"}],
+            "file_hashes": {},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["processed_operations"]["deleted"] == 1
+    assert body["processing_time_ms"] is not None
+
+
+@pytest.mark.unit
+def test_apply_ops_endpoint_marks_tracker_error_state_on_failure(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(
+        srv,
+        "apply_delta_operations",
+        lambda workspace_path, operations, file_hashes=None: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        ),
+    )
+
+    client = TestClient(srv.app)
+    resp = client.post(
+        "/api/v1/delta/apply_ops",
+        json={
+            "workspace_path": "/work/repo",
+            "manifest": {"bundle_id": "b3"},
+            "operations": [{"operation": "deleted", "path": "src/old.py"}],
+            "file_hashes": {},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "APPLY_OPS_ERROR"
+
+    key = srv.get_workspace_key("/work/repo")
+    tracked = srv._upload_result_tracker[key]
+    assert tracked["status"] == "error"
+    assert tracked["error"] == "boom"
+    assert tracked["message"] == "boom"
+    assert tracked["completed_at"] is not None
