@@ -1554,12 +1554,16 @@ class RemoteUploadClient:
         paths that are ignored under the current client policy such as
         dev-workspace in dev-remote mode.
         """
+        created_files: List[Path] = []
         path_map: Dict[Path, Path] = {}
         for path in all_files:
+            if self._is_ignored_path(path):
+                continue
             try:
                 resolved = path.resolve()
             except Exception:
                 continue
+            created_files.append(path)
             path_map[resolved] = path
 
         for cached_abs in get_all_cached_paths(self.repo_name):
@@ -1593,7 +1597,7 @@ class RemoteUploadClient:
             except Exception:
                 continue
         return {
-            "created": all_files,
+            "created": created_files,
             "updated": [],
             "deleted": list(deleted_by_resolved.values()),
             "moved": [],

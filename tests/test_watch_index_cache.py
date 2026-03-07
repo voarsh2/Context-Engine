@@ -174,8 +174,8 @@ def test_run_indexing_strategy_reuses_preloaded_file_state(monkeypatch, tmp_path
 
     ok = proc_mod._run_indexing_strategy(
         path,
-        client=object(),
-        model=object(),
+        client=MagicMock(),
+        model=MagicMock(),
         collection="coll",
         vector_name="vec",
         model_dim=1,

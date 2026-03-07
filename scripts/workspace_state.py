@@ -184,6 +184,10 @@ class StagingInfo(TypedDict, total=False):
     repo_name: Optional[str]
 
 
+class MaintenanceInfo(TypedDict, total=False):
+    last_empty_dir_sweep_at: Optional[str]
+
+
 class WorkspaceState(TypedDict, total=False):
     created_at: str
     updated_at: str
@@ -204,6 +208,7 @@ class WorkspaceState(TypedDict, total=False):
     active_repo_slug: Optional[str]
     serving_repo_slug: Optional[str]
     staging: Optional[StagingInfo]
+    maintenance: Optional[MaintenanceInfo]
 
 def is_multi_repo_mode() -> bool:
     """Check if multi-repo mode is enabled."""
@@ -2537,6 +2542,3 @@ def _list_workspaces_from_qdrant(seen_paths: set) -> List[Dict[str, Any]]:
         pass
 
     return workspaces
-
-
-# Add missing functions that callers expect (already defined above)

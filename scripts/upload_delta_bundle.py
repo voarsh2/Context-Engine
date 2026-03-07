@@ -1,9 +1,11 @@
 import os
 import json
+import shutil
 import tarfile
 import hashlib
 import re
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -14,7 +16,9 @@ try:
         _extract_repo_name_from_path,
         get_staging_targets,
         get_collection_state_snapshot,
+        get_workspace_state,
         is_staging_enabled,
+        update_workspace_state,
     )
 except ImportError as exc:
     raise ImportError(
@@ -26,6 +30,24 @@ logger = logging.getLogger(__name__)
 
 WORK_DIR = os.environ.get("WORK_DIR") or os.environ.get("WORKDIR") or "/work"
 _SLUGGED_REPO_RE = re.compile(r"^.+-[0-9a-f]{16}(?:_old)?$")
+_DEFAULT_EMPTY_DIR_SWEEP_INTERVAL_SECONDS = 7 * 24 * 60 * 60
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalize_hash_value(value: Any) -> str:
@@ -116,17 +138,18 @@ def _sweep_empty_workspace_dirs(workspace_root: Path) -> None:
         workspace_root = workspace_root.resolve()
     except Exception:
         pass
-
     try:
-        for root, dirnames, _filenames in os.walk(workspace_root, topdown=True):
-            current = Path(root)
-            if current == workspace_root:
-                dirnames[:] = [d for d in dirnames if d not in protected_top_level]
         for root, dirnames, _filenames in os.walk(workspace_root, topdown=False):
             current = Path(root)
             if current == workspace_root:
                 continue
             if current.parent == workspace_root and current.name in protected_top_level:
+                continue
+            try:
+                rel = current.relative_to(workspace_root)
+            except Exception:
+                continue
+            if rel.parts and rel.parts[0] in protected_top_level:
                 continue
             try:
                 if any(current.iterdir()):
@@ -136,6 +159,65 @@ def _sweep_empty_workspace_dirs(workspace_root: Path) -> None:
                 continue
     except Exception:
         pass
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _should_run_empty_dir_sweep(workspace_root: Path, slug: str) -> bool:
+    if not _env_flag("CTXCE_UPLOAD_EMPTY_DIR_SWEEP", True):
+        return False
+
+    interval_seconds = max(
+        0,
+        _env_int(
+            "CTXCE_UPLOAD_EMPTY_DIR_SWEEP_INTERVAL_SECONDS",
+            _DEFAULT_EMPTY_DIR_SWEEP_INTERVAL_SECONDS,
+        ),
+    )
+    if interval_seconds == 0:
+        return True
+
+    try:
+        state = get_workspace_state(workspace_path=str(workspace_root), repo_name=slug) or {}
+    except Exception:
+        return True
+
+    maintenance = state.get("maintenance") or {}
+    last_sweep_at = _parse_timestamp(maintenance.get("last_empty_dir_sweep_at"))
+    if last_sweep_at is None:
+        return True
+
+    age_seconds = (datetime.now(timezone.utc) - last_sweep_at).total_seconds()
+    return age_seconds >= interval_seconds
+
+
+def _record_empty_dir_sweep(workspace_root: Path, slug: str) -> None:
+    try:
+        state = get_workspace_state(workspace_path=str(workspace_root), repo_name=slug) or {}
+        maintenance = dict(state.get("maintenance") or {})
+        maintenance["last_empty_dir_sweep_at"] = datetime.now(timezone.utc).isoformat()
+        update_workspace_state(
+            workspace_path=str(workspace_root),
+            repo_name=slug,
+            updates={"maintenance": maintenance},
+        )
+    except Exception as exc:
+        logger.debug(
+            "[upload_service] Failed to record empty-dir sweep for %s: %s",
+            workspace_root,
+            exc,
+        )
 
 
 def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[str, Any]) -> Dict[str, int]:
@@ -456,7 +538,12 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     elif op_type == "moved":
                         if safe_source_path and safe_source_path.exists():
                             target_path.parent.mkdir(parents=True, exist_ok=True)
-                            safe_source_path.rename(target_path)
+                            if target_path.exists():
+                                if target_path.is_dir():
+                                    shutil.rmtree(target_path)
+                                else:
+                                    target_path.unlink()
+                            shutil.move(str(safe_source_path), str(target_path))
                             _cleanup_empty_dirs(safe_source_path.parent, workspace_root)
                             source_key = _normalize_cache_key_path(str(safe_source_path))
                             moved_hash = replica_hashes.pop(source_key, None)
@@ -527,7 +614,7 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                 success_all = all(result in {"applied", "skipped_hash_match"} for result in replica_results.values())
                 if applied_any:
                     operations_count.setdefault(op_type, 0)
-                    operations_count[op_type] = operations_count.get(op_type, 0) + 1
+                    operations_count[op_type] += 1
                     if not success_all:
                         logger.debug(
                             f"[upload_service] Partial success for {op_type} {rel_path}: {replica_results}"
@@ -538,8 +625,12 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                 else:
                     operations_count["failed"] += 1
 
-        for root in replica_roots.values():
+        for slug, root in replica_roots.items():
+            if not _should_run_empty_dir_sweep(root, slug):
+                continue
+            logger.info("[upload_service] Sweeping empty directories under %s", root)
             _sweep_empty_workspace_dirs(root)
+            _record_empty_dir_sweep(root, slug)
 
         return operations_count
 
