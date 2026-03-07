@@ -476,6 +476,12 @@ def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str])
         return {}
 
 
+def get_all_cached_paths(repo_name: Optional[str] = None) -> List[str]:
+    """Return cached file paths from the local workspace cache."""
+    workspace_path = os.environ.get("WORKSPACE_PATH") or os.getcwd()
+    return list(_load_local_cache_file_hashes(workspace_path, repo_name).keys())
+
+
 class RemoteUploadClient:
     """Client for uploading delta bundles to remote server."""
 
@@ -651,6 +657,17 @@ class RemoteUploadClient:
 
         for path in changed_paths:
             if self._is_ignored_path(path):
+                try:
+                    abs_path = str(path.resolve())
+                except Exception:
+                    continue
+                cached_hash = get_cached_file_hash(abs_path, self.repo_name)
+                if cached_hash:
+                    changes["deleted"].append(path)
+                    try:
+                        self._stat_cache.pop(abs_path, None)
+                    except Exception:
+                        pass
                 continue
             # Resolve to an absolute path for stable cache keys
             try:
@@ -1294,6 +1311,89 @@ class RemoteUploadClient:
         total_changes = sum(len(files) for op, files in changes.items() if op != "unchanged")
         return total_changes > 0
 
+    def _collect_force_cleanup_paths(self) -> List[Path]:
+        """
+        Return ignored paths that force mode should actively delete remotely.
+
+        In dev-remote mode, dev-workspace is intentionally ignored during upload
+        scans to avoid recursive dogfooding. If that tree already exists on the
+        remote side from an older buggy upload, force mode should remove it even
+        when the local cache does not contain those paths.
+        """
+        cleanup_paths: List[Path] = []
+        if "dev-workspace" not in self._excluded_dirnames():
+            return cleanup_paths
+
+        dev_root = Path(self.workspace_path) / "dev-workspace"
+        if not dev_root.exists():
+            return cleanup_paths
+
+        for root, dirnames, filenames in os.walk(dev_root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for filename in filenames:
+                path = Path(root) / filename
+                try:
+                    if path.is_file():
+                        cleanup_paths.append(path)
+                except Exception:
+                    continue
+        return cleanup_paths
+
+    def build_force_changes(self, all_files: List[Path]) -> Dict[str, List]:
+        """
+        Build force-upload changes while still cleaning stale cached paths.
+
+        Force mode should re-upload every currently managed file, but it must also
+        emit deletes for files that only exist in the local cache now, including
+        paths that are ignored under the current client policy such as
+        dev-workspace in dev-remote mode.
+        """
+        path_map: Dict[Path, Path] = {}
+        for path in all_files:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            path_map[resolved] = path
+
+        for cached_abs in get_all_cached_paths(self.repo_name):
+            try:
+                cached_path = Path(cached_abs)
+                resolved = cached_path.resolve()
+            except Exception:
+                continue
+            if resolved not in path_map:
+                path_map[resolved] = cached_path
+
+        force_cleanup_paths = self._collect_force_cleanup_paths()
+        for cleanup_path in force_cleanup_paths:
+            try:
+                resolved = cleanup_path.resolve()
+            except Exception:
+                continue
+            if resolved not in path_map:
+                path_map[resolved] = cleanup_path
+
+        probed = self.detect_file_changes(list(path_map.values()))
+        deleted_by_resolved: Dict[Path, Path] = {}
+        for deleted_path in probed.get("deleted", []):
+            try:
+                deleted_by_resolved[deleted_path.resolve()] = deleted_path
+            except Exception:
+                continue
+        for cleanup_path in force_cleanup_paths:
+            try:
+                deleted_by_resolved.setdefault(cleanup_path.resolve(), cleanup_path)
+            except Exception:
+                continue
+        return {
+            "created": all_files,
+            "updated": [],
+            "deleted": list(deleted_by_resolved.values()),
+            "moved": [],
+            "unchanged": [],
+        }
+
     def upload_git_history_only(self, git_history: Dict[str, Any]) -> bool:
         try:
             empty_changes = {
@@ -1531,7 +1631,6 @@ class RemoteUploadClient:
                             self.client.repo_name
                         )
                         cached_paths = [Path(p) for p in cached_file_hashes.keys()]
-                        cached_paths = [p for p in cached_paths if not self.client._is_ignored_path(p)]
                         all_paths = list(set(pending + cached_paths))
                     else:
                         all_paths = pending
@@ -2031,8 +2130,7 @@ Examples:
 
             # Detect changes (treat all files as changes for initial upload)
             if args.force:
-                # Force mode: treat all files as created
-                changes = {"created": all_files, "updated": [], "deleted": [], "moved": [], "unchanged": []}
+                changes = client.build_force_changes(all_files)
             else:
                 changes = client.detect_file_changes(all_files)
 

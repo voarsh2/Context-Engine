@@ -298,6 +298,9 @@ def index_single_file(
     repo_name_for_cache: str | None = None,
     allowed_vectors: set[str] | None = None,
     allowed_sparse: set[str] | None = None,
+    preloaded_text: str | None = None,
+    preloaded_file_hash: str | None = None,
+    preloaded_language: str | None = None,
 ) -> bool:
     """Index a single file path. Returns True if indexed, False if skipped."""
     try:
@@ -330,6 +333,9 @@ def index_single_file(
             repo_name_for_cache=repo_name_for_cache,
             allowed_vectors=allowed_vectors,
             allowed_sparse=allowed_sparse,
+            preloaded_text=preloaded_text,
+            preloaded_file_hash=preloaded_file_hash,
+            preloaded_language=preloaded_language,
         )
     finally:
         if _file_lock_ctx is not None:
@@ -353,6 +359,9 @@ def _index_single_file_inner(
     repo_name_for_cache: str | None = None,
     allowed_vectors: set[str] | None = None,
     allowed_sparse: set[str] | None = None,
+    preloaded_text: str | None = None,
+    preloaded_file_hash: str | None = None,
+    preloaded_language: str | None = None,
 ) -> bool:
     """Inner implementation of index_single_file (after lock is acquired)."""
     if trust_cache is None:
@@ -380,15 +389,18 @@ def _index_single_file_inner(
         except Exception:
             pass
 
-    try:
-        text = file_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        print(f"Skipping {file_path}: {e}")
-        return False
+    if preloaded_text is None:
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"Skipping {file_path}: {e}")
+            return False
+    else:
+        text = preloaded_text
 
-    language = detect_language(file_path)
+    language = preloaded_language or detect_language(file_path)
     is_text_like = _is_text_like_language(language)
-    file_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+    file_hash = preloaded_file_hash or hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
     repo_tag = repo_name_for_cache or _detect_repo_name_from_path(file_path)
 

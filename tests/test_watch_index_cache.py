@@ -150,3 +150,39 @@ def test_processor_delete_clears_cache_even_without_client(monkeypatch, tmp_path
     )
 
     remove_mock.assert_called_once_with(str(missing), "repo")
+
+
+def test_run_indexing_strategy_reuses_preloaded_file_state(monkeypatch, tmp_path):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (False, "changed"))
+
+    captured = {}
+
+    def fake_index_single_file(*args, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", fake_index_single_file)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=object(),
+        model=object(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+    )
+
+    assert ok is True
+    assert captured["preloaded_text"] == "print('x')\n"
+    assert captured["preloaded_file_hash"] == "abc123"
+    assert captured["preloaded_language"] == "python"

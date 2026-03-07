@@ -371,3 +371,121 @@ def test_process_delta_bundle_uses_first_marker_match_for_created_members(tmp_pa
 
     assert counts.get("created") == 1
     assert (work_dir / slug / rel_path).read_bytes() == content
+
+
+def test_process_delta_bundle_deleted_prunes_empty_parent_dirs(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    rel_path = "dev-workspace/nested/stale.py"
+    target = work_dir / slug / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("stale\n", encoding="utf-8")
+
+    bundle = _write_bundle(
+        tmp_path,
+        [{"operation": "deleted", "path": rel_path}],
+    )
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-delete-prune"},
+    )
+
+    assert counts.get("deleted") == 1
+    assert not target.exists()
+    assert not (work_dir / slug / "dev-workspace" / "nested").exists()
+    assert not (work_dir / slug / "dev-workspace").exists()
+    assert (work_dir / slug).exists()
+
+
+def test_process_delta_bundle_moved_prunes_empty_source_parent_dirs(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    src = work_dir / slug / "dev-workspace" / "nested" / "from.py"
+    dest_rel_path = "dest/to.py"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("payload\n", encoding="utf-8")
+
+    bundle = _write_bundle(
+        tmp_path,
+        [{"operation": "moved", "path": dest_rel_path, "source_path": "dev-workspace/nested/from.py"}],
+    )
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-move-prune"},
+    )
+
+    assert counts.get("moved") == 1
+    assert not src.exists()
+    assert (work_dir / slug / dest_rel_path).read_text(encoding="utf-8") == "payload\n"
+    assert not (work_dir / slug / "dev-workspace" / "nested").exists()
+    assert not (work_dir / slug / "dev-workspace").exists()
+    assert (work_dir / slug).exists()
+
+
+def test_process_delta_bundle_sweeps_stranded_empty_dirs_without_file_ops(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    stranded = work_dir / slug / "dev-workspace" / "nested" / "empty"
+    stranded.mkdir(parents=True, exist_ok=True)
+
+    bundle = _write_bundle(tmp_path, [])
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-sweep-empty"},
+    )
+
+    assert counts == {
+        "created": 0,
+        "updated": 0,
+        "deleted": 0,
+        "moved": 0,
+        "skipped": 0,
+        "skipped_hash_match": 0,
+        "failed": 0,
+    }
+    assert not stranded.exists()
+    assert not (work_dir / slug / "dev-workspace").exists()
+    assert (work_dir / slug).exists()
+
+
+def test_process_delta_bundle_preserves_protected_top_level_dirs_when_empty(tmp_path, monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    protected = work_dir / slug / ".remote-git"
+    protected.mkdir(parents=True, exist_ok=True)
+
+    bundle = _write_bundle(tmp_path, [])
+
+    us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-protected-empty"},
+    )
+
+    assert protected.exists()

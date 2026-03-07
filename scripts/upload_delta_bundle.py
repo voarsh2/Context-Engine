@@ -109,6 +109,35 @@ def _cleanup_empty_dirs(path: Path, stop_at: Path) -> None:
             break
 
 
+def _sweep_empty_workspace_dirs(workspace_root: Path) -> None:
+    """Best-effort prune of empty directories under a workspace root."""
+    protected_top_level = {".codebase", ".remote-git"}
+    try:
+        workspace_root = workspace_root.resolve()
+    except Exception:
+        pass
+
+    try:
+        for root, dirnames, _filenames in os.walk(workspace_root, topdown=True):
+            current = Path(root)
+            if current == workspace_root:
+                dirnames[:] = [d for d in dirnames if d not in protected_top_level]
+        for root, dirnames, _filenames in os.walk(workspace_root, topdown=False):
+            current = Path(root)
+            if current == workspace_root:
+                continue
+            if current.parent == workspace_root and current.name in protected_top_level:
+                continue
+            try:
+                if any(current.iterdir()):
+                    continue
+                current.rmdir()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[str, Any]) -> Dict[str, int]:
     """Process delta bundle and return operation counts."""
     operations_count = {
@@ -416,9 +445,11 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     elif op_type == "deleted":
                         if target_path.exists():
                             target_path.unlink(missing_ok=True)
+                            _cleanup_empty_dirs(target_path.parent, workspace_root)
                             replica_hashes.pop(target_key, None)
                             return "applied"
                         else:
+                            _cleanup_empty_dirs(target_path.parent, workspace_root)
                             replica_hashes.pop(target_key, None)
                             return "applied"  # Already deleted
 
@@ -426,6 +457,7 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                         if safe_source_path and safe_source_path.exists():
                             target_path.parent.mkdir(parents=True, exist_ok=True)
                             safe_source_path.rename(target_path)
+                            _cleanup_empty_dirs(safe_source_path.parent, workspace_root)
                             source_key = _normalize_cache_key_path(str(safe_source_path))
                             moved_hash = replica_hashes.pop(source_key, None)
                             if op_content_hash:
@@ -505,6 +537,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     operations_count["skipped_hash_match"] += 1
                 else:
                     operations_count["failed"] += 1
+
+        for root in replica_roots.values():
+            _sweep_empty_workspace_dirs(root)
 
         return operations_count
 

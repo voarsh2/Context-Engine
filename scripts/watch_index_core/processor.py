@@ -644,6 +644,9 @@ def _run_indexing_strategy(
             skip_unchanged=False,
             pseudo_mode=pseudo_mode,
             repo_name_for_cache=repo_name,
+            preloaded_text=text,
+            preloaded_file_hash=file_hash,
+            preloaded_language=language if text is not None else None,
         )
     return ok
 
