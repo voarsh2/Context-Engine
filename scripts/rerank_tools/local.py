@@ -134,6 +134,10 @@ def _get_rerank_session():
 
 
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+)
 
 
 def warmup_reranker():
@@ -163,18 +167,14 @@ def _start_background_warmup():
 _start_background_warmup()
 
 
-def _norm_under(u: str | None) -> str | None:
-    if not u:
-        return None
-    u = str(u).strip().replace("\\", "/")
-    u = "/".join([p for p in u.split("/") if p])
-    if not u:
-        return None
-    if not u.startswith("/"):
-        return "/work/" + u
-    if not u.startswith("/work/"):
-        return "/work/" + u.lstrip("/")
-    return u
+def _point_matches_under(pt: Any, under: str | None) -> bool:
+    if not under:
+        return True
+    payload = getattr(pt, "payload", None) or {}
+    md = payload.get("metadata") or {}
+    if not isinstance(md, dict):
+        md = {}
+    return _metadata_matches_under(md, under)
 
 
 def _select_dense_vector_name(
@@ -366,18 +366,21 @@ def rerank_in_process(
                 key="metadata.language", match=models.MatchValue(value=language)
             )
         )
-    eff_under = _norm_under(under)
-    if eff_under:
-        must.append(
-            models.FieldCondition(
-                key="metadata.path_prefix", match=models.MatchValue(value=eff_under)
-            )
-        )
+    eff_under = _normalize_under_scope(under)
     flt = models.Filter(must=must) if must else None
 
-    pts = dense_results(client, _model, vec_name, query, flt, topk, eff_collection)
-    if not pts and flt is not None:
-        pts = dense_results(client, _model, vec_name, query, None, topk, eff_collection)
+    fetch_topk = max(1, int(topk))
+    if eff_under:
+        try:
+            under_mult = int(os.environ.get("RERANK_UNDER_FETCH_MULT", "4") or 4)
+        except Exception:
+            under_mult = 4
+        fetch_topk = max(fetch_topk, int(limit) * max(under_mult, 2), fetch_topk * max(under_mult, 2))
+        fetch_topk = min(fetch_topk, 2000)
+
+    pts = dense_results(client, _model, vec_name, query, flt, fetch_topk, eff_collection)
+    if eff_under and pts:
+        pts = [pt for pt in pts if _point_matches_under(pt, eff_under)]
     if not pts:
         return []
 
@@ -447,19 +450,21 @@ def main():
                 key="metadata.language", match=models.MatchValue(value=args.language)
             )
         )
-    eff_under = _norm_under(args.under)
-    if eff_under:
-        must.append(
-            models.FieldCondition(
-                key="metadata.path_prefix", match=models.MatchValue(value=eff_under)
-            )
-        )
+    eff_under = _normalize_under_scope(args.under)
     flt = models.Filter(must=must) if must else None
 
-    pts = dense_results(client, model, vec_name, args.query, flt, args.topk, eff_collection)
-    # Fallback: if filtered search yields nothing, retry without filters to avoid empty rerank
-    if not pts and flt is not None:
-        pts = dense_results(client, model, vec_name, args.query, None, args.topk, eff_collection)
+    fetch_topk = max(1, int(args.topk))
+    if eff_under:
+        try:
+            under_mult = int(os.environ.get("RERANK_UNDER_FETCH_MULT", "4") or 4)
+        except Exception:
+            under_mult = 4
+        fetch_topk = max(fetch_topk, int(args.limit) * max(under_mult, 2), fetch_topk * max(under_mult, 2))
+        fetch_topk = min(fetch_topk, 2000)
+
+    pts = dense_results(client, model, vec_name, args.query, flt, fetch_topk, eff_collection)
+    if eff_under and pts:
+        pts = [pt for pt in pts if _point_matches_under(pt, eff_under)]
     if not pts:
         return
     pairs = prepare_pairs(args.query, pts)

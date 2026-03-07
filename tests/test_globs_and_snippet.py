@@ -117,6 +117,32 @@ def test_run_hybrid_search_slugged_path_globs(monkeypatch):
 
 
 @pytest.mark.unit
+def test_run_hybrid_search_under_recursive_scope(monkeypatch):
+    pts = [
+        _Pt("1", "/work/repo/space/ship/a.py"),
+        _Pt("2", "/work/repo/direct/tools/b.py"),
+    ]
+    monkeypatch.setattr(hyb, "get_qdrant_client", lambda *a, **k: FakeQdrant(pts))
+    monkeypatch.setattr(hyb, "return_qdrant_client", lambda *a, **k: None)
+    monkeypatch.setenv("EMBEDDING_MODEL", "unit-test")
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+    monkeypatch.setattr(hyb, "TextEmbedding", lambda *a, **k: FakeEmbed())
+    monkeypatch.setattr(hyb, "_get_embedding_model", lambda *a, **k: FakeEmbed())
+
+    items = hyb.run_hybrid_search(
+        queries=["rotate heading"],
+        limit=10,
+        per_path=2,
+        under="space",
+        expand=False,
+        model=FakeEmbed(),
+    )
+    paths = {it.get("path") for it in items}
+    assert "/work/repo/space/ship/a.py" in paths
+    assert "/work/repo/direct/tools/b.py" not in paths
+
+
+@pytest.mark.unit
 def test_dense_query_preserves_collection_on_filter_drop(monkeypatch):
     calls = []
 

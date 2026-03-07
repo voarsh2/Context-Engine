@@ -296,6 +296,10 @@ except ImportError:
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
 from scripts.ingest_code import ensure_collection as _ensure_collection_raw
 from scripts.ingest_code import project_mini as _project_mini
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+)
 
 # ---------------------------------------------------------------------------
 # Module logger
@@ -440,7 +444,7 @@ def run_pure_dense_search(
         model: Embedding model (will load default if None)
         collection: Qdrant collection name
         language: Optional language filter
-        under: Optional path prefix filter
+        under: Optional recursive workspace subtree filter
         repo: Optional repo filter
 
     Returns:
@@ -465,12 +469,10 @@ def run_pure_dense_search(
     vec_name = sanitize_vector_name(model_name)
     coll = collection or _collection()
 
-    # Build filter
+    # Build server-side filter (exclude `under` here; recursive under is post-filtered)
     must = []
     if language:
         must.append(models.FieldCondition(key="metadata.language", match=models.MatchValue(value=language)))
-    if under:
-        must.append(models.FieldCondition(key="metadata.path_prefix", match=models.MatchValue(value=under)))
     if repo and repo != "*":
         if isinstance(repo, list):
             must.append(models.FieldCondition(key="metadata.repo", match=models.MatchAny(any=repo)))
@@ -504,10 +506,13 @@ def run_pure_dense_search(
         ranked_points = dense_query(client, vec_name, vec_list, flt, limit, coll, query_text=query)
 
         # Build output
+        eff_under = _normalize_under_scope(under)
         results = []
         for p in ranked_points:
             payload = p.payload or {}
             md = payload.get("metadata") or {}
+            if eff_under and not _metadata_matches_under(md, eff_under):
+                continue
 
             # Prefer host_path when available (consistent with hybrid search)
             _path = md.get("host_path") or payload.get("path") or md.get("path") or ""
@@ -690,21 +695,8 @@ def _run_hybrid_search_impl(
     eff_path_globs_norm = _normalize_globs(eff_path_globs)
     eff_not_globs_norm = _normalize_globs(eff_not_globs)
 
-    # Normalize under
-    def _norm_under(u: str | None) -> str | None:
-        if not u:
-            return None
-        u = str(u).strip().replace("\\", "/")
-        u = "/".join([p for p in u.split("/") if p])
-        if not u:
-            return None
-        if not u.startswith("/"):
-            v = "/work/" + u
-        else:
-            v = "/work/" + u.lstrip("/") if not u.startswith("/work/") else u
-        return v
-
-    eff_under = _norm_under(eff_under)
+    # Normalize under as a user-facing recursive subtree scope.
+    eff_under = _normalize_under_scope(eff_under)
 
     # Expansion knobs that affect query construction/results (must be part of cache key)
     try:
@@ -810,12 +802,8 @@ def _run_hybrid_search_impl(
                     key="metadata.repo", match=models.MatchValue(value=eff_repo)
                 )
             )
-    if eff_under:
-        must.append(
-            models.FieldCondition(
-                key="metadata.path_prefix", match=models.MatchValue(value=eff_under)
-            )
-        )
+    # NOTE: `under` is recursive and user-facing; we enforce it in client-side
+    # filtering via normalized metadata paths instead of exact path_prefix equality.
     if eff_kind:
         must.append(
             models.FieldCondition(
@@ -2105,7 +2093,7 @@ def _run_hybrid_search_impl(
             return _fnm.fnmatchcase(path, pat)
         return _fnm.fnmatchcase(path.lower(), pat.lower())
 
-    if eff_not or eff_path_regex or eff_ext or eff_path_globs or eff_not_globs:
+    if eff_under or eff_not or eff_path_regex or eff_ext or eff_path_globs or eff_not_globs:
 
         def _pass_filters(m: Dict[str, Any]) -> bool:
             md = (m["pt"].payload or {}).get("metadata") or {}
@@ -2118,6 +2106,8 @@ def _run_hybrid_search_impl(
                 nn = eff_not if case_sensitive else eff_not.lower()
                 if nn in p_for_sub or nn in pp_for_sub:
                     return False
+            if eff_under and not _metadata_matches_under(md, eff_under):
+                return False
             if eff_not_globs_norm and any(_match_glob(g, path) or _match_glob(g, rel) for g in eff_not_globs_norm):
                 return False
             if eff_ext:

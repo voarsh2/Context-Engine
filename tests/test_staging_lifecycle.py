@@ -553,6 +553,7 @@ def test_admin_copy_endpoint_reports_graph_clone_in_redirect(monkeypatch: pytest
     monkeypatch.setattr(upload_service, "_require_admin_session", lambda request: {"user_id": "admin"})
     monkeypatch.setattr(upload_service, "WORK_DIR", "/fake/work")
     monkeypatch.setenv("WORK_DIR", "/fake/work")
+    monkeypatch.setattr(upload_service, "pooled_qdrant_client", None, raising=False)
 
     def fake_copy_collection_qdrant(**kwargs):
         assert kwargs.get("source") == "src"

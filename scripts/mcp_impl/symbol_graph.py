@@ -22,6 +22,12 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set
 
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+    path_matches_under as _path_matches_under,
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -113,23 +119,18 @@ def _symbol_variants(symbol: str) -> List[str]:
     return list(dict.fromkeys(variants))  # Dedupe preserving order
 
 def _norm_under(u: Optional[str]) -> Optional[str]:
-    """Normalize an `under` path to match ingest's stored `metadata.path_prefix` values.
+    """Normalize user-facing `under` to recursive subtree scope token."""
+    return _normalize_under_scope(u)
 
-    This mirrors the engine's convention: normalize to a /work/... style path.
-    Note: `under` in this engine is an exact directory filter (not recursive).
-    """
-    if not u:
-        return None
-    s = str(u).strip().replace("\\", "/")
-    s = "/".join([p for p in s.split("/") if p])
-    if not s:
-        return None
-    # Normalize to /work/...
-    if not s.startswith("/"):
-        v = "/work/" + s
-    else:
-        v = "/work/" + s.lstrip("/") if not s.startswith("/work/") else s
-    return v.rstrip("/")
+
+def _point_matches_under(pt: Any, under: Optional[str]) -> bool:
+    if not under:
+        return True
+    payload = getattr(pt, "payload", None) or {}
+    md = payload.get("metadata", payload)
+    if not isinstance(md, dict):
+        md = {}
+    return _metadata_matches_under(md, under)
 
 
 async def _symbol_graph_impl(
@@ -150,7 +151,7 @@ async def _symbol_graph_impl(
         query_type: One of "callers", "definition", "importers"
         limit: Maximum number of results
         language: Optional language filter
-        under: Optional path prefix filter
+        under: Optional recursive workspace subtree filter
         collection: Optional collection override
         session: Optional session ID for collection routing
         ctx: MCP context (optional)
@@ -201,6 +202,8 @@ async def _symbol_graph_impl(
 
     results = []
 
+    norm_under = _norm_under(under)
+
     try:
         if query_type == "callers":
             # Prefer graph edges collection when available (fast keyword filters).
@@ -212,7 +215,7 @@ async def _symbol_graph_impl(
                 limit=limit,
                 language=language,
                 repo_filter=None,
-                under=_norm_under(under),
+                under=norm_under,
             )
             if not results:
                 # Fall back to array field lookup in the main collection.
@@ -223,7 +226,7 @@ async def _symbol_graph_impl(
                     value=symbol,
                     limit=limit,
                     language=language,
-                    under=_norm_under(under),
+                    under=norm_under,
                 )
         elif query_type == "definition":
             # Find chunks where symbol_path matches the symbol
@@ -233,7 +236,7 @@ async def _symbol_graph_impl(
                 symbol=symbol,
                 limit=limit,
                 language=language,
-                under=_norm_under(under),
+                under=norm_under,
             )
         elif query_type == "importers":
             results = await _query_graph_edges_collection(
@@ -244,7 +247,7 @@ async def _symbol_graph_impl(
                 limit=limit,
                 language=language,
                 repo_filter=None,
-                under=_norm_under(under),
+                under=norm_under,
             )
             if not results:
                 # Fall back to array field lookup in the main collection.
@@ -255,7 +258,7 @@ async def _symbol_graph_impl(
                     value=symbol,
                     limit=limit,
                     language=language,
-                    under=_norm_under(under),
+                    under=norm_under,
                 )
 
         # If no results, fall back to semantic search
@@ -265,6 +268,7 @@ async def _symbol_graph_impl(
                 query_type=query_type,
                 limit=limit,
                 language=language,
+                under=norm_under,
                 collection=coll,
                 session=session,
             )
@@ -277,6 +281,7 @@ async def _symbol_graph_impl(
             query_type=query_type,
             limit=limit,
             language=language,
+            under=norm_under,
             collection=coll,
             session=session,
         )
@@ -371,7 +376,9 @@ async def _query_graph_edges_collection(
             if not p:
                 continue
             path_s = str(p)
-            if under and not str(path_s).startswith(str(under)):
+            if under and not _path_matches_under(
+                path_s, under, repo_hint=(payload.get("repo") or repo_filter)
+            ):
                 continue
             if path_s in seen_paths:
                 continue
@@ -468,14 +475,6 @@ async def _query_array_field(
                 match=qmodels.MatchValue(value=language.lower()),
             )
         )
-    if under:
-        base_conditions.append(
-            qmodels.FieldCondition(
-                key="metadata.path_prefix",
-                match=qmodels.MatchValue(value=under),
-            )
-        )
-
     # Strategy 1: Exact match with MatchAny (most reliable for array fields)
     try:
         filter1 = qmodels.Filter(
@@ -499,6 +498,8 @@ async def _query_array_field(
         scroll_result = await asyncio.to_thread(scroll1)
         points = scroll_result[0] if scroll_result else []
         for pt in points:
+            if under and not _point_matches_under(pt, under):
+                continue
             pt_id = str(getattr(pt, "id", id(pt)))
             if pt_id not in seen_ids:
                 seen_ids.add(pt_id)
@@ -534,6 +535,8 @@ async def _query_array_field(
                 scroll_result = await asyncio.to_thread(scroll2)
                 points = scroll_result[0] if scroll_result else []
                 for pt in points:
+                    if under and not _point_matches_under(pt, under):
+                        continue
                     pt_id = str(getattr(pt, "id", id(pt)))
                     if pt_id not in seen_ids:
                         seen_ids.add(pt_id)
@@ -565,6 +568,8 @@ async def _query_array_field(
             scroll_result = await asyncio.to_thread(scroll3)
             points = scroll_result[0] if scroll_result else []
             for pt in points:
+                if under and not _point_matches_under(pt, under):
+                    continue
                 pt_id = str(getattr(pt, "id", id(pt)))
                 if pt_id not in seen_ids:
                     seen_ids.add(pt_id)
@@ -600,14 +605,6 @@ async def _query_definition(
                 match=qmodels.MatchValue(value=language.lower()),
             )
         )
-    if under:
-        base_conditions.append(
-            qmodels.FieldCondition(
-                key="metadata.path_prefix",
-                match=qmodels.MatchValue(value=under),
-            )
-        )
-
     # Strategy 1: Exact match on symbol_path (e.g., "MyClass.my_method")
     try:
         filter1 = qmodels.Filter(
@@ -692,6 +689,8 @@ async def _query_definition(
     seen_ids = set()
     unique_results = []
     for pt in results:
+        if under and not _point_matches_under(pt, under):
+            continue
         pt_id = getattr(pt, "id", None)
         if pt_id not in seen_ids:
             seen_ids.add(pt_id)
@@ -748,6 +747,7 @@ async def _fallback_semantic_search(
     query_type: str,
     limit: int = 20,
     language: Optional[str] = None,
+    under: Optional[str] = None,
     collection: Optional[str] = None,
     session: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -769,6 +769,7 @@ async def _fallback_semantic_search(
             query=query,
             limit=limit,
             language=language,
+            under=under,
             session=session,
             output_format="json",  # Avoid TOON encoding for internal calls
         )
@@ -833,7 +834,7 @@ async def _compute_called_by(
         symbol: The symbol name to find callers for
         limit: Maximum number of callers to return
         language: Optional language filter
-        under: Optional path prefix filter
+        under: Optional recursive workspace subtree filter
         collection: Optional collection override
 
     Returns:
@@ -881,13 +882,6 @@ async def _compute_called_by(
             )
         )
     norm_under = _norm_under(under)
-    if norm_under:
-        base_conditions.append(
-            qmodels.FieldCondition(
-                key="metadata.path_prefix",
-                match=qmodels.MatchValue(value=norm_under),
-            )
-        )
 
     callers: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
@@ -921,6 +915,8 @@ async def _compute_called_by(
             points = scroll_result[0] if scroll_result else []
 
             for pt in points:
+                if norm_under and not _point_matches_under(pt, norm_under):
+                    continue
                 pt_id = str(getattr(pt, "id", id(pt)))
                 if pt_id in seen_ids:
                     continue

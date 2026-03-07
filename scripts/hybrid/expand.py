@@ -29,6 +29,11 @@ import logging
 from typing import List, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+)
+
 logger = logging.getLogger("hybrid_expand")
 
 # Import QdrantClient type for annotations
@@ -542,20 +547,8 @@ def expand_via_embeddings(
         except Exception:
             vec_name = None
 
-    def _norm_under(u: str | None) -> str | None:
-        if not u:
-            return None
-        u = str(u).strip().replace("\\", "/")
-        u = "/".join([p for p in u.split("/") if p])
-        if not u:
-            return None
-        if u.startswith("/work/"):
-            return u
-        if not u.startswith("/"):
-            return "/work/" + u
-        return "/work/" + u.lstrip("/")
-
     flt = None
+    eff_under = _normalize_under_scope(under)
     try:
         from qdrant_client import models
 
@@ -567,15 +560,6 @@ def expand_via_embeddings(
                     match=models.MatchValue(value=language),
                 )
             )
-        if under:
-            eff_under = _norm_under(under)
-            if eff_under:
-                must.append(
-                    models.FieldCondition(
-                        key="metadata.path_prefix",
-                        match=models.MatchValue(value=eff_under),
-                    )
-                )
         if kind:
             must.append(
                 models.FieldCondition(
@@ -636,6 +620,17 @@ def expand_via_embeddings(
 
     if not results:
         return []
+
+    if eff_under:
+        _scoped = []
+        for hit in results:
+            payload = getattr(hit, "payload", None) or {}
+            md = payload.get("metadata") or {}
+            if _metadata_matches_under(md, eff_under):
+                _scoped.append(hit)
+        results = _scoped
+        if not results:
+            return []
 
     # Extract unique terms from neighbors
     extracted_terms: set[str] = set()

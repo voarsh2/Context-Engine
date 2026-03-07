@@ -43,6 +43,9 @@ from scripts.mcp_impl.workspace import _default_collection, _work_script
 from scripts.mcp_impl.admin_tools import _detect_current_repo, _run_async
 from scripts.mcp_toon import _should_use_toon, _format_results_as_toon
 from scripts.mcp_auth import require_collection_access as _require_collection_access
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+)
 
 # Constants
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -158,7 +161,7 @@ async def _repo_search_impl(
     - repo: str or list[str]. Filter by repo name(s). Use "*" to search all repos (disable auto-filter).
       By default, auto-detects current repo from CURRENT_REPO env and filters to it.
       Use repo=["frontend","backend"] to search related repos together.
-    - Filters (optional): language, under (path prefix), kind, symbol, ext, path_regex,
+    - Filters (optional): language, under (recursive workspace subtree), kind, symbol, ext, path_regex,
       path_glob (str or list[str]), not_glob (str or list[str]), not_ (negative text), case.
     - debug: bool (default false). When true, includes verbose internal fields like
       components, rerank_counters, code_signals. Default false saves ~60-80% tokens.
@@ -438,7 +441,7 @@ async def _repo_search_impl(
         under = under_hint
 
     language = _to_str(language, "").strip()
-    under = _to_str(under, "").strip()
+    under = _normalize_under_scope(_to_str(under, "").strip())
     kind = _to_str(kind, "").strip()
     symbol = _to_str(symbol, "").strip()
     path_regex = _to_str(path_regex, "").strip()
@@ -487,6 +490,99 @@ async def _repo_search_impl(
         detected_repo = _detect_current_repo()
         if detected_repo:
             repo_filter = [detected_repo]
+
+    case_sensitive = str(case or "").strip().lower() in {
+        "sensitive",
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+    path_globs_norm = [g if case_sensitive else g.lower() for g in path_globs]
+    not_globs_norm = [g if case_sensitive else g.lower() for g in not_globs]
+
+    def _norm_case(v: str) -> str:
+        return v if case_sensitive else v.lower()
+
+    def _match_glob(glob_pat: str, path_val: str) -> bool:
+        import fnmatch as _fnm
+        if not glob_pat:
+            return False
+        p = _norm_case(path_val).replace("\\", "/").strip("/")
+        if _fnm.fnmatchcase(p, glob_pat):
+            return True
+        # Allow repo-relative globs (e.g., scripts/**) to match absolute paths
+        # by testing suffix windows of the normalized path.
+        if not glob_pat.startswith("/") and "/" in p:
+            parts = [seg for seg in p.split("/") if seg]
+            for i in range(1, len(parts)):
+                tail = "/".join(parts[i:])
+                if _fnm.fnmatchcase(tail, glob_pat):
+                    return True
+        return False
+
+    def _result_passes_path_filters(item: dict) -> bool:
+        import re as _re
+
+        path = str(item.get("path") or "")
+        if not path:
+            return False
+
+        # Evaluate filters against all known path forms carried by this result.
+        path_vals = []
+        for key in ("path", "rel_path", "client_path", "host_path", "container_path"):
+            v = item.get(key)
+            if isinstance(v, str) and v.strip():
+                path_vals.append(v.strip().replace("\\", "/"))
+        if not path_vals:
+            path_vals = [path]
+        if path.startswith("/work/"):
+            path_vals.append(path[len("/work/") :])
+
+        # Deduplicate while preserving order.
+        seen = set()
+        norm_paths = []
+        for pv in path_vals:
+            if pv not in seen:
+                norm_paths.append(pv)
+                seen.add(pv)
+
+        if not_:
+            needle = _norm_case(str(not_))
+            if any(needle in _norm_case(pv) for pv in norm_paths):
+                return False
+
+        if ext:
+            ext_norm = str(ext).lower().lstrip(".")
+            if not any(_norm_case(pv).endswith("." + ext_norm) for pv in norm_paths):
+                return False
+
+        if path_regex:
+            flags = 0 if case_sensitive else _re.IGNORECASE
+            try:
+                if not any(_re.search(path_regex, pv, flags=flags) for pv in norm_paths):
+                    return False
+            except Exception:
+                pass
+
+        if path_globs_norm and not any(
+            _match_glob(g, pv) for g in path_globs_norm for pv in norm_paths
+        ):
+            return False
+
+        if not_globs_norm and any(
+            _match_glob(g, pv) for g in not_globs_norm for pv in norm_paths
+        ):
+            return False
+
+        return True
+
+    def _apply_result_filters(items: list[dict]) -> list[dict]:
+        if not items:
+            return []
+        if not (not_ or path_regex or ext or path_globs_norm or not_globs_norm):
+            return items
+        return [it for it in items if _result_passes_path_filters(it)]
 
     compact_raw = compact
     compact = _to_bool(compact, False)
@@ -607,46 +703,9 @@ async def _repo_search_impl(
             )
         )
         
-        # Apply post-filters (path_regex, path_glob, not_glob, not_) that aren't
-        # supported by run_pure_dense_search's server-side filters
-        case_sensitive = str(case or "").strip().lower() in {"sensitive", "true", "1", "yes", "on"}
-        import fnmatch as _fnm
-        import re as _re
-
-        def _norm_path(p: str) -> str:
-            return p if case_sensitive else p.lower()
-
-        path_globs_norm = [g if case_sensitive else g.lower() for g in path_globs]
-        not_globs_norm = [g if case_sensitive else g.lower() for g in not_globs]
-        path_regex_norm = path_regex or ""
-
-        def _match_glob(glob_pat: str, path_val: str) -> bool:
-            if not glob_pat:
-                return False
-            return _fnm.fnmatchcase(_norm_path(path_val), glob_pat)
-
         for item in items:
             path = item.get("path") or ""
-            
-            # Apply path_regex filter
-            if path_regex_norm:
-                flags = 0 if case_sensitive else _re.IGNORECASE
-                try:
-                    if not _re.search(path_regex_norm, path, flags=flags):
-                        continue
-                except Exception:
-                    pass
-            
-            # Apply path_glob filter
-            if path_globs_norm and not any(_match_glob(g, path) for g in path_globs_norm):
-                continue
-            
-            # Apply not_glob filter
-            if not_globs_norm and any(_match_glob(g, path) for g in not_globs_norm):
-                continue
-            
-            # Apply not_ text filter
-            if not_ and not_.lower() in _norm_path(path):
+            if not _result_passes_path_filters({"path": path}):
                 continue
 
             payload = item.get("payload") or {}
@@ -1269,6 +1328,10 @@ async def _repo_search_impl(
                 item["tags"] = obj.get("tags")
             results.append(item)
 
+    # Enforce strict filter semantics regardless of retrieval/rerank branch.
+    # This closes gaps where fallback rerank paths may bypass path_glob/not_glob.
+    results = _apply_result_filters(results)
+
     # Mode-aware reordering: nudge core implementation code vs docs and non-core when requested
     def _is_doc_path(p: str) -> bool:
         pl = str(p or "").lower()
@@ -1549,6 +1612,12 @@ async def _repo_search_impl(
         #        start_line, end_line, tags, pseudo
         results = [_strip_debug_fields(r) for r in results]
 
+    _res_ok = bool(res.get("ok", True)) if isinstance(res, dict) else True
+    try:
+        _res_code = int((res or {}).get("code", 0))
+    except Exception:
+        _res_code = 0
+
     response = {
         "args": {
             "queries": queries,
@@ -1577,11 +1646,17 @@ async def _repo_search_impl(
         "used_rerank": bool(used_rerank),
         "total": len(results),
         "results": results,
-        **res,
+        "ok": _res_ok,
+        "code": _res_code,
     }
+
+    # Expose a concise failure reason without leaking raw subprocess streams by default.
+    if (not _res_ok or _res_code != 0) and not results:
+        response["error"] = "search backend execution failed"
 
     # Only include debug fields when explicitly requested
     if debug:
+        response["subprocess"] = res
         response["rerank_counters"] = rerank_counters
         if code_signals.get("has_code_signals"):
             response["code_signals"] = code_signals

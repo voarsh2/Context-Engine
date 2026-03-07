@@ -1431,7 +1431,7 @@ async def symbol_graph(
     - query_type: str. One of "callers", "definition", "importers".
     - limit: int (default 20). Maximum results to return.
     - language: str (optional). Filter by programming language.
-    - under: str (optional). Filter by path prefix.
+    - under: str (optional). Filter by recursive workspace subtree (e.g., "scripts" -> scripts/**).
     - output_format: "json" (default) or "toon" for token-efficient format.
 
     Returns:
@@ -1746,7 +1746,7 @@ async def info_request(
     - include_relationships: bool (default false). Add imports_from, calls, related_paths to results.
     - limit: int (default 10). Maximum results to return.
     - language: str. Filter by programming language.
-    - under: str. Limit search to specific directory.
+    - under: str. Limit search to a recursive workspace subtree.
     - repo: str or list[str]. Filter by repository name(s).
     - output_format: "json" (default) or "toon" for token-efficient TOON format.
 

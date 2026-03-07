@@ -15,6 +15,10 @@ class _FastMCP:
         def _decorator(fn):
             return fn
         return _decorator
+    def resource(self, *args, **kwargs):
+        def _decorator(fn):
+            return fn
+        return _decorator
 
 class _Context:
     def __init__(self, *args, **kwargs):
@@ -98,4 +102,3 @@ async def test_change_history_strict_match_under_work(monkeypatch):
     assert summary.get("ingested_min") == 90
     assert summary.get("ingested_max") == 115
     assert summary.get("churn_count_max") == 5
-
