@@ -114,9 +114,25 @@ function createPythonEnvManager(deps) {
 
     const REQUIRED_PYTHON_MODULES = ['requests', 'urllib3', 'charset_normalizer', 'watchdog'];
     const depCheckCache = new Map();
+    const ensureDepCheckInflight = new Map();
+    let hasLoggedBundledDepPath = false;
 
     function cacheKey(pythonPath, workingDirectory) {
         return `${pythonPath || ''}::${workingDirectory || ''}`;
+    }
+
+    function getBundledLibsPath(workingDirectory) {
+        const candidates = [];
+        if (workingDirectory) {
+            candidates.push(path.join(workingDirectory, 'python_libs'));
+        }
+        candidates.push(path.join(getExtensionRoot(), 'python_libs'));
+        for (const libsPath of candidates) {
+            if (libsPath && fs.existsSync(libsPath)) {
+                return libsPath;
+            }
+        }
+        return undefined;
     }
 
     function venvRootDir() {
@@ -186,16 +202,13 @@ function createPythonEnvManager(deps) {
         let pythonError;
         const env = { ...process.env };
         try {
-            const candidates = [];
-            if (workingDirectory) {
-                candidates.push(path.join(workingDirectory, 'python_libs'));
-            }
-            candidates.push(path.join(getExtensionRoot(), 'python_libs'));
-            for (const libsPath of candidates) {
-                if (libsPath && fs.existsSync(libsPath)) {
-                    const existing = env.PYTHONPATH || '';
-                    env.PYTHONPATH = existing ? `${libsPath}${path.delimiter}${existing}` : libsPath;
-                    break;
+            const libsPath = getBundledLibsPath(workingDirectory);
+            if (libsPath) {
+                const existing = env.PYTHONPATH || '';
+                env.PYTHONPATH = existing ? `${libsPath}${path.delimiter}${existing}` : libsPath;
+                if (!hasLoggedBundledDepPath) {
+                    log(`Using bundled python_libs for dependency checks: ${libsPath}`);
+                    hasLoggedBundledDepPath = true;
                 }
             }
         } catch (error) {
@@ -309,65 +322,87 @@ function createPythonEnvManager(deps) {
     }
 
     async function ensurePythonDependencies(pythonPath, workingDirectory, pythonPathSource) {
-        // Probe current interpreter with bundled python_libs first
-        const allowPrompt = pythonPathSource === 'configured' || pythonPathSource === 'override';
-        const primaryKey = cacheKey(pythonPath, workingDirectory);
-        if (depCheckCache.get(primaryKey)) {
-            return true;
-        }
-        let ok = await checkPythonDeps(pythonPath, workingDirectory, { showInterpreterError: allowPrompt });
-        if (ok) {
-            depCheckCache.set(primaryKey, true);
-            return true;
+        const inflightKey = cacheKey(pythonPath, workingDirectory);
+        const existing = ensureDepCheckInflight.get(inflightKey);
+        if (existing) {
+            return existing;
         }
 
-        // If that fails, try to auto-detect a better system Python before falling back to a venv
-        const autoPython = await detectSystemPython();
-        if (autoPython && autoPython !== pythonPath) {
-            log(`Falling back to auto-detected Python interpreter: ${autoPython}`);
-            const autoKey = cacheKey(autoPython, workingDirectory);
-            if (depCheckCache.get(autoKey)) {
-                setPythonOverridePath(autoPython);
+        const task = (async () => {
+            const allowPrompt = pythonPathSource === 'configured' || pythonPathSource === 'override';
+            const primaryKey = cacheKey(pythonPath, workingDirectory);
+            if (depCheckCache.get(primaryKey)) {
                 return true;
             }
-            ok = await checkPythonDeps(autoPython, workingDirectory, { showInterpreterError: allowPrompt });
+
+            let ok = await checkPythonDeps(pythonPath, workingDirectory, { showInterpreterError: false });
             if (ok) {
-                setPythonOverridePath(autoPython);
-                depCheckCache.set(autoKey, true);
+                depCheckCache.set(primaryKey, true);
                 return true;
             }
-        }
 
-        // As a last resort, offer to create a private venv and install deps via pip
-        // Always prompt at this point - we've exhausted all other options (initial Python + auto-detected both failed)
-        const choice = await vscode.window.showErrorMessage(
-            'Context Engine Uploader: missing Python modules. Create isolated environment and auto-install?',
-            'Auto-install to private venv',
-            'Cancel'
-        );
-        if (choice !== 'Auto-install to private venv') {
-            return false;
+            // If that fails, try to auto-detect a better system Python before falling back to a venv.
+            const autoPython = await detectSystemPython();
+            if (autoPython && autoPython !== pythonPath) {
+                log(`Falling back to auto-detected Python interpreter: ${autoPython}`);
+                const autoKey = cacheKey(autoPython, workingDirectory);
+                if (depCheckCache.get(autoKey)) {
+                    setPythonOverridePath(autoPython);
+                    return true;
+                }
+                ok = await checkPythonDeps(autoPython, workingDirectory, { showInterpreterError: false });
+                if (ok) {
+                    setPythonOverridePath(autoPython);
+                    depCheckCache.set(autoKey, true);
+                    return true;
+                }
+            }
+
+            // Delay configured-python noise until after fallback discovery is exhausted.
+            if (allowPrompt) {
+                vscode.window.showErrorMessage(`Context Engine Uploader: failed to run ${pythonPath}. Update contextEngineUploader.pythonPath.`);
+            }
+
+            // As a last resort, offer to create a private venv and install deps via pip
+            // only after current and auto-detected interpreters have both failed.
+            const choice = await vscode.window.showErrorMessage(
+                'Context Engine Uploader: missing Python modules. Create isolated environment and auto-install?',
+                'Auto-install to private venv',
+                'Cancel'
+            );
+            if (choice !== 'Auto-install to private venv') {
+                return false;
+            }
+            const created = await ensurePrivateVenv();
+            if (!created) return false;
+            const venvPython = resolvePrivateVenvPython();
+            if (!venvPython) {
+                vscode.window.showErrorMessage('Context Engine Uploader: failed to locate private venv python.');
+                return false;
+            }
+            const installed = await installDepsInto(venvPython);
+            if (!installed) return false;
+            setPythonOverridePath(venvPython);
+            log(`Using private venv interpreter: ${getPythonOverridePath()}`);
+            const venvKey = cacheKey(venvPython, workingDirectory);
+            if (depCheckCache.get(venvKey)) {
+                return true;
+            }
+            const finalOk = await checkPythonDeps(venvPython, workingDirectory, { showInterpreterError: true });
+            if (finalOk) {
+                depCheckCache.set(venvKey, true);
+            }
+            return finalOk;
+        })();
+
+        ensureDepCheckInflight.set(inflightKey, task);
+        try {
+            return await task;
+        } finally {
+            if (ensureDepCheckInflight.get(inflightKey) === task) {
+                ensureDepCheckInflight.delete(inflightKey);
+            }
         }
-        const created = await ensurePrivateVenv();
-        if (!created) return false;
-        const venvPython = resolvePrivateVenvPython();
-        if (!venvPython) {
-            vscode.window.showErrorMessage('Context Engine Uploader: failed to locate private venv python.');
-            return false;
-        }
-        const installed = await installDepsInto(venvPython);
-        if (!installed) return false;
-        setPythonOverridePath(venvPython);
-        log(`Using private venv interpreter: ${getPythonOverridePath()}`);
-        const venvKey = cacheKey(venvPython, workingDirectory);
-        if (depCheckCache.get(venvKey)) {
-            return true;
-        }
-        const finalOk = await checkPythonDeps(venvPython, workingDirectory, { showInterpreterError: true });
-        if (finalOk) {
-            depCheckCache.set(venvKey, true);
-        }
-        return finalOk;
     }
 
     return {

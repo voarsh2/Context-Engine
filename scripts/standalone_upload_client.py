@@ -300,6 +300,10 @@ class SimpleHashCache:
             self._cache = file_hashes
             self._cache_loaded = True
 
+    def flush(self) -> None:
+        """Persist the current in-memory cache state to disk."""
+        self._save_cache(dict(self._load_cache()))
+
     def _cache_seems_stale(self, file_hashes: Dict[str, str]) -> bool:
         """Return True if a large portion of cached paths no longer exist on disk."""
         total = len(file_hashes)
@@ -349,6 +353,13 @@ def remove_cached_file(file_path: str, repo_name: Optional[str] = None) -> None:
     global _hash_cache
     if _hash_cache:
         _hash_cache.remove_hash(file_path)
+
+
+def flush_cached_file_hashes() -> None:
+    """Persist the current workspace hash cache to disk."""
+    global _hash_cache
+    if _hash_cache:
+        _hash_cache.flush()
 
 
 def _find_git_root(start: Path) -> Optional[Path]:
@@ -1542,6 +1553,7 @@ class RemoteUploadClient:
                     processed_ops = response.get('processed_operations', {})
                     logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
                     logger.info(f"[remote_upload] Processed operations: {processed_ops}")
+                    flush_cached_file_hashes()
 
                     # Clean up temporary bundle after successful upload
                     try:
@@ -1890,6 +1902,7 @@ class RemoteUploadClient:
                     processed_ops = response.get('processed_operations', {})
                     logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
                     logger.info(f"[remote_upload] Processed operations: {processed_ops}")
+                    flush_cached_file_hashes()
 
                     # Clean up temporary bundle after successful upload
                     try:
