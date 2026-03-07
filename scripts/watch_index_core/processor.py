@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -38,38 +43,228 @@ class _SkipUnchanged(Exception):
     """Sentinel exception to skip unchanged files in the watch loop."""
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = str(os.environ.get(name, str(default))).strip()
+        val = int(raw)
+        return val if val > 0 else default
+    except Exception:
+        return default
+
+
+_GIT_HISTORY_MAX_WORKERS = _env_int("WATCH_GIT_HISTORY_MAX_WORKERS", 1)
+_GIT_HISTORY_TIMEOUT_SECONDS = _env_int("WATCH_GIT_HISTORY_TIMEOUT_SECONDS", 0)
+_GIT_HISTORY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_GIT_HISTORY_MAX_WORKERS,
+    thread_name_prefix="git-history",
+)
+_GIT_HISTORY_INFLIGHT: set[str] = set()
+_GIT_HISTORY_INFLIGHT_LOCK = threading.Lock()
+
+
+def _manifest_key(p: Path) -> str:
+    try:
+        return str(p.resolve())
+    except Exception:
+        return str(p)
+
+
+def _manifest_stats(p: Path) -> tuple[str, int]:
+    run_id = "unknown"
+    commit_count = -1
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            commits = data.get("commits") or []
+            if isinstance(commits, list):
+                commit_count = len(commits)
+            name = p.name
+            run_id = name[:-5] if name.endswith(".json") else name
+    except Exception:
+        pass
+    return run_id, commit_count
+
+
+def _run_git_history_ingest(
+    p: Path,
+    collection: str,
+    repo_name: Optional[str],
+    env_snapshot: Optional[Dict[str, str]] = None,
+) -> None:
+    script = ROOT_DIR / "scripts" / "ingest_history.py"
+    if not script.exists():
+        logger.warning("[git_history_manifest] ingest script missing: %s", script)
+        return
+
+    cmd = [sys.executable or "python3", str(script), "--manifest-json", str(p)]
+    env = _build_subprocess_env(collection, repo_name, env_snapshot)
+    started = time.monotonic()
+    timeout = _GIT_HISTORY_TIMEOUT_SECONDS if _GIT_HISTORY_TIMEOUT_SECONDS > 0 else None
+    stdout_tail: deque[str] = deque(maxlen=20)
+    stderr_tail: deque[str] = deque(maxlen=20)
+
+    def _stream_pipe(pipe, label: str, tail: deque[str]) -> None:
+        try:
+            for raw in iter(pipe.readline, ""):
+                line = (raw or "").rstrip()
+                if not line:
+                    continue
+                tail.append(line)
+                logger.info("[git_history_manifest][%s] %s", label, line)
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    proc: Optional[subprocess.Popen] = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        t_out = threading.Thread(
+            target=_stream_pipe,
+            args=(proc.stdout, "stdout", stdout_tail),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_stream_pipe,
+            args=(proc.stderr, "stderr", stderr_tail),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+
+        deadline = (started + timeout) if timeout else None
+        timed_out = False
+        while True:
+            code = proc.poll()
+            if code is not None:
+                break
+            if deadline and time.monotonic() >= deadline:
+                timed_out = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+            time.sleep(0.2)
+
+        # Ensure threads flush trailing output after process exit/kill.
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+
+        if timed_out:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "[git_history_manifest] ingest_history.py timeout for %s after %dms (timeout=%ss)",
+                p,
+                elapsed_ms,
+                _GIT_HISTORY_TIMEOUT_SECONDS,
+            )
+            if stderr_tail:
+                logger.warning(
+                    "[git_history_manifest] timeout stderr tail for %s: %s",
+                    p,
+                    " | ".join(list(stderr_tail)[-5:]),
+                )
+            return
+
+        returncode = proc.wait(timeout=1.0)
+    except Exception as e:
+        logger.warning("[git_history_manifest] subprocess error for %s: %s", p, e)
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        return
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if returncode != 0:
+        logger.warning(
+            "[git_history_manifest] ingest_history.py failed for %s: exit=%d elapsed_ms=%d stderr=%s",
+            p,
+            returncode,
+            elapsed_ms,
+            " | ".join(list(stderr_tail)[-5:]),
+        )
+        return
+
+    logger.info(
+        "[git_history_manifest] completed for %s: exit=0 elapsed_ms=%d",
+        p,
+        elapsed_ms,
+    )
+    if stdout_tail:
+        logger.info(
+            "[git_history_manifest] stdout tail for %s: %s",
+            p,
+            " | ".join(list(stdout_tail)[-5:]),
+        )
+    if stderr_tail:
+        logger.warning(
+            "[git_history_manifest] stderr tail for %s: %s",
+            p,
+            " | ".join(list(stderr_tail)[-5:]),
+        )
+
+
+def _on_git_history_done(manifest_key: str, future: Future) -> None:
+    with _GIT_HISTORY_INFLIGHT_LOCK:
+        _GIT_HISTORY_INFLIGHT.discard(manifest_key)
+        remaining = len(_GIT_HISTORY_INFLIGHT)
+    logger.info("[git_history_manifest] in-flight remaining=%d", remaining)
+    try:
+        future.result()
+    except Exception as e:
+        logger.warning("[git_history_manifest] worker crashed for %s: %s", manifest_key, e)
+
+
 def _process_git_history_manifest(
     p: Path,
     collection: str,
     repo_name: Optional[str],
     env_snapshot: Optional[Dict[str, str]] = None,
 ) -> None:
-    try:
-        script = ROOT_DIR / "scripts" / "ingest_history.py"
-        if not script.exists():
+    key = _manifest_key(p)
+    run_id, commit_count = _manifest_stats(p)
+    queued = 0
+    with _GIT_HISTORY_INFLIGHT_LOCK:
+        if key in _GIT_HISTORY_INFLIGHT:
+            logger.info(
+                "[git_history_manifest] skip duplicate in-flight manifest: %s run_id=%s",
+                p,
+                run_id,
+            )
             return
-        cmd = [sys.executable or "python3", str(script), "--manifest-json", str(p)]
-        env = _build_subprocess_env(collection, repo_name, env_snapshot)
-        try:
-            print(
-                f"[git_history_manifest] launching ingest_history.py for {p} "
-                f"collection={collection} repo={repo_name}"
-            )
-        except Exception:
-            pass
-        # Use subprocess.run for better error observability.
-        # NOTE: This blocks until ingest_history.py completes. If history ingestion
-        # is slow, this may need revisiting (e.g., revert to Popen fire-and-forget
-        # or run in a separate thread) to avoid blocking the watcher.
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            logger.warning(
-                "[git_history_manifest] ingest_history.py failed for %s: exit=%d stderr=%s",
-                p, result.returncode, (result.stderr or "")[:500],
-            )
-    except Exception as e:
-        logger.warning("[git_history_manifest] error processing %s: %s", p, e)
-        return
+        _GIT_HISTORY_INFLIGHT.add(key)
+        queued = len(_GIT_HISTORY_INFLIGHT)
+    logger.info(
+        "[git_history_manifest] queued ingest_history.py for %s run_id=%s commits=%d collection=%s repo=%s in_flight=%d",
+        p,
+        run_id,
+        commit_count,
+        collection,
+        repo_name,
+        queued,
+    )
+    future = _GIT_HISTORY_EXECUTOR.submit(
+        _run_git_history_ingest,
+        p,
+        collection,
+        repo_name,
+        env_snapshot,
+    )
+    future.add_done_callback(lambda fut, manifest_key=key: _on_git_history_done(manifest_key, fut))
 
 
 def _advance_progress(

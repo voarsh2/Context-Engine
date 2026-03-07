@@ -48,6 +48,16 @@ except ImportError:
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+_git_history_skip_log_key: Optional[str] = None
+
+
+def _log_git_history_skip_once(reason: str, key: str) -> None:
+    global _git_history_skip_log_key
+    marker = f"{reason}:{key}"
+    if _git_history_skip_log_key == marker:
+        return
+    _git_history_skip_log_key = marker
+    logger.info("[git_history] skip (%s): %s", reason, key)
 
 DEFAULT_MAX_TEMP_CLEAN_ATTEMPTS = 3
 DEFAULT_TEMP_CLEAN_SLEEP = 1.0
@@ -426,10 +436,12 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
     }
 
     if max_commits <= 0:
+        _log_git_history_skip_once("disabled", f"max_commits={max_commits}")
         return None
 
     root = _find_git_root(Path(workspace_path))
     if not root:
+        _log_git_history_skip_once("no_repo", workspace_path)
         return None
 
     # Git history cache: avoid emitting identical manifests when HEAD/settings are unchanged
@@ -463,6 +475,7 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
             cache = {}
 
         if current_head and cache.get("last_head") == current_head and cache.get("max_commits") == max_commits and str(cache.get("since") or "") == since:
+            _log_git_history_skip_once("cache_hit", f"head={current_head[:10]} since={since or '-'} max={max_commits}")
             return None
 
     base_head = ""
@@ -513,12 +526,20 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
             errors="replace",
         )
         if proc.returncode != 0 or not proc.stdout.strip():
+            _log_git_history_skip_once(
+                "rev_list_empty",
+                f"head={current_head[:10] if current_head else '-'} rc={proc.returncode}",
+            )
             return None
         commits = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
     except Exception:
         return None
 
     if not commits:
+        _log_git_history_skip_once(
+            "no_commits",
+            f"head={current_head[:10] if current_head else '-'}",
+        )
         return None
     if len(commits) > max_commits:
         commits = commits[:max_commits]
@@ -592,6 +613,10 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
             continue
 
     if not records:
+        _log_git_history_skip_once(
+            "no_records",
+            f"commits={len(commits)} head={current_head[:10] if current_head else '-'}",
+        )
         return None
 
     try:
@@ -611,6 +636,14 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
         "since": since,
         "commits": records,
     }
+    logger.info(
+        "[git_history] prepared manifest mode=%s commits=%d head=%s prev=%s base=%s",
+        manifest["mode"],
+        len(records),
+        (current_head[:10] if current_head else "-"),
+        (prev_head[:10] if prev_head else "-"),
+        (base_head[:10] if base_head else "-"),
+    )
 
     # Update git history cache with the HEAD and settings used for this manifest
     try:

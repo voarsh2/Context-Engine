@@ -4,6 +4,7 @@ import argparse
 import subprocess
 import shlex
 import hashlib
+import logging
 from typing import List, Dict, Any
 import re
 import time
@@ -34,6 +35,10 @@ except ImportError:
     _EMBEDDER_FACTORY = False
 
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 def _manifest_run_id(manifest_path: str) -> str:
@@ -382,13 +387,43 @@ def _ingest_from_manifest(
     mode = str(data.get("mode") or "delta").strip().lower() or "delta"
 
     points: List[models.PointStruct] = []
-    count = 0
-    for c in commits:
+    total_commits = len(commits)
+    prepared_count = 0
+    persisted_count = 0
+    invalid_commit_records = 0
+    embed_failures = 0
+    point_build_failures = 0
+    upsert_failures = 0
+    processed_count = 0
+    progress_step = max(1, total_commits // 10) if total_commits > 0 else 1
+
+    def _log_progress(force: bool = False) -> None:
+        if not force and processed_count % progress_step != 0:
+            return
+        logger.info(
+            "[ingest_history] progress run_id=%s processed=%d/%d prepared=%d persisted=%d invalid=%d embed_failures=%d point_failures=%d upsert_failures=%d",
+            run_id,
+            processed_count,
+            total_commits,
+            prepared_count,
+            persisted_count,
+            invalid_commit_records,
+            embed_failures,
+            point_build_failures,
+            upsert_failures,
+        )
+
+    for idx, c in enumerate(commits, start=1):
+        processed_count += 1
         try:
             if not isinstance(c, dict):
+                invalid_commit_records += 1
+                _log_progress()
                 continue
             commit_id = str(c.get("commit_id") or "").strip()
             if not commit_id:
+                invalid_commit_records += 1
+                _log_progress()
                 continue
             author_name = str(c.get("author_name") or "")
             authored_date = str(c.get("authored_date") or "")
@@ -406,7 +441,12 @@ def _ingest_from_manifest(
             text = build_text(md, include_body=include_body)
             try:
                 vec = next(model.embed([text])).tolist()
-            except Exception:
+            except Exception as e:
+                embed_failures += 1
+                logger.warning(
+                    f"[ingest_history] embed failed for commit={commit_id} idx={idx}: {e}",
+                )
+                _log_progress()
                 continue
 
             goal: str = ""
@@ -451,25 +491,64 @@ def _ingest_from_manifest(
             pid = stable_id(commit_id)
             pt = models.PointStruct(id=pid, vector={vec_name: vec}, payload=payload)
             points.append(pt)
-            count += 1
+            prepared_count += 1
             if len(points) >= per_batch:
-                client.upsert(collection_name=COLLECTION, points=points)
-                points.clear()
-        except Exception:
+                batch_size = len(points)
+                try:
+                    client.upsert(collection_name=COLLECTION, points=points)
+                    persisted_count += batch_size
+                except Exception as e:
+                    upsert_failures += batch_size
+                    logger.error(
+                        "[ingest_history] upsert batch failed (size=%d): %s",
+                        batch_size,
+                        e,
+                    )
+                finally:
+                    points.clear()
+            _log_progress()
+        except Exception as e:
+            point_build_failures += 1
+            logger.warning(
+                f"[ingest_history] commit processing failed idx={idx}: {e}",
+            )
+            _log_progress()
             continue
 
     if points:
-        client.upsert(collection_name=COLLECTION, points=points)
+        batch_size = len(points)
+        try:
+            client.upsert(collection_name=COLLECTION, points=points)
+            persisted_count += batch_size
+        except Exception as e:
+            upsert_failures += batch_size
+            logger.error(
+                "[ingest_history] final upsert failed (size=%d): %s",
+                batch_size,
+                e,
+            )
+    _log_progress(force=True)
     try:
         _prune_old_commit_points(client, run_id, mode=mode)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[ingest_history] prune failed for run_id=%s: %s", run_id, e)
     try:
         _cleanup_manifest_files(manifest_path)
-    except Exception:
-        pass
-    print(f"Ingested {count} commits into {COLLECTION} from manifest {manifest_path}.")
-    return count
+    except Exception as e:
+        logger.warning("[ingest_history] manifest cleanup failed for %s: %s", manifest_path, e)
+    logger.info(
+        "Ingested commits from manifest %s into %s: persisted=%d prepared=%d invalid=%d "
+        "embed_failures=%d point_failures=%d upsert_failures=%d",
+        manifest_path,
+        COLLECTION,
+        persisted_count,
+        prepared_count,
+        invalid_commit_records,
+        embed_failures,
+        point_build_failures,
+        upsert_failures,
+    )
+    return persisted_count
 
 
 def main():
