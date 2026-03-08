@@ -804,6 +804,30 @@ class RemoteUploadClient:
             logger.info("[watch] Upload handling completed")
 
     def _finalize_successful_changes(self, changes: Dict[str, List]) -> None:
+        for path in changes.get("created", []):
+            try:
+                abs_path = str(path.resolve())
+                current_hash = hashlib.sha1(path.read_bytes()).hexdigest()
+                set_cached_file_hash(abs_path, current_hash, self.repo_name)
+                stat = path.stat()
+                self._stat_cache[abs_path] = (
+                    getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
+                    stat.st_size,
+                )
+            except Exception:
+                continue
+        for path in changes.get("updated", []):
+            try:
+                abs_path = str(path.resolve())
+                current_hash = hashlib.sha1(path.read_bytes()).hexdigest()
+                set_cached_file_hash(abs_path, current_hash, self.repo_name)
+                stat = path.stat()
+                self._stat_cache[abs_path] = (
+                    getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
+                    stat.st_size,
+                )
+            except Exception:
+                continue
         for path in changes.get("deleted", []):
             try:
                 abs_path = str(path.resolve())
@@ -811,11 +835,22 @@ class RemoteUploadClient:
                 self._stat_cache.pop(abs_path, None)
             except Exception:
                 continue
-        for source_path, _dest_path in changes.get("moved", []):
+        for source_path, dest_path in changes.get("moved", []):
             try:
-                abs_path = str(source_path.resolve())
-                remove_cached_file(abs_path, self.repo_name)
-                self._stat_cache.pop(abs_path, None)
+                source_abs_path = str(source_path.resolve())
+                remove_cached_file(source_abs_path, self.repo_name)
+                self._stat_cache.pop(source_abs_path, None)
+            except Exception:
+                pass
+            try:
+                dest_abs_path = str(dest_path.resolve())
+                current_hash = hashlib.sha1(dest_path.read_bytes()).hexdigest()
+                set_cached_file_hash(dest_abs_path, current_hash, self.repo_name)
+                stat = dest_path.stat()
+                self._stat_cache[dest_abs_path] = (
+                    getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
+                    stat.st_size,
+                )
             except Exception:
                 continue
 
@@ -1048,8 +1083,6 @@ class RemoteUploadClient:
                 self._stat_cache[abs_path] = (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)), stat.st_size)
             except Exception:
                 pass
-            set_cached_file_hash(abs_path, current_hash, self.repo_name)
-
         # Detect moves by looking for files with same content hash
         # but different paths (requires additional tracking)
         changes["moved"] = self._detect_moves(changes["created"], changes["deleted"])
@@ -1174,8 +1207,6 @@ class RemoteUploadClient:
                     operations.append(operation)
                     file_hashes[rel_path] = f"sha1:{file_hash}"
                     total_size += stat.st_size
-                    set_cached_file_hash(str(path.resolve()), file_hash, self.repo_name)
-
                 except Exception as e:
                     print(f"[bundle_create] Error processing created file {path}: {e}")
                     continue
@@ -1214,8 +1245,6 @@ class RemoteUploadClient:
                     operations.append(operation)
                     file_hashes[rel_path] = f"sha1:{file_hash}"
                     total_size += stat.st_size
-                    set_cached_file_hash(str(path.resolve()), file_hash, self.repo_name)
-
                 except Exception as e:
                     print(f"[bundle_create] Error processing updated file {path}: {e}")
                     continue
@@ -1256,8 +1285,6 @@ class RemoteUploadClient:
                     operations.append(operation)
                     file_hashes[dest_rel_path] = f"sha1:{file_hash}"
                     total_size += stat.st_size
-                    set_cached_file_hash(str(dest_path.resolve()), file_hash, self.repo_name)
-
                 except Exception as e:
                     print(f"[bundle_create] Error processing moved file {source_path} -> {dest_path}: {e}")
                     continue
@@ -2058,6 +2085,7 @@ class RemoteUploadClient:
                         return True
                 if not self.has_meaningful_changes(planned_changes):
                     logger.info("[remote_upload] Plan found no upload work; skipping bundle upload")
+                    self._finalize_successful_changes(changes)
                     self._set_last_upload_result(
                         "skipped_by_plan",
                         plan_preview=preview,
@@ -2182,6 +2210,7 @@ class RemoteUploadClient:
                 self._pending_paths = set()
                 self._check_for_deletions = False
                 self._lock = threading.Lock()
+                self._processing = False
                 
             def on_any_event(self, event):
                 """Handle any file system event."""
@@ -2226,8 +2255,11 @@ class RemoteUploadClient:
             def _process_pending_changes(self):
                 """Process accumulated changes after debounce period."""
                 with self._lock:
+                    if self._processing:
+                        return
                     if not self._pending_paths:
                         return
+                    self._processing = True
                     pending = list(self._pending_paths)
                     self._pending_paths.clear()
                     check_deletions = self._check_for_deletions
@@ -2276,6 +2308,9 @@ class RemoteUploadClient:
                                 logger.error("[watch] Failed to upload git history metadata")
                 except Exception as e:
                     logger.error(f"[watch] Error processing changes: {e}")
+                finally:
+                    with self._lock:
+                        self._processing = False
         
         observer = Observer()
         handler = CodeFileEventHandler(self, debounce_seconds=2.0)

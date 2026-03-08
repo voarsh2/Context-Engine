@@ -1,5 +1,6 @@
 import importlib
 from pathlib import Path
+from unittest.mock import MagicMock
 
 
 def _exercise_ignored_path_cleanup(mod_name: str, monkeypatch, tmp_path: Path) -> None:
@@ -214,6 +215,103 @@ def test_remote_upload_client_plan_skip_avoids_bundle_upload(monkeypatch, tmp_pa
 
 def test_standalone_upload_client_plan_skip_avoids_bundle_upload(monkeypatch, tmp_path):
     _exercise_plan_skip_avoids_bundle_upload("scripts.standalone_upload_client", monkeypatch, tmp_path)
+
+
+def _exercise_detect_file_changes_does_not_persist_hash(mod_name: str, monkeypatch, tmp_path: Path) -> None:
+    mod = importlib.import_module(mod_name)
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir(parents=True, exist_ok=True)
+    current = workspace / "app.py"
+    current.write_text("print('current')\n", encoding="utf-8")
+
+    set_hash = MagicMock()
+    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None: "oldhash")
+    monkeypatch.setattr(mod, "set_cached_file_hash", set_hash)
+
+    client = mod.RemoteUploadClient(
+        upload_endpoint="http://localhost:8004",
+        workspace_path=str(workspace),
+        collection_name="test-coll",
+    )
+
+    changes = client.detect_file_changes([current])
+
+    assert current in changes["updated"]
+    set_hash.assert_not_called()
+
+
+def test_remote_upload_client_detect_file_changes_does_not_persist_hash(monkeypatch, tmp_path):
+    _exercise_detect_file_changes_does_not_persist_hash(
+        "scripts.remote_upload_client", monkeypatch, tmp_path
+    )
+
+
+def test_standalone_upload_client_detect_file_changes_does_not_persist_hash(monkeypatch, tmp_path):
+    _exercise_detect_file_changes_does_not_persist_hash(
+        "scripts.standalone_upload_client", monkeypatch, tmp_path
+    )
+
+
+def _exercise_plan_skip_finalizes_hash(mod_name: str, monkeypatch, tmp_path: Path) -> None:
+    mod = importlib.import_module(mod_name)
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir(parents=True, exist_ok=True)
+    current = workspace / "app.py"
+    current.write_text("print('current')\n", encoding="utf-8")
+
+    client = mod.RemoteUploadClient(
+        upload_endpoint="http://localhost:8004",
+        workspace_path=str(workspace),
+        collection_name="test-coll",
+    )
+
+    set_hash = MagicMock()
+    monkeypatch.setattr(mod, "set_cached_file_hash", set_hash)
+    monkeypatch.setattr(
+        client,
+        "_plan_delta_upload",
+        lambda changes: {
+            "needed_files": {"created": [], "updated": [], "moved": []},
+            "operation_counts_preview": {
+                "created": 0,
+                "updated": 0,
+                "deleted": 0,
+                "moved": 0,
+                "skipped": 1,
+                "skipped_hash_match": 1,
+                "failed": 0,
+            },
+            "needed_size_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(client, "create_delta_bundle", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("should not bundle")))
+    monkeypatch.setattr(client, "upload_bundle", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("should not upload")))
+
+    assert client.process_changes_and_upload(
+        {
+            "created": [],
+            "updated": [current],
+            "deleted": [],
+            "moved": [],
+            "unchanged": [],
+        }
+    ) is True
+    assert client.last_upload_result["outcome"] == "skipped_by_plan"
+    set_hash.assert_called_once()
+
+
+def test_remote_upload_client_plan_skip_finalizes_hash(monkeypatch, tmp_path):
+    _exercise_plan_skip_finalizes_hash(
+        "scripts.remote_upload_client", monkeypatch, tmp_path
+    )
+
+
+def test_standalone_upload_client_plan_skip_finalizes_hash(monkeypatch, tmp_path):
+    _exercise_plan_skip_finalizes_hash(
+        "scripts.standalone_upload_client", monkeypatch, tmp_path
+    )
 
 
 def test_standalone_upload_client_plan_payload_prefixes_previous_hash(monkeypatch, tmp_path):

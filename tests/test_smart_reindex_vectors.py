@@ -2,6 +2,7 @@ import os
 import sys
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -291,3 +292,41 @@ def test_smart_reindex_unnamed_reuse_requires_dense_vector(tmp_path, monkeypatch
     assert len(captured["points"]) == 1
     out_vec = captured["points"][0].vector
     assert out_vec == embedded_vec
+
+
+def test_smart_reindex_updates_cached_hash_on_no_symbol_changes(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=object))
+
+    from scripts.ingest import pipeline as ingest_pipeline
+
+    code = "def hi():\n    return 1\n"
+    fp = tmp_path / "x.py"
+    fp.write_text(code, encoding="utf-8")
+
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "extract_symbols_with_tree_sitter",
+        lambda _fp: {"function_hi_1": {"name": "hi", "type": "function", "start_line": 1}},
+    )
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "get_cached_symbols",
+        lambda _fp: {"function_hi_1": {"name": "hi", "type": "function", "start_line": 1}},
+    )
+    monkeypatch.setattr(ingest_pipeline, "compare_symbol_changes", lambda *_: ([], []))
+    set_cached_file_hash = MagicMock()
+    monkeypatch.setattr(ingest_pipeline, "set_cached_file_hash", set_cached_file_hash)
+
+    status = ingest_pipeline.process_file_with_smart_reindexing(
+        file_path=Path(fp),
+        text=code,
+        language="python",
+        client=MagicMock(),
+        current_collection="c",
+        per_file_repo="r",
+        model=object(),
+        vector_name="dense",
+    )
+
+    assert status == "skipped"
+    set_cached_file_hash.assert_called_once()

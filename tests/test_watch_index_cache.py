@@ -186,3 +186,29 @@ def test_run_indexing_strategy_reuses_preloaded_file_state(monkeypatch, tmp_path
     assert captured["preloaded_text"] == "print('x')\n"
     assert captured["preloaded_file_hash"] == "abc123"
     assert captured["preloaded_language"] == "python"
+
+
+def test_run_indexing_strategy_skips_ensure_for_cached_hash_match(monkeypatch, tmp_path):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    ensure_mock = MagicMock()
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", ensure_mock)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: "abc123")
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+
+    with pytest.raises(proc_mod._SkipUnchanged):
+        proc_mod._run_indexing_strategy(
+            path,
+            client=MagicMock(),
+            model=MagicMock(),
+            collection="coll",
+            vector_name="vec",
+            model_dim=1,
+            repo_name="repo",
+        )
+
+    ensure_mock.assert_not_called()

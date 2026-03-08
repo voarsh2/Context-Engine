@@ -574,10 +574,6 @@ def _run_indexing_strategy(
 ) -> bool:
     if collection is None:
         return False
-    try:
-        idx.ensure_collection_and_indexes_once(client, collection, model_dim, vector_name)
-    except Exception:
-        pass
 
     text, file_hash = _read_text_and_sha1(path)
     ok = False
@@ -619,6 +615,7 @@ def _run_indexing_strategy(
                         repo_name,
                         model,
                         vector_name,
+                        model_dim=model_dim,
                     )
                     ok = status in ("success", "skipped")
                 except Exception as exc:
@@ -633,6 +630,12 @@ def _run_indexing_strategy(
                 # Fallback: full single-file reindex. Pseudo/tags are inlined by default;
                 # when PSEUDO_DEFER_TO_WORKER=1 we run base-only and rely on backfill.
     if not ok:
+        try:
+            idx.ensure_collection_and_indexes_once(
+                client, collection, model_dim, vector_name
+            )
+        except Exception:
+            pass
         pseudo_mode = "off" if get_boolean_env("PSEUDO_DEFER_TO_WORKER") else "full"
         ok = idx.index_single_file(
             client,

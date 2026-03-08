@@ -950,6 +950,7 @@ def process_file_with_smart_reindexing(
     model,
     vector_name: str | None,
     *,
+    model_dim: int | None = None,
     allowed_vectors: set[str] | None = None,
     allowed_sparse: set[str] | None = None,
 ) -> str:
@@ -1057,8 +1058,24 @@ def process_file_with_smart_reindexing(
     changed_set = set(changed_symbols)
 
     if len(changed_symbols) == 0 and cached_symbols:
+        try:
+            if set_cached_file_hash:
+                set_cached_file_hash(fp, file_hash, per_file_repo)
+        except Exception:
+            pass
         print(f"[SMART_REINDEX] {file_path}: 0 changes detected, skipping")
         return "skipped"
+
+    if model_dim and vector_name:
+        try:
+            ensure_collection_and_indexes_once(
+                client,
+                current_collection,
+                int(model_dim),
+                vector_name,
+            )
+        except Exception:
+            pass
 
     existing_points = []
     try:
