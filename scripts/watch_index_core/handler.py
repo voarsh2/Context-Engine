@@ -81,6 +81,17 @@ class IndexHandler(FileSystemEventHandler):
         except Exception:
             pass
 
+    def _is_internal_metadata_path(self, p: Path) -> bool:
+        try:
+            if any(part == ".codebase" for part in p.parts):
+                return True
+            global_state_dir = _get_global_state_dir()
+            if global_state_dir is not None and p.is_relative_to(global_state_dir):
+                return True
+        except (OSError, ValueError):
+            return False
+        return False
+
     def _maybe_enqueue(self, src_path: str) -> None:
         self._maybe_reload_excluder()
         p = Path(src_path)
@@ -95,15 +106,7 @@ class IndexHandler(FileSystemEventHandler):
         except ValueError:
             return
 
-        try:
-            if callable(_get_global_state_dir):
-                global_state_dir = _get_global_state_dir()
-                if global_state_dir is not None and p.is_relative_to(global_state_dir):
-                    return
-        except (OSError, ValueError):
-            pass
-
-        if any(part == ".codebase" for part in p.parts):
+        if self._is_internal_metadata_path(p):
             return
 
         # Git history manifests are handled by a separate ingestion pipeline and should still
@@ -140,7 +143,7 @@ class IndexHandler(FileSystemEventHandler):
             p = Path(event.src_path).resolve()
         except Exception:
             return
-        if any(part == ".codebase" for part in p.parts):
+        if self._is_internal_metadata_path(p):
             return
         if not idx.is_indexable_file(p):
             return
@@ -161,6 +164,8 @@ class IndexHandler(FileSystemEventHandler):
             src = Path(event.src_path).resolve()
             dest = Path(event.dest_path).resolve()
         except Exception:
+            return
+        if self._is_internal_metadata_path(src) or self._is_internal_metadata_path(dest):
             return
         if not idx.is_indexable_file(dest) and not idx.is_indexable_file(src):
             return

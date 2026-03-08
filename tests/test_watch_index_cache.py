@@ -212,3 +212,129 @@ def test_run_indexing_strategy_skips_ensure_for_cached_hash_match(monkeypatch, t
         )
 
     ensure_mock.assert_not_called()
+
+
+def test_staging_requires_subprocess_only_for_active_dual_root_state(monkeypatch):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+    monkeypatch.setattr(proc_mod, "is_staging_enabled", lambda: True)
+
+    assert proc_mod._staging_requires_subprocess(None) is False
+    assert (
+        proc_mod._staging_requires_subprocess(
+            {
+                "indexing_env": {"FOO": "bar"},
+                "active_repo_slug": "repo",
+                "serving_repo_slug": "repo",
+            }
+        )
+        is False
+    )
+    assert (
+        proc_mod._staging_requires_subprocess(
+            {
+                "indexing_env": {"FOO": "bar"},
+                "active_repo_slug": "repo",
+                "serving_repo_slug": "repo_old",
+            }
+        )
+        is True
+    )
+    assert (
+        proc_mod._staging_requires_subprocess(
+            {
+                "indexing_env": {"FOO": "bar"},
+                "active_repo_slug": "repo",
+                "serving_repo_slug": "repo",
+                "staging": {"collection": "repo_old_collection"},
+            }
+        )
+        is True
+    )
+
+
+def test_process_paths_does_not_force_subprocess_for_non_active_staging(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod, "_detect_repo_for_file", lambda p: tmp_path)
+    monkeypatch.setattr(proc_mod, "_get_collection_for_file", lambda p: "coll")
+    monkeypatch.setattr(proc_mod, "_set_status_indexing", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "persist_indexing_config", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "update_indexing_status", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_extract_repo_name_from_path", lambda *_: "repo")
+    monkeypatch.setattr(proc_mod, "is_staging_enabled", lambda: True)
+    monkeypatch.setattr(
+        proc_mod,
+        "get_workspace_state",
+        lambda *a, **k: {
+            "indexing_env": {"FOO": "bar"},
+            "active_repo_slug": "repo",
+            "serving_repo_slug": "repo",
+        },
+    )
+
+    staging_mock = MagicMock(return_value=False)
+    monkeypatch.setattr(proc_mod, "_maybe_handle_staging_file", staging_mock)
+    monkeypatch.setattr(proc_mod, "_run_indexing_strategy", lambda *a, **k: True)
+
+    proc_mod._process_paths(
+        [path],
+        client=MagicMock(),
+        model=MagicMock(),
+        vector_name="vec",
+        model_dim=1,
+        workspace_path=str(tmp_path),
+    )
+
+    assert staging_mock.call_args is not None
+    assert staging_mock.call_args.kwargs == {}
+    assert staging_mock.call_args.args[5] is None
+
+
+def test_process_paths_uses_subprocess_when_staging_is_actually_active(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod, "_detect_repo_for_file", lambda p: tmp_path)
+    monkeypatch.setattr(proc_mod, "_get_collection_for_file", lambda p: "coll")
+    monkeypatch.setattr(proc_mod, "_set_status_indexing", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "persist_indexing_config", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "update_indexing_status", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_extract_repo_name_from_path", lambda *_: "repo")
+    monkeypatch.setattr(proc_mod, "is_staging_enabled", lambda: True)
+    monkeypatch.setattr(
+        proc_mod,
+        "get_workspace_state",
+        lambda *a, **k: {
+            "indexing_env": {"FOO": "bar"},
+            "active_repo_slug": "repo",
+            "serving_repo_slug": "repo_old",
+        },
+    )
+
+    staging_mock = MagicMock(return_value=False)
+    monkeypatch.setattr(proc_mod, "_maybe_handle_staging_file", staging_mock)
+    monkeypatch.setattr(proc_mod, "_run_indexing_strategy", lambda *a, **k: True)
+
+    proc_mod._process_paths(
+        [path],
+        client=MagicMock(),
+        model=MagicMock(),
+        vector_name="vec",
+        model_dim=1,
+        workspace_path=str(tmp_path),
+    )
+
+    assert staging_mock.call_args is not None
+    assert staging_mock.call_args.kwargs == {}
+    assert staging_mock.call_args.args[5] == {"FOO": "bar"}

@@ -91,6 +91,7 @@ def test_schema_mode_validate_errors_on_missing_vectors(monkeypatch):
 def test_schema_mode_migrate_adds_missing_vectors_and_indexes(monkeypatch):
     monkeypatch.setenv("PATTERN_VECTORS", "1")
     monkeypatch.setattr(ingq, "LEX_SPARSE_MODE", False)
+    ingq.ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard("test-collection")
 
     existing_vectors = {
         "code": object(),
@@ -122,6 +123,7 @@ def test_schema_mode_migrate_adds_missing_vectors_and_indexes(monkeypatch):
 def test_schema_mode_create_creates_collection_only(monkeypatch):
     monkeypatch.setenv("PATTERN_VECTORS", "0")
     monkeypatch.setattr(ingq, "LEX_SPARSE_MODE", False)
+    ingq.ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard("test-collection")
 
     client = FakeClient(collection_exists=False)
 
@@ -138,3 +140,15 @@ def test_schema_mode_create_creates_collection_only(monkeypatch):
     assert any(
         c["field_name"] == "metadata.language" for c in client.payload_index_calls
     )
+
+
+def test_ensure_payload_indexes_memoized_per_process():
+    client = FakeClient(collection_exists=True)
+    ingq.ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard("test-collection")
+
+    ingq.ensure_payload_indexes(client, "test-collection")
+    first_count = len(client.payload_index_calls)
+    ingq.ensure_payload_indexes(client, "test-collection")
+
+    assert first_count == len(ingq.PAYLOAD_INDEX_FIELDS)
+    assert len(client.payload_index_calls) == first_count

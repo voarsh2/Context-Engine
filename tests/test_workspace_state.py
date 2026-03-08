@@ -433,3 +433,30 @@ class TestConstants:
         assert "" in ws_module.PLACEHOLDER_COLLECTION_NAMES
         assert "default-collection" in ws_module.PLACEHOLDER_COLLECTION_NAMES
         assert "my-collection" in ws_module.PLACEHOLDER_COLLECTION_NAMES
+
+
+class TestCompareSymbolChanges:
+    def test_compare_symbol_changes_tolerates_line_shift_for_unchanged_content(self, ws_module):
+        old_symbols = {
+            "function_foo_10": {
+                "name": "foo",
+                "type": "function",
+                "start_line": 10,
+                "end_line": 20,
+                "content_hash": "samehash",
+            }
+        }
+        new_symbols = {
+            "function_foo_12": {
+                "name": "foo",
+                "type": "function",
+                "start_line": 12,
+                "end_line": 22,
+                "content_hash": "samehash",
+            }
+        }
+
+        unchanged, changed = ws_module.compare_symbol_changes(old_symbols, new_symbols)
+
+        assert unchanged == ["function_foo_12"]
+        assert changed == []

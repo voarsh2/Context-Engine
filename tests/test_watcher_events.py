@@ -72,6 +72,25 @@ def test_on_moved_enqueues_new_dest(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_on_moved_ignores_internal_codebase_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("MULTI_REPO_MODE", "0")
+    q = FakeQueue()
+    handler = wi.IndexHandler(root=tmp_path, queue=q, client=FakeClient(), collection="c")
+
+    codebase = tmp_path / ".codebase"
+    codebase.mkdir(parents=True, exist_ok=True)
+    src = codebase / "state.json"
+    dst = codebase / "file_locks" / "abc.lock"
+    src.write_text("{}\n")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("lock\n")
+
+    handler.on_moved(E(src, dest=dst))
+
+    assert q.added == []
+
+
+@pytest.mark.unit
 def test_ignore_reload_rebuilds_excluder(monkeypatch, tmp_path):
     monkeypatch.setenv("MULTI_REPO_MODE", "0")
     # Place .qdrantignore; construct handler (captures mtime)
@@ -105,4 +124,3 @@ def test_remote_git_manifest_is_enqueued_even_if_excluded(monkeypatch, tmp_path)
 
     handler.on_created(E(manifest))
     assert any(p.endswith("/.remote-git/git_history_test.json") for p in q.added)
-

@@ -5,7 +5,7 @@ HTTP Upload Service for Delta Bundles in Context-Engine.
 This FastAPI service receives delta bundles from remote upload clients,
 processes them, and integrates with the existing indexing pipeline.
 """
-# 
+
 import os
 import json
 import tarfile

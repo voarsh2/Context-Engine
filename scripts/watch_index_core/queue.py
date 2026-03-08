@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable, List, Set
 
-from .config import DELAY_SECS, LOGGER
+from .config import DELAY_SECS, LOGGER, RECENT_FINGERPRINT_TTL_SECS
 
 
 class ChangeQueue:
@@ -20,6 +21,7 @@ class ChangeQueue:
         self._process_cb = process_cb
         # Serialize processing to avoid concurrent use of TextEmbedding/QdrantClient
         self._processing_lock = threading.Lock()
+        self._recent_fingerprints: dict[Path, tuple[tuple[int, int], float]] = {}
 
     def add(self, p: Path) -> None:
         with self._lock:
@@ -35,6 +37,53 @@ class ChangeQueue:
             self._timer = threading.Timer(DELAY_SECS, self._flush)
             self._timer.daemon = True
             self._timer.start()
+
+    def _fingerprint_path(self, p: Path) -> tuple[int, int] | None:
+        try:
+            st = p.stat()
+            return (
+                int(getattr(st, "st_size", 0)),
+                int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
+            )
+        except Exception:
+            return None
+
+    def _filter_recent_paths(self, paths: Iterable[Path]) -> list[Path]:
+        ttl = float(RECENT_FINGERPRINT_TTL_SECS)
+        if ttl <= 0:
+            return list(paths)
+
+        now = time.time()
+        keep: list[Path] = []
+        for p in paths:
+            fp = self._fingerprint_path(p)
+            if fp is None:
+                keep.append(p)
+                continue
+            prev = self._recent_fingerprints.get(p)
+            if prev is not None:
+                prev_fp, prev_ts = prev
+                if prev_fp == fp and (now - prev_ts) < ttl:
+                    continue
+            keep.append(p)
+        return keep
+
+    def _mark_recent_paths(self, paths: Iterable[Path]) -> None:
+        ttl = float(RECENT_FINGERPRINT_TTL_SECS)
+        if ttl <= 0:
+            return
+        now = time.time()
+        for p in paths:
+            fp = self._fingerprint_path(p)
+            if fp is None:
+                continue
+            self._recent_fingerprints[p] = (fp, now)
+        # Keep at least a 1s grace for small TTLs while using a proportional
+        # buffer for larger TTLs so stale handled fingerprints age out cleanly.
+        cutoff = now - max(ttl * 2.0, ttl + 1.0)
+        stale = [p for p, (_fp, ts) in self._recent_fingerprints.items() if ts < cutoff]
+        for p in stale:
+            self._recent_fingerprints.pop(p, None)
 
     def _flush(self) -> None:
         # Grab current batch
@@ -57,14 +106,23 @@ class ChangeQueue:
             # Per-file locking in index_single_file handles indexer/watcher coordination
             todo: Iterable[Path] = paths
             while True:
+                filtered_todo = self._filter_recent_paths(todo)
+                if not filtered_todo:
+                    with self._lock:
+                        if not self._pending:
+                            break
+                        todo = list(self._pending)
+                        self._pending.clear()
+                    continue
                 try:
-                    self._process_cb(list(todo))
+                    self._process_cb(list(filtered_todo))
+                    self._mark_recent_paths(filtered_todo)
                 except Exception as exc:
                     # Log processing error via structured logging
                     try:
                         LOGGER.error(
                             "Processing batch failed in ChangeQueue._flush",
-                            extra={"error": str(exc), "batch_size": len(list(todo))},
+                            extra={"error": str(exc), "batch_size": len(filtered_todo)},
                             exc_info=True,
                         )
                     except Exception as inner_exc:  # pragma: no cover - logging fallback

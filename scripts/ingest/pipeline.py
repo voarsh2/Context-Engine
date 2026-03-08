@@ -1188,6 +1188,30 @@ def process_file_with_smart_reindexing(
     pseudo_batch_concurrency = int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1)
     use_batch_pseudo = pseudo_batch_concurrency > 1
 
+    def _apply_symbol_pseudo(
+        symbol_name: str,
+        kind: str,
+        start_line: int,
+        pseudo_text: str,
+        pseudo_tags: list[str],
+    ) -> None:
+        if not symbol_name or not kind:
+            return
+        sid = f"{kind}_{symbol_name}_{start_line}"
+        target = symbol_meta.get(sid)
+        if target is None:
+            for candidate in symbol_meta.values():
+                if str(candidate.get("type") or "") != str(kind):
+                    continue
+                if str(candidate.get("name") or "") != str(symbol_name):
+                    continue
+                target = candidate
+                break
+        if target is None:
+            return
+        target["pseudo"] = pseudo_text
+        target["tags"] = list(pseudo_tags or [])
+
     chunk_data_sr: list[dict] = []
     for ch in chunks:
         info = build_information(
@@ -1276,6 +1300,13 @@ def process_file_with_smart_reindexing(
                             start_line = ch.get("start", 0)
                             sid = f"{k}_{symbol_name}_{start_line}"
                             set_cached_pseudo(fp, sid, pseudo, tags, file_hash)
+                        _apply_symbol_pseudo(
+                            symbol_name,
+                            ch.get("kind", "unknown"),
+                            ch.get("start", 0),
+                            pseudo,
+                            tags,
+                        )
             except Exception as e:
                 print(f"[PSEUDO_BATCH] Smart reindex batch failed, falling back: {e}")
                 use_batch_pseudo = False
@@ -1297,8 +1328,25 @@ def process_file_with_smart_reindexing(
                         sid = f"{k}_{symbol_name}_{start_line}"
                         if set_cached_pseudo:
                             set_cached_pseudo(fp, sid, pseudo, tags, file_hash)
+                        _apply_symbol_pseudo(
+                            symbol_name,
+                            k,
+                            start_line,
+                            pseudo,
+                            tags,
+                        )
+                        cd["_pseudo_applied"] = True
             except Exception:
                 pass
+
+        if (pseudo or tags) and not ch.get("_pseudo_applied"):
+            _apply_symbol_pseudo(
+                ch.get("symbol", ""),
+                ch.get("kind", "unknown"),
+                ch.get("start", 0),
+                pseudo,
+                tags,
+            )
 
         if pseudo:
             payload["pseudo"] = pseudo

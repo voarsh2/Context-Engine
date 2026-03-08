@@ -44,6 +44,24 @@ class _SkipUnchanged(Exception):
     """Sentinel exception to skip unchanged files in the watch loop."""
 
 
+def _staging_requires_subprocess(state: Optional[Dict[str, object]]) -> bool:
+    """Return True only when dual-root staging is actually active for this repo."""
+    if not (is_staging_enabled() and isinstance(state, dict)):
+        return False
+
+    staging = state.get("staging")
+    if isinstance(staging, dict) and staging:
+        return True
+
+    active_slug = str(state.get("active_repo_slug") or "").strip()
+    serving_slug = str(state.get("serving_repo_slug") or "").strip()
+    if serving_slug.endswith("_old"):
+        return True
+    if active_slug and serving_slug and active_slug != serving_slug:
+        return True
+    return False
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         raw = str(os.environ.get(name, str(default))).strip()
@@ -334,7 +352,7 @@ def _maybe_handle_staging_file(
     repo_progress: Dict[str, int],
     started_at: str,
 ) -> bool:
-    if not (is_staging_enabled() and state_env and collection):
+    if not (state_env and collection):
         return False
 
     _text, file_hash = _read_text_and_sha1(path)
@@ -441,7 +459,7 @@ def _process_paths(
         try:
             st = get_workspace_state(repo_key, repo_name) if get_workspace_state else None
             if isinstance(st, dict):
-                if is_staging_enabled():
+                if _staging_requires_subprocess(st):
                     state_env = st.get("indexing_env")
         except Exception:
             state_env = None
@@ -452,7 +470,7 @@ def _process_paths(
                     p,
                     collection,
                     repo_name,
-                    env_snapshot=(state_env if is_staging_enabled() else None),
+                    env_snapshot=state_env,
                 )
             except Exception as exc:
                 safe_print(f"[commit_ingest_error] {p}: {exc}")

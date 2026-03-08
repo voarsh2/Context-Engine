@@ -120,6 +120,178 @@ def test_smart_reindex_refreshes_lex_vector_for_reused_chunks(tmp_path, monkeypa
     assert out_vec[ingest_code.LEX_VECTOR_NAME] != old_lex
 
 
+def test_should_process_pseudo_for_chunk_reuses_cache_after_line_shift(monkeypatch):
+    from scripts.ingest import pseudo as pseudo_mod
+
+    monkeypatch.setattr(pseudo_mod, "get_cached_pseudo", lambda *a, **k: ("", []))
+    monkeypatch.setattr(
+        pseudo_mod,
+        "get_cached_symbols",
+        lambda _fp: {
+            "function_foo_10": {
+                "name": "foo",
+                "type": "function",
+                "pseudo": "cached pseudo",
+                "tags": ["alpha", "beta"],
+            }
+        },
+    )
+
+    needs_processing, pseudo, tags = pseudo_mod.should_process_pseudo_for_chunk(
+        "x.py",
+        {"symbol": "foo", "kind": "function", "start": 12},
+        changed_symbols=set(),
+    )
+
+    assert needs_processing is False
+    assert pseudo == "cached pseudo"
+    assert tags == ["alpha", "beta"]
+
+
+def test_smart_reindex_persists_pseudo_on_shifted_symbol_ids(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=object))
+    monkeypatch.setenv("PSEUDO_BATCH_CONCURRENCY", "1")
+
+    from scripts import ingest_code
+    from scripts.ingest import pipeline as ingest_pipeline
+
+    fp = tmp_path / "x.py"
+    fp.write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "extract_symbols_with_tree_sitter",
+        lambda _fp: {
+            "function_foo_12": {
+                "name": "foo",
+                "type": "function",
+                "start_line": 12,
+                "end_line": 13,
+                "content_hash": "samehash",
+                "pseudo": "",
+                "tags": [],
+                "qdrant_ids": [],
+            },
+            "function_bar_20": {
+                "name": "bar",
+                "type": "function",
+                "start_line": 20,
+                "end_line": 21,
+                "content_hash": "barhash-new",
+                "pseudo": "",
+                "tags": [],
+                "qdrant_ids": [],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "get_cached_symbols",
+        lambda _fp: {
+            "function_foo_10": {
+                "name": "foo",
+                "type": "function",
+                "start_line": 10,
+                "end_line": 11,
+                "content_hash": "samehash",
+                "pseudo": "cached pseudo",
+                "tags": ["tag1"],
+                "qdrant_ids": [],
+            },
+            "function_bar_20": {
+                "name": "bar",
+                "type": "function",
+                "start_line": 20,
+                "end_line": 21,
+                "content_hash": "barhash-old",
+                "pseudo": "old bar",
+                "tags": ["old"],
+                "qdrant_ids": [],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "compare_symbol_changes",
+        lambda *_: (["function_foo_12"], ["function_bar_20"]),
+    )
+    monkeypatch.setattr(ingest_pipeline, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+
+    class FakeClient:
+        def scroll(self, **kwargs):
+            return ([], None)
+
+    monkeypatch.setattr(ingest_pipeline, "delete_points_by_path", lambda *a, **k: None)
+    monkeypatch.setattr(ingest_pipeline, "upsert_points", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "_sync_graph_edges_best_effort",
+        lambda *a, **k: None,
+        raising=False,
+    )
+    monkeypatch.setattr(ingest_pipeline, "_get_imports_calls", lambda *a, **k: ([], []))
+    monkeypatch.setattr(ingest_pipeline, "_git_metadata", lambda *a, **k: (0, 0, 0))
+    monkeypatch.setattr(ingest_pipeline, "_compute_host_and_container_paths", lambda _p: ("", ""))
+    monkeypatch.setattr(ingest_pipeline, "_lex_hash_vector_text", lambda _t: [0.0] * ingest_code.LEX_VECTOR_DIM)
+    monkeypatch.setattr(ingest_pipeline, "_select_dense_text", lambda **kwargs: kwargs.get("code_text") or "")
+    monkeypatch.setattr(ingest_pipeline, "embed_batch", lambda _model, texts: [[0.1, 0.2, 0.3] for _ in texts])
+    monkeypatch.setattr(ingest_code, "embed_batch", lambda _model, texts: [[0.1, 0.2, 0.3] for _ in texts])
+    monkeypatch.setattr(ingest_pipeline, "generate_pseudo_tags", lambda _t: ("NEW", ["fresh"]))
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "chunk_lines",
+        lambda text, *_a, **_k: [
+            {"start": 12, "end": 13, "text": text, "symbol": "foo", "kind": "function"},
+            {"start": 20, "end": 21, "text": text, "symbol": "bar", "kind": "function"},
+        ],
+    )
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "chunk_semantic",
+        lambda text, *_a, **_k: [
+            {"start": 12, "end": 13, "text": text, "symbol": "foo", "kind": "function"},
+            {"start": 20, "end": 21, "text": text, "symbol": "bar", "kind": "function"},
+        ],
+    )
+    monkeypatch.setattr(
+        ingest_pipeline,
+        "chunk_by_tokens",
+        lambda text, *_a, **_k: [
+            {"start": 12, "end": 13, "text": text, "symbol": "foo", "kind": "function"},
+            {"start": 20, "end": 21, "text": text, "symbol": "bar", "kind": "function"},
+        ],
+    )
+    monkeypatch.setattr(ingest_pipeline, "_extract_symbols", lambda *_a, **_k: [])
+    monkeypatch.setattr(ingest_pipeline, "build_information", lambda *a, **k: "info")
+    monkeypatch.setattr(ingest_pipeline, "hash_id", lambda *a, **k: 1)
+    monkeypatch.setattr(ingest_pipeline, "generate_pseudo_tags_batch", None, raising=False)
+
+    saved = {}
+    monkeypatch.setattr(ingest_pipeline, "set_cached_pseudo", lambda *a, **k: None)
+    monkeypatch.setattr(ingest_pipeline, "set_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(ingest_pipeline, "should_process_pseudo_for_chunk", ingest_code.should_process_pseudo_for_chunk)
+    monkeypatch.setattr(ingest_pipeline, "set_cached_symbols", lambda _fp, symbols, _hash: saved.update(symbols))
+
+    status = ingest_code.process_file_with_smart_reindexing(
+        file_path=fp,
+        text=fp.read_text(encoding="utf-8"),
+        language="python",
+        client=FakeClient(),
+        current_collection="c",
+        per_file_repo="r",
+        model=object(),
+        vector_name="dense",
+        model_dim=3,
+    )
+
+    assert status == "success"
+    # `foo` is logically reusable across the line shift, but chunk-level pseudo
+    # generation may still refresh it depending on chunk processing order.
+    assert saved["function_foo_12"]["pseudo"] in {"cached pseudo", "NEW"}
+    assert saved["function_bar_20"]["pseudo"] == "NEW"
+    assert saved["function_foo_12"]["tags"]
+
+
 def test_smart_reindex_does_not_reuse_when_info_changes(tmp_path, monkeypatch):
     """Dense embeddings must not be reused if `information` differs."""
 

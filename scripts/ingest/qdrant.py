@@ -31,6 +31,7 @@ from scripts.ingest.config import (
 # ---------------------------------------------------------------------------
 ENSURED_COLLECTIONS: set[str] = set()
 ENSURED_COLLECTIONS_LAST_CHECK: dict[str, float] = {}
+ENSURED_PAYLOAD_INDEX_COLLECTIONS: set[str] = set()
 
 
 class CollectionNeedsRecreateError(Exception):
@@ -535,6 +536,9 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
     if not name:
         print("[BUG] recreate_collection called with name=None! Fix the caller - collection name is required.", flush=True)
         return
+    ENSURED_COLLECTIONS.discard(name)
+    ENSURED_COLLECTIONS_LAST_CHECK.pop(name, None)
+    ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard(name)
     try:
         client.delete_collection(name)
     except Exception:
@@ -580,6 +584,10 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
 
 def ensure_payload_indexes(client: QdrantClient, collection: str):
     """Create helpful payload indexes if they don't exist (idempotent)."""
+    if not collection:
+        return
+    if collection in ENSURED_PAYLOAD_INDEX_COLLECTIONS:
+        return
     for field in PAYLOAD_INDEX_FIELDS:
         try:
             client.create_payload_index(
@@ -589,6 +597,7 @@ def ensure_payload_indexes(client: QdrantClient, collection: str):
             )
         except Exception:
             pass
+    ENSURED_PAYLOAD_INDEX_COLLECTIONS.add(collection)
 
 
 def ensure_collection_and_indexes_once(

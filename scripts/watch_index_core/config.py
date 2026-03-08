@@ -33,6 +33,12 @@ ROOT = Path(os.environ.get("WATCH_ROOT", "/work")).resolve()
 # Debounce interval for file system events
 DELAY_SECS = float(os.environ.get("WATCH_DEBOUNCE_SECS", "1.0"))
 
+# Suppress repeated processing of the exact same observed file state for a short
+# window. This is especially useful on shared/polled filesystems like CephFS.
+RECENT_FINGERPRINT_TTL_SECS = float(
+    os.environ.get("WATCH_RECENT_FINGERPRINT_TTL_SECS", "0")
+)
+
 
 def default_collection_name() -> str:
     """Base fallback for collection name before runtime resolution."""
