@@ -138,6 +138,10 @@ function createBridgeManager(deps) {
     return serverMode === 'bridge' && transportMode === 'http';
   }
 
+  function requiresLocalBridgeProcess(serverMode, transportMode) {
+    return serverMode === 'bridge' && (transportMode === 'http' || transportMode === 'sse-remote');
+  }
+
   function resolveBridgeHttpUrl() {
     try {
       const settings = getEffectiveConfig();
@@ -300,10 +304,10 @@ function createBridgeManager(deps) {
       const serverModeRaw = config.get('mcpServerMode') || 'bridge';
       const transportMode = (typeof transportModeRaw === 'string' ? transportModeRaw.trim() : 'sse-remote') || 'sse-remote';
       const serverMode = (typeof serverModeRaw === 'string' ? serverModeRaw.trim() : 'bridge') || 'bridge';
-      if (requiresHttpBridge(serverMode, transportMode)) {
+      if (requiresLocalBridgeProcess(serverMode, transportMode)) {
         await start();
       } else {
-        log('Context Engine Uploader: HTTP bridge settings changed, but current MCP wiring does not use the HTTP bridge; not restarting HTTP bridge.');
+        log('Context Engine Uploader: bridge settings changed, but current MCP wiring does not use the local bridge process; not restarting bridge.');
       }
     }
   }
@@ -321,6 +325,7 @@ function createBridgeManager(deps) {
     getState,
     isRunning,
     requiresHttpBridge,
+    requiresLocalBridgeProcess,
     resolveBridgeHttpUrl,
     ensureReadyForConfigs,
     start,

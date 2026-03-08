@@ -275,6 +275,7 @@ function activate(context) {
       resolveBridgeCliInvocation: () => bridgeManager ? bridgeManager.resolveBridgeCliInvocation() : undefined,
       resolveBridgeHttpUrl: () => bridgeManager ? bridgeManager.resolveBridgeHttpUrl() : undefined,
       requiresHttpBridge: (s, t) => bridgeManager ? bridgeManager.requiresHttpBridge(s, t) : (s === 'bridge' && t === 'http'),
+      requiresLocalBridgeProcess: (s, t) => bridgeManager ? bridgeManager.requiresLocalBridgeProcess(s, t) : (s === 'bridge' && (t === 'http' || t === 'sse-remote')),
       ensureHttpBridgeReadyForConfigs: () => bridgeManager ? bridgeManager.ensureReadyForConfigs() : Promise.resolve(false),
       getBridgeIsRunning: () => (bridgeManager && typeof bridgeManager.isRunning === 'function' ? bridgeManager.isRunning() : false),
       writeCtxConfig: () => ctxConfigManager ? ctxConfigManager.writeCtxConfig() : Promise.resolve(),
@@ -487,10 +488,10 @@ function activate(context) {
     const serverModeRaw = config.get('mcpServerMode') || 'bridge';
     const transportMode = (typeof transportModeRaw === 'string' ? transportModeRaw.trim() : 'sse-remote') || 'sse-remote';
     const serverMode = (typeof serverModeRaw === 'string' ? serverModeRaw.trim() : 'bridge') || 'bridge';
-    if (bridgeManager && bridgeManager.requiresHttpBridge(serverMode, transportMode)) {
+    if (bridgeManager && bridgeManager.requiresLocalBridgeProcess(serverMode, transportMode)) {
       startHttpBridgeProcess().catch(error => log(`Auto-start HTTP MCP bridge failed: ${error instanceof Error ? error.message : String(error)}`));
     } else {
-      log('Context Engine Uploader: autoStartMcpBridge is enabled, but current MCP wiring does not use the HTTP bridge; skipping auto-start.');
+      log('Context Engine Uploader: autoStartMcpBridge is enabled, but current MCP wiring does not use the local bridge process; skipping auto-start.');
     }
   }
 }

@@ -282,7 +282,7 @@
         "contextEngineUploader.autoStartMcpBridge": {
           "type": "boolean",
           "default": true,
-          "description": "When enabled and mcpServerMode='bridge' with mcpTransportMode='http', automatically start the local ctx-mcp-bridge HTTP server for the active workspace so IDE clients can connect over HTTP without manual commands. Has no effect in stdio/direct modes."
+          "description": "When enabled and mcpServerMode='bridge', automatically start the bundled local ctx bridge process for the active workspace. In http mode it serves the local HTTP MCP bridge directly; in sse-remote mode it starts the same bundled bridge adapter used by bridge-stdio wiring. Has no effect in direct modes."
         },
         "contextEngineUploader.mcpBridgePort": {
           "type": "number",
