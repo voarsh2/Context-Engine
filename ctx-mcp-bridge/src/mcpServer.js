@@ -107,10 +107,11 @@ async function listMemoryTools(client) {
     return [];
   }
   try {
-    const timeoutMs = getBridgeListTimeoutMs();
-    const remote = await withTimeout(
-      client.listTools(),
-      timeoutMs,
+    const remote = await withTransientRetry(
+      () => {
+        const timeoutMs = getBridgeListTimeoutMs();
+        return withTimeout(client.listTools(), timeoutMs, "memory tools/list");
+      },
       "memory tools/list",
     );
     return Array.isArray(remote?.tools) ? remote.tools.slice() : [];
@@ -151,11 +152,16 @@ async function listResourcesSafe(client, label, cursor) {
     return { resources: [], nextCursor: null };
   }
   try {
-    const timeoutMs = getBridgeListTimeoutMs();
     const params = cursor ? { cursor } : {};
-    const remote = await withTimeout(
-      client.listResources(params),
-      timeoutMs,
+    const remote = await withTransientRetry(
+      () => {
+        const timeoutMs = getBridgeListTimeoutMs();
+        return withTimeout(
+          client.listResources(params),
+          timeoutMs,
+          `${label} resources/list`,
+        );
+      },
       `${label} resources/list`,
     );
     return {
@@ -176,11 +182,16 @@ async function listResourceTemplatesSafe(client, label, cursor) {
     return { resourceTemplates: [], nextCursor: null };
   }
   try {
-    const timeoutMs = getBridgeListTimeoutMs();
     const params = cursor ? { cursor } : {};
-    const remote = await withTimeout(
-      client.listResourceTemplates(params),
-      timeoutMs,
+    const remote = await withTransientRetry(
+      () => {
+        const timeoutMs = getBridgeListTimeoutMs();
+        return withTimeout(
+          client.listResourceTemplates(params),
+          timeoutMs,
+          `${label} resources/templates/list`,
+        );
+      },
       `${label} resources/templates/list`,
     );
     return {
@@ -411,6 +422,34 @@ function isTransientToolError(error) {
   } catch {
     return false;
   }
+}
+
+async function withTransientRetry(operation, label, maxAttempts, retryDelayMs) {
+  const attempts = Number.isFinite(maxAttempts) && maxAttempts > 0
+    ? Math.floor(maxAttempts)
+    : getBridgeRetryAttempts();
+  const delayMs = Number.isFinite(retryDelayMs) && retryDelayMs >= 0
+    ? Math.floor(retryDelayMs)
+    : getBridgeRetryDelayMs();
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0 && delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (!isTransientToolError(err) || attempt === attempts - 1) {
+        throw err;
+      }
+      debugLog(
+        `[ctxce] ${label}: transient error (attempt ${attempt + 1}/${attempts}), retrying: ` +
+        String(err),
+      );
+    }
+  }
+  throw lastError || new Error(`[ctxce] ${label}: unknown transient retry failure`);
 }
 // MCP stdio server implemented using the official MCP TypeScript SDK.
 // Acts as a low-level proxy for tools, forwarding tools/list and tools/call
@@ -843,15 +882,22 @@ async function createBridgeServer(options) {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     let remote;
     try {
-      debugLog("[ctxce] tools/list: fetching tools from indexer");
-      await refreshSessionAndSyncDefaults();
+      await initializeRemoteClients(false);
+      await ensureRemoteDefaults(false);
       if (!indexerClient) {
         throw new Error("Indexer MCP client not initialized");
       }
-      const timeoutMs = getBridgeListTimeoutMs();
-      remote = await withTimeout(
-        indexerClient.listTools(),
-        timeoutMs,
+
+      debugLog("[ctxce] tools/list: fetching tools from indexer");
+      remote = await withTransientRetry(
+        () => {
+          const timeoutMs = getBridgeListTimeoutMs();
+          return withTimeout(
+            indexerClient.listTools(),
+            timeoutMs,
+            "indexer tools/list",
+          );
+        },
         "indexer tools/list",
       );
     } catch (err) {
@@ -881,7 +927,8 @@ async function createBridgeServer(options) {
   server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
     // Proxy resource discovery/read-through so clients that use MCP resources
     // (not only tools) can access upstream indexer/memory resources directly.
-    await refreshSessionAndSyncDefaults();
+    await initializeRemoteClients(false);
+    await ensureRemoteDefaults(false);
     const cursor =
       request && request.params && typeof request.params.cursor === "string"
         ? request.params.cursor
@@ -911,7 +958,8 @@ async function createBridgeServer(options) {
   });
 
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async (request) => {
-    await refreshSessionAndSyncDefaults();
+    await initializeRemoteClients(false);
+    await ensureRemoteDefaults(false);
     const cursor =
       request && request.params && typeof request.params.cursor === "string"
         ? request.params.cursor
