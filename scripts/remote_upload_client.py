@@ -1432,6 +1432,11 @@ class RemoteUploadClient:
             if needs_content:
                 # Skip operations that need content - they'll be uploaded separately
                 continue
+            # IMPORTANT: server-side apply_delta_operations() only accepts "deleted" and "moved"
+            # operations. Hash-matched "created" and "updated" operations must NOT be routed
+            # through apply_ops since the server will reject them.
+            if op_type not in {"deleted", "moved"}:
+                continue
             # Preserve all other operations so server advances state
             filtered_ops.append(operation)
             # Include hash for non-deleted operations

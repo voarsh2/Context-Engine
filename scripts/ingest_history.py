@@ -532,10 +532,26 @@ def _ingest_from_manifest(
                 e,
             )
     _log_progress(force=True)
-    try:
-        _prune_old_commit_points(client, run_id, mode=mode)
-    except Exception as e:
-        logger.warning("[ingest_history] prune failed for run_id=%s: %s", run_id, e)
+    # Only prune snapshot runs that completed cleanly
+    prune_safe = (
+        mode == "snapshot"
+        and prepared_count > 0
+        and invalid_commit_records == 0
+        and embed_failures == 0
+        and point_build_failures == 0
+        and upsert_failures == 0
+        and persisted_count == prepared_count
+    )
+    if prune_safe:
+        try:
+            _prune_old_commit_points(client, run_id, mode=mode)
+        except Exception as e:
+            logger.warning("[ingest_history] prune failed for run_id=%s: %s", run_id, e)
+    elif mode == "snapshot":
+        logger.warning(
+            "[ingest_history] skipping prune for run_id=%s because the snapshot ingest was incomplete",
+            run_id,
+        )
     try:
         _cleanup_manifest_files(manifest_path)
     except Exception as e:

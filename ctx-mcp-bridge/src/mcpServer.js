@@ -36,10 +36,15 @@ async function sendSessionDefaults(client, payload, label) {
     return false;
   }
   try {
-    await client.callTool({
-      name: "set_session_defaults",
-      arguments: payload,
-    });
+    const timeoutMs = getBridgeToolTimeoutMs();
+    await withTimeout(
+      client.callTool({
+        name: "set_session_defaults",
+        arguments: payload,
+      }),
+      timeoutMs,
+      `sendSessionDefaults(${label})`
+    );
     return true;
   } catch (err) {
     // eslint-disable-next-line no-console

@@ -646,6 +646,10 @@ def ensure_collection_and_indexes_once(
                 ENSURED_COLLECTIONS_LAST_CHECK.pop(collection, None)
             except Exception:
                 pass
+            try:
+                ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard(collection)
+            except Exception:
+                pass
     ensure_collection(client, collection, dim, vector_name, schema_mode=mode)
     if mode in {"legacy", "migrate"}:
         ensure_payload_indexes(client, collection)

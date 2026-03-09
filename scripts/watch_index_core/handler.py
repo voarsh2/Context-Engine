@@ -174,9 +174,10 @@ class IndexHandler(FileSystemEventHandler):
                         deleted = True
                     if deleted:
                         safe_print(f"[moved:external_to_internal] deleted {src}")
+                except Exception as exc:
+                    safe_print(f"[moved:external_to_internal:error] {src}: {exc}")
+                finally:
                     self._invalidate_cache(src)
-                except Exception:
-                    pass
             return
         if src_internal:
             # Internal -> external: index destination as new file
@@ -201,9 +202,10 @@ class IndexHandler(FileSystemEventHandler):
                             deleted = True
                         if deleted:
                             safe_print(f"[moved:ignored_dest_deleted_src] {src} -> {dest}")
+                    except Exception as exc:
+                        safe_print(f"[moved:ignored_dest_deleted_src:error] {src}: {exc}")
+                    finally:
                         self._invalidate_cache(src)
-                    except Exception:
-                        pass
                 return
         except Exception:
             pass

@@ -712,16 +712,22 @@ def _index_single_file_inner(
             for i, v, lx, m, lt, ct in zip(batch_ids, vectors, batch_lex, batch_meta, batch_lex_text, batch_code)
         ]
         upsert_points(client, collection, points)
-        # Optional: materialize file-level graph edges in a companion `<collection>_graph` store.
-        # This is an accelerator for symbol_graph callers/importers and is safe to skip on failure.
-        _sync_graph_edges_best_effort(
-            client,
-            collection,
-            str(file_path),
-            repo_tag,
-            calls,
-            imports,
-        )
+
+    # Optional: materialize file-level graph edges in a companion `<collection>_graph` store.
+    # This is an accelerator for symbol_graph callers/importers and is safe to skip on failure.
+    # IMPORTANT: Sync must run after upserts (or after delete-only reindex) to ensure graph
+    # edges stay consistent. When a file reindexes to zero chunks, batch_texts is empty but
+    # we still need to sync graph edges to remove stale entries.
+    _sync_graph_edges_best_effort(
+        client,
+        collection,
+        str(file_path),
+        repo_tag,
+        calls,
+        imports,
+    )
+
+    if batch_texts:
         try:
             ws = os.environ.get("WATCH_ROOT") or os.environ.get("WORKSPACE_PATH") or "/work"
             if set_cached_file_hash:
@@ -1507,15 +1513,19 @@ def process_file_with_smart_reindexing(
 
     if all_points:
         _upsert_points_fn(client, current_collection, all_points)
-        # Optional: materialize file-level graph edges (best-effort).
-        _sync_graph_edges_best_effort(
-            client,
-            current_collection,
-            str(file_path),
-            per_file_repo,
-            calls,
-            imports,
-        )
+
+    # Optional: materialize file-level graph edges (best-effort).
+    # IMPORTANT: Sync must run after upserts OR after delete-only reindex to ensure graph
+    # edges stay consistent. When a file reindexes to zero chunks, all_points is empty but
+    # we still need to sync graph edges to remove stale entries.
+    _sync_graph_edges_best_effort(
+        client,
+        current_collection,
+        str(file_path),
+        per_file_repo,
+        calls,
+        imports,
+    )
 
     try:
         if set_cached_symbols:

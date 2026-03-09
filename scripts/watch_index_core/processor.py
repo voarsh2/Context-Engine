@@ -142,8 +142,7 @@ def _run_git_history_ingest(
 ) -> None:
     script = watch_config.ROOT_DIR / "scripts" / "ingest_history.py"
     if not script.exists():
-        logger.warning("[git_history_manifest] ingest script missing: %s", script)
-        return
+        raise RuntimeError(f"[git_history_manifest] ingest script missing: {script}")
 
     cmd = [sys.executable or "python3", str(script), "--manifest-json", str(p)]
     env = _build_subprocess_env(collection, repo_name, env_snapshot)
@@ -218,19 +217,14 @@ def _run_git_history_ingest(
 
         if timed_out:
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            logger.warning(
-                "[git_history_manifest] ingest_history.py timeout for %s after %dms (timeout=%ss)",
-                p,
-                elapsed_ms,
-                _GIT_HISTORY_TIMEOUT_SECONDS,
+            error_msg = (
+                f"[git_history_manifest] ingest_history.py timeout for {p} after {elapsed_ms}ms "
+                f"(timeout={_GIT_HISTORY_TIMEOUT_SECONDS}s)"
             )
             if stderr_tail:
-                logger.warning(
-                    "[git_history_manifest] timeout stderr tail for %s: %s",
-                    p,
-                    _tail_snapshot(stderr_tail),
-                )
-            return
+                error_msg += f" stderr={_tail_snapshot(stderr_tail)}"
+            logger.warning(error_msg)
+            raise RuntimeError(error_msg)
 
         returncode = proc.wait(timeout=1.0)
     except Exception as e:
@@ -240,18 +234,16 @@ def _run_git_history_ingest(
                 proc.kill()
         except Exception:
             pass
-        return
+        raise RuntimeError(f"[git_history_manifest] subprocess error for {p}: {e}") from e
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     if returncode != 0:
-        logger.warning(
-            "[git_history_manifest] ingest_history.py failed for %s: exit=%d elapsed_ms=%d stderr=%s",
-            p,
-            returncode,
-            elapsed_ms,
-            _tail_snapshot(stderr_tail),
+        error_msg = (
+            f"[git_history_manifest] ingest_history.py failed for {p}: exit={returncode} "
+            f"elapsed_ms={elapsed_ms} stderr={_tail_snapshot(stderr_tail)}"
         )
-        return
+        logger.warning(error_msg)
+        raise RuntimeError(error_msg)
 
     logger.info(
         "[git_history_manifest] completed for %s: exit=0 elapsed_ms=%d",
@@ -839,8 +831,11 @@ def _process_paths(
                             caller_path=str(p),
                             repo=repo_name,
                         )
-                    except Exception:
-                        pass
+                    except Exception as graph_exc:
+                        safe_print(f"[deleted:graph_failed] {p} -> {collection}: {graph_exc}")
+                        # Don't mark as deleted_ok if graph cleanup fails
+                        deleted_ok = False
+                        raise
                     safe_print(f"[deleted] {p} -> {collection}")
                     deleted_ok = True
                 except Exception:

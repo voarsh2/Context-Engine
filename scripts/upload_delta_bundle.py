@@ -553,7 +553,9 @@ def apply_delta_operations(
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     if target_path.exists():
                         if target_path.is_dir():
-                            shutil.rmtree(target_path)
+                            raise IsADirectoryError(
+                                f"[upload_delta_bundle] move target is a directory: {target_path}"
+                            )
                         else:
                             target_path.unlink()
                     shutil.move(str(safe_source_path), str(target_path))
@@ -602,10 +604,9 @@ def apply_delta_operations(
                 slug=slug,
                 entries=journal_entries_by_slug.get(slug, []),
             )
-            # Flush updated replica hashes to disk
+            # Flush updated replica hashes to disk (including empty caches)
             replica_hashes = replica_cache_hashes.get(slug, {})
-            if replica_hashes:
-                _flush_replica_cache_hashes(root, slug, replica_hashes)
+            _flush_replica_cache_hashes(root, slug, replica_hashes)
 
         return operations_count
     except Exception as e:
@@ -800,7 +801,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                             target_path.parent.mkdir(parents=True, exist_ok=True)
                             if target_path.exists():
                                 if target_path.is_dir():
-                                    shutil.rmtree(target_path)
+                                    raise IsADirectoryError(
+                                        f"[upload_service] move target is a directory: {target_path}"
+                                    )
                                 else:
                                     target_path.unlink()
                             shutil.move(str(safe_source_path), str(target_path))
@@ -901,10 +904,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                 slug=slug,
                 entries=journal_entries_by_slug.get(slug, []),
             )
-            # Flush updated replica hashes to disk
+            # Flush updated replica hashes to disk (including empty caches)
             replica_hashes = replica_cache_hashes.get(slug, {})
-            if replica_hashes:
-                _flush_replica_cache_hashes(root, slug, replica_hashes)
+            _flush_replica_cache_hashes(root, slug, replica_hashes)
 
         return operations_count
 
