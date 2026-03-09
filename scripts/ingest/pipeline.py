@@ -275,6 +275,40 @@ def _sync_graph_edges_best_effort(
             pass
 
 
+def _symbols_to_metadata_dict(language: str, text: str) -> dict:
+    """Build symbol metadata dict from in-memory source text."""
+    symbols = {}
+    try:
+        symbols_list = _extract_symbols(language, text)
+        lines = text.split("\n")
+        for sym in symbols_list or []:
+            kind = str(sym.get("kind") or "")
+            name = str(sym.get("name") or "")
+            start = int(sym.get("start") or 0)
+            end = int(sym.get("end") or 0)
+            if not kind or not name or start <= 0 or end < start:
+                continue
+            symbol_id = f"{kind}_{name}_{start}"
+            content = "\n".join(lines[start - 1 : end])
+            content_hash = hashlib.sha1(
+                content.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            symbols[symbol_id] = {
+                "name": name,
+                "type": kind,
+                "start_line": start,
+                "end_line": end,
+                "content_hash": content_hash,
+                "content": content,
+                "pseudo": "",
+                "tags": [],
+                "qdrant_ids": [],
+            }
+    except Exception:
+        return {}
+    return symbols
+
+
 def build_information(
     language: str, path: Path, start: int, end: int, first_line: str
 ) -> str:
@@ -304,6 +338,7 @@ def index_single_file(
     preloaded_language: str | None = None,
 ) -> bool:
     """Index a single file path. Returns True if indexed, False if skipped."""
+    repo_for_graph = repo_name_for_cache or _detect_repo_name_from_path(file_path)
     try:
         if _should_skip_explicit_file_by_excluder(file_path):
             try:
@@ -315,12 +350,14 @@ def index_single_file(
                 client,
                 collection,
                 str(file_path),
-                repo_tag,
+                repo_for_graph,
                 None,  # No calls when file is excluded
                 None,  # No imports when file is excluded
             )
             print(f"Skipping excluded file: {file_path}")
             return False
+    except NameError:
+        raise
     except Exception:
         return False
 
@@ -383,7 +420,12 @@ def _index_single_file_inner(
             trust_cache = False
 
     fast_fs = _env_truthy(os.environ.get("INDEX_FS_FASTPATH"), False)
-    if skip_unchanged and fast_fs and get_cached_file_meta is not None:
+    if (
+        preloaded_text is None
+        and skip_unchanged
+        and fast_fs
+        and get_cached_file_meta is not None
+    ):
         try:
             repo_for_cache = repo_name_for_cache or _detect_repo_name_from_path(file_path)
             meta = get_cached_file_meta(str(file_path), repo_for_cache) or {}
@@ -444,7 +486,10 @@ def _index_single_file_inner(
     if get_cached_symbols and set_cached_symbols:
         cached_symbols = get_cached_symbols(str(file_path))
         if cached_symbols:
-            current_symbols = extract_symbols_with_tree_sitter(str(file_path))
+            if preloaded_text is not None:
+                current_symbols = _symbols_to_metadata_dict(language, preloaded_text)
+            else:
+                current_symbols = extract_symbols_with_tree_sitter(str(file_path))
             _, changed = compare_symbol_changes(cached_symbols, current_symbols)
             for symbol_data in current_symbols.values():
                 symbol_id = f"{symbol_data['type']}_{symbol_data['name']}_{symbol_data['start_line']}"
@@ -1000,12 +1045,14 @@ def process_file_with_smart_reindexing(
                 client,
                 current_collection,
                 str(p),
-                repo_name_for_cache or _detect_repo_name_from_path(file_path),
+                per_file_repo or _detect_repo_name_from_path(file_path),
                 None,  # No calls when file is excluded
                 None,  # No imports when file is excluded
             )
             print(f"[SMART_REINDEX] Skipping excluded file: {file_path}")
             return "skipped"
+    except NameError:
+        raise
     except Exception:
         return "skipped"
 
@@ -1089,13 +1136,20 @@ def process_file_with_smart_reindexing(
     changed_set = set(changed_symbols)
 
     if len(changed_symbols) == 0 and cached_symbols:
+        prev_hash = None
         try:
-            if set_cached_file_hash:
-                set_cached_file_hash(fp, file_hash, per_file_repo)
+            if get_cached_file_hash:
+                prev_hash = get_cached_file_hash(fp, per_file_repo)
         except Exception:
-            pass
-        print(f"[SMART_REINDEX] {file_path}: 0 changes detected, skipping")
-        return "skipped"
+            prev_hash = None
+        if prev_hash and file_hash and prev_hash == file_hash:
+            print(f"[SMART_REINDEX] {file_path}: 0 changes detected, skipping")
+            return "skipped"
+        print(
+            f"[SMART_REINDEX] {file_path}: non-symbol change detected; "
+            "falling back to full reindex"
+        )
+        return "failed"
 
     if model_dim and vector_name:
         try:

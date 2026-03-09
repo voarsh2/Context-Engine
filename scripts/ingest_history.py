@@ -369,18 +369,18 @@ def _ingest_from_manifest(
     vec_name: str,
     include_body: bool,
     per_batch: int,
-) -> int:
+) -> tuple[int, bool]:
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         print(f"Failed to read manifest {manifest_path}: {e}")
-        return 0
+        return 0, False
 
     commits = data.get("commits") or []
     if not commits:
         print("No commits in manifest.")
-        return 0
+        return 0, False
 
     run_id = _manifest_run_id(manifest_path)
     mode = str(data.get("mode") or "delta").strip().lower() or "delta"
@@ -501,7 +501,7 @@ def _ingest_from_manifest(
                     persisted_count += batch_size
                 except Exception as e:
                     upsert_failures += batch_size
-                    logger.error(
+                    logger.exception(
                         "[ingest_history] upsert batch failed (size=%d): %s",
                         batch_size,
                         e,
@@ -526,22 +526,22 @@ def _ingest_from_manifest(
             persisted_count += batch_size
         except Exception as e:
             upsert_failures += batch_size
-            logger.error(
+            logger.exception(
                 "[ingest_history] final upsert failed (size=%d): %s",
                 batch_size,
                 e,
             )
     _log_progress(force=True)
-    # Only prune snapshot runs that completed cleanly
-    prune_safe = (
-        mode == "snapshot"
-        and prepared_count > 0
+    ingest_successful = (
+        prepared_count > 0
         and invalid_commit_records == 0
         and embed_failures == 0
         and point_build_failures == 0
         and upsert_failures == 0
         and persisted_count == prepared_count
     )
+    # Only prune snapshot runs that completed cleanly
+    prune_safe = mode == "snapshot" and ingest_successful
     if prune_safe:
         try:
             _prune_old_commit_points(client, run_id, mode=mode)
@@ -554,14 +554,7 @@ def _ingest_from_manifest(
         )
 
     # Only cleanup manifest if ingest completed successfully
-    ingest_complete = (
-        prepared_count > 0
-        and invalid_commit_records == 0
-        and embed_failures == 0
-        and point_build_failures == 0
-        and upsert_failures == 0
-        and persisted_count == prepared_count
-    )
+    ingest_complete = ingest_successful
     if ingest_complete:
         try:
             _cleanup_manifest_files(manifest_path)
@@ -710,7 +703,7 @@ def main():
                 persisted_count += batch_size
             except Exception as e:
                 upsert_failures += batch_size
-                logger.error(
+                logger.exception(
                     "[ingest_history] batch upsert failed collection=%s repo=%s size=%d path=%s: %s",
                     COLLECTION,
                     REPO_NAME,
@@ -727,7 +720,7 @@ def main():
             persisted_count += final_size
         except Exception as e:
             upsert_failures += final_size
-            logger.error(
+            logger.exception(
                 "[ingest_history] final upsert failed collection=%s repo=%s size=%d path=%s: %s",
                 COLLECTION,
                 REPO_NAME,

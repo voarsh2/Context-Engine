@@ -175,7 +175,7 @@ class IndexHandler(FileSystemEventHandler):
                         try:
                             idx.delete_graph_edges_by_path(
                                 self.client,
-                                f"{coll}_graph",
+                                coll,
                                 caller_path=str(src),
                             )
                         except Exception:
@@ -212,7 +212,7 @@ class IndexHandler(FileSystemEventHandler):
                             try:
                                 idx.delete_graph_edges_by_path(
                                     self.client,
-                                    f"{coll}_graph",
+                                    coll,
                                     caller_path=str(src),
                                 )
                             except Exception:
@@ -308,6 +308,14 @@ class IndexHandler(FileSystemEventHandler):
             return
         try:
             idx.delete_points_by_path(self.client, collection, str(path))
+            try:
+                idx.delete_graph_edges_by_path(
+                    self.client,
+                    collection,
+                    caller_path=str(path),
+                )
+            except Exception:
+                pass
             safe_print(f"[deleted] {path} -> {collection}")
         except Exception:
             pass

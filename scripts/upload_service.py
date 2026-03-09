@@ -539,6 +539,14 @@ async def _process_bundle_background(
             process_delta_bundle, workspace_path, bundle_path, manifest
         )
         processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        failed_count = int((operations_count or {}).get("failed") or 0)
+        applied_count = int(
+            (operations_count or {}).get("created", 0)
+            + (operations_count or {}).get("updated", 0)
+            + (operations_count or {}).get("deleted", 0)
+            + (operations_count or {}).get("moved", 0)
+        )
+        status_value = "completed" if failed_count == 0 else "failed"
         if sequence_number is not None:
             _sequence_tracker[key] = sequence_number
         _upload_result_tracker[key] = {
@@ -547,7 +555,9 @@ async def _process_bundle_background(
             "sequence_number": sequence_number,
             "processed_operations": operations_count,
             "processing_time_ms": processing_time,
-            "status": "completed",
+            "status": status_value,
+            "failed_count": failed_count,
+            "partial": bool(failed_count > 0 and applied_count > 0),
             "completed_at": datetime.now().isoformat(),
         }
         if log_activity:
@@ -565,10 +575,21 @@ async def _process_bundle_background(
                 )
             except Exception as activity_err:
                 logger.debug(f"[upload_service] Failed to log activity for bundle {bundle_id}: {activity_err}")
-        logger.info(
-            f"[upload_service] Finished processing bundle {bundle_id} seq {sequence_number} "
-            f"in {processing_time}ms ops={operations_count}"
-        )
+        if failed_count > 0:
+            logger.warning(
+                "[upload_service] Finished processing bundle %s seq %s with failures in %sms "
+                "failed=%d ops=%s",
+                bundle_id,
+                sequence_number,
+                processing_time,
+                failed_count,
+                operations_count,
+            )
+        else:
+            logger.info(
+                f"[upload_service] Finished processing bundle {bundle_id} seq {sequence_number} "
+                f"in {processing_time}ms ops={operations_count}"
+            )
     except Exception as e:
         _upload_result_tracker[key] = {
             "workspace_path": workspace_path,
@@ -1790,6 +1811,14 @@ async def apply_delta_ops(request: ApplyOperationsRequest):
             request.file_hashes,
         )
         processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        failed_count = int((operations_count or {}).get("failed") or 0)
+        applied_count = int(
+            (operations_count or {}).get("created", 0)
+            + (operations_count or {}).get("updated", 0)
+            + (operations_count or {}).get("deleted", 0)
+            + (operations_count or {}).get("moved", 0)
+        )
+        status_value = "completed" if failed_count == 0 else "failed"
         _sequence_tracker[key] = sequence_number
         _upload_result_tracker[key] = {
             "workspace_path": workspace_path,
@@ -1797,9 +1826,33 @@ async def apply_delta_ops(request: ApplyOperationsRequest):
             "sequence_number": sequence_number,
             "processed_operations": operations_count,
             "processing_time_ms": processing_time,
-            "status": "completed",
+            "status": status_value,
+            "failed_count": failed_count,
+            "partial": bool(failed_count > 0 and applied_count > 0),
             "completed_at": datetime.now().isoformat(),
         }
+        if failed_count > 0:
+            logger.warning(
+                "[upload_service] apply_ops completed with failures bundle=%s seq=%s failed=%d ops=%s",
+                bundle_id,
+                sequence_number,
+                failed_count,
+                operations_count,
+            )
+            return UploadResponse(
+                success=False,
+                bundle_id=bundle_id,
+                sequence_number=sequence_number,
+                processed_operations=operations_count,
+                processing_time_ms=processing_time,
+                next_sequence=sequence_number + 1 if sequence_number is not None else None,
+                error={
+                    "code": "APPLY_OPS_PARTIAL_FAILURE",
+                    "message": f"One or more operations failed during apply_ops (failed={failed_count})",
+                    "failed_count": failed_count,
+                    "processed_operations": operations_count,
+                },
+            )
         logger.info(
             "[upload_service] Applied metadata-only operations bundle=%s seq=%s in %sms ops=%s",
             bundle_id,

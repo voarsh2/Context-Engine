@@ -889,7 +889,7 @@ class RemoteUploadClient:
                         "processed_operations": server_info.get("last_processed_operations"),
                         "processing_time_ms": server_info.get("last_processing_time_ms"),
                     }
-                if last_upload_status == "failed":
+                if last_upload_status in ("failed", "error"):
                     return {
                         "outcome": "failed",
                         "bundle_id": last_bundle_id or bundle_id,

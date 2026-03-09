@@ -10,6 +10,7 @@ from qdrant_client import QdrantClient
 
 import scripts.ingest_code as idx
 from scripts.workspace_state import (
+    _get_state_lock,
     _extract_repo_name_from_path,
     _normalize_cache_key_path,
     get_collection_state_snapshot,
@@ -156,19 +157,21 @@ def _should_run_empty_dir_sweep(workspace_path: str, repo_name: Optional[str]) -
 
 def _record_empty_dir_sweep(workspace_path: str, repo_name: Optional[str]) -> None:
     try:
-        # Read fresh state to get latest maintenance dict
-        state = get_workspace_state(workspace_path=workspace_path, repo_name=repo_name) or {}
-        # Merge into existing maintenance dict rather than replacing it
-        maintenance = dict(state.get("maintenance") or {})
-        maintenance["last_empty_dir_sweep_at"] = datetime.now(timezone.utc).isoformat()
-        # Note: This is a best-effort update. Concurrent updates to other maintenance
-        # fields could be lost due to shallow merging in update_workspace_state.
-        # For production use, consider adding a deep-merge helper or locking at a higher level.
-        update_workspace_state(
-            workspace_path=workspace_path,
-            repo_name=repo_name,
-            updates={"maintenance": maintenance},
-        )
+        lock = _get_state_lock(workspace_path, repo_name)
+        with lock:
+            state = get_workspace_state(
+                workspace_path=workspace_path,
+                repo_name=repo_name,
+            ) or {}
+            maintenance = dict(state.get("maintenance") or {})
+            maintenance["last_empty_dir_sweep_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            update_workspace_state(
+                workspace_path=workspace_path,
+                repo_name=repo_name,
+                updates={"maintenance": maintenance},
+            )
     except Exception as exc:
         logger.warning(
             "Failed to record empty dir sweep timestamp: %s (workspace=%s, repo=%s)",
@@ -360,20 +363,22 @@ def _record_consistency_audit(
     summary: Dict[str, Any],
 ) -> None:
     try:
-        # Read fresh state to get latest maintenance dict
-        state = get_workspace_state(workspace_path=workspace_path, repo_name=repo_name) or {}
-        # Merge into existing maintenance dict rather than replacing it
-        maintenance = dict(state.get("maintenance") or {})
-        maintenance["last_consistency_audit_at"] = datetime.now(timezone.utc).isoformat()
-        maintenance["last_consistency_audit_summary"] = summary
-        # Note: This is a best-effort update. Concurrent updates to other maintenance
-        # fields could be lost due to shallow merging in update_workspace_state.
-        # For production use, consider adding a deep-merge helper or locking at a higher level.
-        update_workspace_state(
-            workspace_path=workspace_path,
-            repo_name=repo_name,
-            updates={"maintenance": maintenance},
-        )
+        lock = _get_state_lock(workspace_path, repo_name)
+        with lock:
+            state = get_workspace_state(
+                workspace_path=workspace_path,
+                repo_name=repo_name,
+            ) or {}
+            maintenance = dict(state.get("maintenance") or {})
+            maintenance["last_consistency_audit_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            maintenance["last_consistency_audit_summary"] = summary
+            update_workspace_state(
+                workspace_path=workspace_path,
+                repo_name=repo_name,
+                updates={"maintenance": maintenance},
+            )
     except Exception as exc:
         logger.warning(
             "Failed to record consistency audit: %s (workspace=%s, repo=%s)",
@@ -470,6 +475,7 @@ def _enqueue_consistency_repairs(
 
         # Preserve retry state from existing failed entries
         if existing and existing.get("status") == "failed":
+            entry["status"] = "failed"
             entry["attempts"] = existing.get("attempts", 0)
             entry["last_error"] = existing.get("last_error")
             # Keep created_at from existing entry to preserve original enqueue time

@@ -1768,22 +1768,35 @@ def upsert_index_journal_entries(
     """Persist or replace repo-scoped index journal entries keyed by normalized path."""
     normalized_entries: List[IndexJournalRecord] = []
     now = datetime.now().isoformat()
+    valid_statuses = {"pending", "in_progress", "failed", "done"}
     for entry in entries or []:
         path = _normalize_cache_key_path(str(entry.get("path") or ""))
         op_type = str(entry.get("op_type") or "").strip().lower()
         if not path or op_type not in {"upsert", "delete"}:
             continue
         content_hash = str(entry.get("content_hash") or "").strip() or None
+        status = str(entry.get("status") or "pending").strip().lower()
+        if status not in valid_statuses:
+            status = "pending"
+        try:
+            attempts = int(entry.get("attempts", 0) or 0)
+        except Exception:
+            attempts = 0
+        if attempts < 0:
+            attempts = 0
+        last_error = entry.get("last_error")
+        if last_error is not None:
+            last_error = str(last_error)
         normalized_entries.append(
             {
                 "path": path,
                 "op_type": op_type,
                 "content_hash": content_hash,
-                "status": "pending",
-                "attempts": 0,
+                "status": status,
+                "attempts": attempts,
                 "created_at": str(entry.get("created_at") or now),
-                "updated_at": now,
-                "last_error": None,
+                "updated_at": str(entry.get("updated_at") or now),
+                "last_error": last_error,
             }
         )
 

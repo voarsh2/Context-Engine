@@ -466,7 +466,7 @@ def test_smart_reindex_unnamed_reuse_requires_dense_vector(tmp_path, monkeypatch
     assert out_vec == embedded_vec
 
 
-def test_smart_reindex_updates_cached_hash_on_no_symbol_changes(tmp_path, monkeypatch):
+def test_smart_reindex_no_symbol_changes_falls_back_without_hash_cache(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=object))
 
     from scripts.ingest import pipeline as ingest_pipeline
@@ -486,6 +486,7 @@ def test_smart_reindex_updates_cached_hash_on_no_symbol_changes(tmp_path, monkey
         lambda _fp: {"function_hi_1": {"name": "hi", "type": "function", "start_line": 1}},
     )
     monkeypatch.setattr(ingest_pipeline, "compare_symbol_changes", lambda *_: ([], []))
+    monkeypatch.setattr(ingest_pipeline, "get_cached_file_hash", lambda *_: None)
     set_cached_file_hash = MagicMock()
     monkeypatch.setattr(ingest_pipeline, "set_cached_file_hash", set_cached_file_hash)
 
@@ -500,5 +501,5 @@ def test_smart_reindex_updates_cached_hash_on_no_symbol_changes(tmp_path, monkey
         vector_name="dense",
     )
 
-    assert status == "skipped"
-    set_cached_file_hash.assert_called_once()
+    assert status == "failed"
+    set_cached_file_hash.assert_not_called()

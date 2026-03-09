@@ -750,7 +750,7 @@ class RemoteUploadClient:
                         "processed_operations": server_info.get("last_processed_operations"),
                         "processing_time_ms": server_info.get("last_processing_time_ms"),
                     }
-                if last_upload_status == "failed":
+                if last_upload_status in ("failed", "error"):
                     return {
                         "outcome": "failed",
                         "bundle_id": last_bundle_id or bundle_id,
@@ -841,7 +841,17 @@ class RemoteUploadClient:
 
     def _is_watchable_path(self, path: Path) -> bool:
         """Return True when a filesystem event path is eligible for upload processing."""
-        return not self._is_ignored_path(path) and idx.CODE_EXTS.get(path.suffix.lower(), "unknown") != "unknown"
+        if self._is_ignored_path(path):
+            return False
+        suffix = path.suffix.lower()
+        if idx.CODE_EXTS.get(suffix, "unknown") != "unknown":
+            return True
+        name = path.name.lower()
+        try:
+            extensionless_names = {k.lower() for k in (idx.EXTENSIONLESS_FILES or {}).keys()}
+        except Exception:
+            extensionless_names = set()
+        return name in extensionless_names or name.startswith("dockerfile")
 
     def _get_temp_bundle_dir(self) -> Path:
         """Get or create temporary directory for bundle creation."""
