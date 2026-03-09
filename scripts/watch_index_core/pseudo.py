@@ -8,6 +8,7 @@ import threading
 from typing import Optional
 
 import scripts.ingest_code as idx
+from . import config as watch_config
 from .utils import get_boolean_env
 from scripts.workspace_state import (
     _cross_process_lock,
@@ -16,8 +17,6 @@ from scripts.workspace_state import (
     get_collection_mappings,
     is_multi_repo_mode,
 )
-
-from .config import ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,7 @@ def _start_pseudo_backfill_worker(
             try:
                 graph_backfill_enabled = get_boolean_env("GRAPH_EDGES_BACKFILL")
                 try:
-                    mappings = get_collection_mappings(search_root=str(ROOT))
+                    mappings = get_collection_mappings(search_root=str(watch_config.ROOT))
                 except Exception:
                     mappings = []
                 if not mappings:
@@ -83,7 +82,7 @@ def _start_pseudo_backfill_worker(
                         if is_multi_repo_mode() and repo_name:
                             state_dir = _get_repo_state_dir(repo_name)
                         else:
-                            state_dir = _get_global_state_dir(str(ROOT))
+                            state_dir = _get_global_state_dir(str(watch_config.ROOT))
                         lock_path = state_dir / "pseudo.lock"
                         with _cross_process_lock(lock_path):
                             processed = idx.pseudo_backfill_tick(

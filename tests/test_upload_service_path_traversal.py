@@ -2,7 +2,6 @@ import io
 import json
 import os
 import tarfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -437,33 +436,15 @@ def test_process_delta_bundle_moved_prunes_empty_source_parent_dirs(tmp_path, mo
     assert (work_dir / slug).exists()
 
 
-def test_process_delta_bundle_sweeps_stranded_empty_dirs_without_file_ops(tmp_path, monkeypatch):
+def test_process_delta_bundle_does_not_sweep_stranded_empty_dirs_without_file_ops(tmp_path, monkeypatch):
     import scripts.upload_delta_bundle as us
 
     work_dir = tmp_path / "work"
     work_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
-    monkeypatch.setenv("CTXCE_UPLOAD_EMPTY_DIR_SWEEP", "1")
-    monkeypatch.setenv("CTXCE_UPLOAD_EMPTY_DIR_SWEEP_INTERVAL_SECONDS", "604800")
-
     slug = "repo-0123456789abcdef"
     stranded = work_dir / slug / "dev-workspace" / "nested" / "empty"
     stranded.mkdir(parents=True, exist_ok=True)
-    state_store = {}
-
-    monkeypatch.setattr(
-        us,
-        "get_workspace_state",
-        lambda workspace_path=None, repo_name=None: state_store.get(repo_name, {}),
-    )
-
-    def _fake_update_workspace_state(workspace_path=None, updates=None, repo_name=None):
-        state = dict(state_store.get(repo_name, {}))
-        state.update(updates or {})
-        state_store[repo_name] = state
-        return state
-
-    monkeypatch.setattr(us, "update_workspace_state", _fake_update_workspace_state)
 
     bundle = _write_bundle(tmp_path, [])
 
@@ -482,10 +463,9 @@ def test_process_delta_bundle_sweeps_stranded_empty_dirs_without_file_ops(tmp_pa
         "skipped_hash_match": 0,
         "failed": 0,
     }
-    assert not stranded.exists()
-    assert not (work_dir / slug / "dev-workspace").exists()
+    assert stranded.exists()
+    assert (work_dir / slug / "dev-workspace").exists()
     assert (work_dir / slug).exists()
-    assert state_store[slug]["maintenance"]["last_empty_dir_sweep_at"]
 
 
 def test_process_delta_bundle_skips_broad_empty_dir_sweep_when_disabled(tmp_path, monkeypatch):
@@ -517,31 +497,9 @@ def test_process_delta_bundle_skips_broad_empty_dir_sweep_when_recent(tmp_path, 
     work_dir = tmp_path / "work"
     work_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
-    monkeypatch.setenv("CTXCE_UPLOAD_EMPTY_DIR_SWEEP", "1")
-    monkeypatch.setenv("CTXCE_UPLOAD_EMPTY_DIR_SWEEP_INTERVAL_SECONDS", "604800")
-
     slug = "repo-0123456789abcdef"
     stranded = work_dir / slug / "dev-workspace" / "nested" / "empty"
     stranded.mkdir(parents=True, exist_ok=True)
-    recent = datetime.now(timezone.utc) - timedelta(hours=1)
-    state_store = {
-        slug: {
-            "maintenance": {
-                "last_empty_dir_sweep_at": recent.isoformat(),
-            }
-        }
-    }
-
-    monkeypatch.setattr(
-        us,
-        "get_workspace_state",
-        lambda workspace_path=None, repo_name=None: state_store.get(repo_name, {}),
-    )
-    monkeypatch.setattr(
-        us,
-        "update_workspace_state",
-        lambda workspace_path=None, updates=None, repo_name=None: state_store.get(repo_name, {}),
-    )
 
     bundle = _write_bundle(tmp_path, [])
 

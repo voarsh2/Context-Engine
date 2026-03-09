@@ -100,7 +100,6 @@ def _managed_upload_marker_path(
     slug_name: str,
     marker_root: Optional[Path] = None,
 ) -> Path:
-    # Marker is stored with per-repo metadata, not inside the repo workspace tree.
     base = marker_root or work_root
     return base / ".codebase" / "repos" / slug_name / _MARKER_NAME
 
@@ -118,11 +117,12 @@ def _is_managed_upload_workspace_dir(
             return False
         if not _SLUGGED_REPO_RE.match(p.name or ""):
             return False
-        return _managed_upload_marker_path(
+        marker = _managed_upload_marker_path(
             work_root=work_root,
             marker_root=marker_root,
             slug_name=p.name,
-        ).exists()
+        )
+        return marker.exists()
     except Exception:
         return False
 
@@ -238,7 +238,7 @@ def delete_collection_everywhere(
     mappings = []
     try:
         if get_collection_mappings is not None:
-            mappings = get_collection_mappings(search_root=str(codebase_root)) or []
+            mappings = get_collection_mappings(search_root=str(work_root)) or []
     except Exception:
         mappings = []
 

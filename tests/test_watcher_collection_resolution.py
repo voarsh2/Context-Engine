@@ -17,6 +17,9 @@ def test_main_resolves_collection_from_state(monkeypatch, tmp_path):
     wi = importlib.import_module("scripts.watch_index")
     # Reload to re-read env defaults (COLLECTION) in module globals
     wi = importlib.reload(wi)
+    watch_config = importlib.import_module("scripts.watch_index_core.config")
+    original_root = watch_config.ROOT
+    original_watch_root = wi.ROOT
 
     # Fake QdrantClient: force get_collection to raise so code chooses sanitized vector name path
     class FakeQdrant:
@@ -70,10 +73,14 @@ def test_main_resolves_collection_from_state(monkeypatch, tmp_path):
     assert wi.COLLECTION == os.environ.get("COLLECTION_NAME") == "my-collection"
 
     # Run main(); in single-repo mode it should keep the env-provided COLLECTION_NAME
-    wi.main()
+    try:
+        wi.main()
 
-    # Postcondition: global COLLECTION remains the env-provided name
-    assert wi.COLLECTION == "my-collection"
+        # Postcondition: global COLLECTION remains the env-provided name
+        assert wi.COLLECTION == "my-collection"
+    finally:
+        watch_config.ROOT = original_root
+        wi.ROOT = original_watch_root
 
 
 def test_multi_repo_ignores_placeholder_collection_in_state(monkeypatch, tmp_path):
@@ -85,7 +92,8 @@ def test_multi_repo_ignores_placeholder_collection_in_state(monkeypatch, tmp_pat
 
     utils = importlib.import_module("scripts.watch_index_core.utils")
     utils = importlib.reload(utils)
-    monkeypatch.setattr(utils, "ROOT", tmp_path, raising=False)
+    watch_config = importlib.import_module("scripts.watch_index_core.config")
+    monkeypatch.setattr(watch_config, "ROOT", tmp_path, raising=True)
     monkeypatch.setattr(utils, "is_multi_repo_mode", lambda: True, raising=True)
 
     repo_slug = "Pirate Survivors-2b23a7e45f2c4b9f"
@@ -111,4 +119,3 @@ def test_multi_repo_ignores_placeholder_collection_in_state(monkeypatch, tmp_pat
 
     resolved = utils._get_collection_for_file(target)
     assert resolved == f"derived-{repo_slug}"
-

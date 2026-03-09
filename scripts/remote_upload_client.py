@@ -176,6 +176,24 @@ def _compute_logical_repo_id(workspace_path: str) -> str:
     return f"{prefix}{h}"
 
 
+def _derive_metadata_root(workspace_path: str) -> Path:
+    """Infer host-side metadata root that corresponds to container `/work`."""
+    try:
+        p = Path(workspace_path).resolve()
+    except Exception:
+        p = Path(workspace_path)
+
+    if p.name == "dev-workspace":
+        return p.parent
+    if p.parent.name == "dev-workspace":
+        return p.parent.parent
+    if (p / ".codebase").exists():
+        return p
+    if (p.parent / ".codebase").exists():
+        return p.parent
+    return p.parent
+
+
 def _redact_emails(text: str) -> str:
     """Redact email addresses from commit messages for privacy."""
     try:
@@ -435,7 +453,12 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
     return manifest
 
 
-def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str]) -> Dict[str, str]:
+def _load_local_cache_file_hashes(
+    workspace_path: str,
+    repo_name: Optional[str],
+    *,
+    metadata_root: Optional[str] = None,
+) -> Dict[str, str]:
     """Best-effort read of the local cache.json file_hashes map.
 
     This mirrors the layout used by workspace_state without introducing new
@@ -443,7 +466,13 @@ def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str])
     lookups still go through get_cached_file_hash.
     """
     try:
-        base = Path(os.environ.get("WORKSPACE_PATH") or workspace_path).resolve()
+        base = Path(
+            metadata_root
+            or os.environ.get("CTXCE_METADATA_ROOT")
+            or os.environ.get("WATCH_ROOT")
+            or os.environ.get("WORKSPACE_PATH")
+            or workspace_path
+        ).resolve()
         multi_repo = os.environ.get("MULTI_REPO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
         if multi_repo and repo_name:
             cache_path = base / ".codebase" / "repos" / repo_name / "cache.json"
@@ -483,10 +512,19 @@ def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str])
         return {}
 
 
-def get_all_cached_paths(repo_name: Optional[str] = None) -> List[str]:
+def get_all_cached_paths(
+    repo_name: Optional[str] = None,
+    metadata_root: Optional[str] = None,
+) -> List[str]:
     """Return cached file paths from the local workspace cache."""
-    workspace_path = os.environ.get("WORKSPACE_PATH") or os.getcwd()
-    return list(_load_local_cache_file_hashes(workspace_path, repo_name).keys())
+    effective_workspace = os.environ.get("WORKSPACE_PATH") or os.getcwd()
+    return list(
+        _load_local_cache_file_hashes(
+            effective_workspace,
+            repo_name,
+            metadata_root=metadata_root,
+        ).keys()
+    )
 
 
 class RemoteUploadClient:
@@ -528,14 +566,12 @@ class RemoteUploadClient:
         """Initialize remote upload client."""
         self.upload_endpoint = upload_endpoint.rstrip('/')
         self.workspace_path = workspace_path
+        self.metadata_root = str(_derive_metadata_root(workspace_path))
         self.collection_name = collection_name
         self.max_retries = max_retries
         self.timeout = timeout
         self.temp_dir = None
         self.logical_repo_id = logical_repo_id
-
-        # Set environment variables for cache functions
-        os.environ["WORKSPACE_PATH"] = workspace_path
 
         # Get repo name for cache operations
         try:
@@ -558,6 +594,50 @@ class RemoteUploadClient:
         self.session.mount("https://", adapter)
         self.last_upload_result: Dict[str, Any] = {"outcome": "idle"}
         self._last_plan_payload: Optional[Dict[str, Any]] = None
+
+    def _get_cached_file_hash(self, file_path: str) -> str:
+        try:
+            return get_cached_file_hash(
+                file_path,
+                self.repo_name,
+                metadata_root=self.metadata_root,
+            )
+        except TypeError:
+            # Support monkeypatched test doubles that don't accept metadata_root.
+            return get_cached_file_hash(file_path, self.repo_name)
+
+    def _set_cached_file_hash(self, file_path: str, file_hash: str) -> None:
+        try:
+            set_cached_file_hash(
+                file_path,
+                file_hash,
+                self.repo_name,
+                metadata_root=self.metadata_root,
+            )
+        except TypeError:
+            # Support monkeypatched test doubles that don't accept metadata_root.
+            set_cached_file_hash(file_path, file_hash, self.repo_name)
+
+    def _remove_cached_file(self, file_path: str) -> None:
+        try:
+            remove_cached_file(
+                file_path,
+                self.repo_name,
+                metadata_root=self.metadata_root,
+            )
+        except TypeError:
+            # Support monkeypatched test doubles that don't accept metadata_root.
+            remove_cached_file(file_path, self.repo_name)
+
+    def _get_all_cached_paths(self) -> List[str]:
+        try:
+            return get_all_cached_paths(
+                self.repo_name,
+                metadata_root=self.metadata_root,
+            )
+        except TypeError:
+            # Support monkeypatched test doubles that don't accept metadata_root.
+            return get_all_cached_paths(self.repo_name)
 
     def _set_last_upload_result(self, outcome: str, **details: Any) -> Dict[str, Any]:
         result: Dict[str, Any] = {"outcome": outcome}
@@ -586,7 +666,7 @@ class RemoteUploadClient:
             try:
                 abs_path = str(path.resolve())
                 current_hash = hashlib.sha1(path.read_bytes()).hexdigest()
-                set_cached_file_hash(abs_path, current_hash, self.repo_name)
+                self._set_cached_file_hash(abs_path, current_hash)
                 stat = path.stat()
                 self._stat_cache[abs_path] = (
                     getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
@@ -598,7 +678,7 @@ class RemoteUploadClient:
             try:
                 abs_path = str(path.resolve())
                 current_hash = hashlib.sha1(path.read_bytes()).hexdigest()
-                set_cached_file_hash(abs_path, current_hash, self.repo_name)
+                self._set_cached_file_hash(abs_path, current_hash)
                 stat = path.stat()
                 self._stat_cache[abs_path] = (
                     getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
@@ -609,21 +689,21 @@ class RemoteUploadClient:
         for path in changes.get("deleted", []):
             try:
                 abs_path = str(path.resolve())
-                remove_cached_file(abs_path, self.repo_name)
+                self._remove_cached_file(abs_path)
                 self._stat_cache.pop(abs_path, None)
             except Exception:
                 continue
         for source_path, dest_path in changes.get("moved", []):
             try:
                 source_abs_path = str(source_path.resolve())
-                remove_cached_file(source_abs_path, self.repo_name)
+                self._remove_cached_file(source_abs_path)
                 self._stat_cache.pop(source_abs_path, None)
             except Exception:
                 continue
             try:
                 dest_abs_path = str(dest_path.resolve())
                 current_hash = hashlib.sha1(dest_path.read_bytes()).hexdigest()
-                set_cached_file_hash(dest_abs_path, current_hash, self.repo_name)
+                self._set_cached_file_hash(dest_abs_path, current_hash)
                 stat = dest_path.stat()
                 self._stat_cache[dest_abs_path] = (
                     getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
@@ -795,7 +875,7 @@ class RemoteUploadClient:
                     abs_path = str(path.resolve())
                 except Exception:
                     continue
-                cached_hash = get_cached_file_hash(abs_path, self.repo_name)
+                cached_hash = self._get_cached_file_hash(abs_path)
                 if cached_hash:
                     changes["deleted"].append(path)
                     try:
@@ -810,7 +890,7 @@ class RemoteUploadClient:
                 # Skip paths that cannot be resolved
                 continue
 
-            cached_hash = get_cached_file_hash(abs_path, self.repo_name)
+            cached_hash = self._get_cached_file_hash(abs_path)
 
             if not path.exists():
                 # File was deleted
@@ -890,7 +970,7 @@ class RemoteUploadClient:
         for deleted_path in deleted_files:
             try:
                 # Try to get cached hash first, fallback to file content
-                cached_hash = get_cached_file_hash(str(deleted_path), self.repo_name)
+                cached_hash = self._get_cached_file_hash(str(deleted_path))
                 if cached_hash:
                     deleted_hashes[cached_hash] = deleted_path
                     continue
@@ -1003,7 +1083,7 @@ class RemoteUploadClient:
                         content = f.read()
                     file_hash = hashlib.sha1(content).hexdigest()
                     content_hash = f"sha1:{file_hash}"
-                    previous_hash = get_cached_file_hash(str(path.resolve()), self.repo_name)
+                    previous_hash = self._get_cached_file_hash(str(path.resolve()))
 
                     # Write file to bundle
                     bundle_file_path = files_dir / "updated" / rel_path
@@ -1079,7 +1159,7 @@ class RemoteUploadClient:
             for path in changes["deleted"]:
                 rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
                 try:
-                    previous_hash = get_cached_file_hash(str(path.resolve()), self.repo_name)
+                    previous_hash = self._get_cached_file_hash(str(path.resolve()))
 
                     operation = {
                         "operation": "deleted",
@@ -1096,7 +1176,7 @@ class RemoteUploadClient:
                     # Once a delete operation has been recorded, drop the cache entry
                     # so subsequent scans do not keep re-reporting the same deletion.
                     try:
-                        remove_cached_file(str(path.resolve()), self.repo_name)
+                        self._remove_cached_file(str(path.resolve()))
                     except Exception:
                         pass
 
@@ -1202,7 +1282,7 @@ class RemoteUploadClient:
                         "path": rel_path,
                         "size_bytes": stat.st_size,
                         "content_hash": f"sha1:{file_hash}",
-                        "previous_hash": get_cached_file_hash(str(path.resolve()), self.repo_name),
+                        "previous_hash": self._get_cached_file_hash(str(path.resolve())),
                         "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
                     }
                 )
@@ -1245,7 +1325,7 @@ class RemoteUploadClient:
                     {
                         "operation": "deleted",
                         "path": rel_path,
-                        "previous_hash": get_cached_file_hash(str(path.resolve()), self.repo_name),
+                        "previous_hash": self._get_cached_file_hash(str(path.resolve())),
                         "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
                     }
                 )
@@ -1750,7 +1830,7 @@ class RemoteUploadClient:
             created_files.append(path)
             path_map[resolved] = path
 
-        for cached_abs in get_all_cached_paths(self.repo_name):
+        for cached_abs in self._get_all_cached_paths():
             try:
                 cached_path = Path(cached_abs)
                 resolved = cached_path.resolve()

@@ -5,21 +5,19 @@ import tarfile
 import hashlib
 import re
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 
 try:
     from scripts.workspace_state import (
-        _normalize_cache_key_path,
-        _extract_repo_name_from_path,
-        get_staging_targets,
-        get_collection_state_snapshot,
-        get_workspace_state,
-        is_staging_enabled,
-        update_workspace_state,
-    )
+    _normalize_cache_key_path,
+    _extract_repo_name_from_path,
+    get_staging_targets,
+    get_collection_state_snapshot,
+    is_staging_enabled,
+    upsert_index_journal_entries,
+)
 except ImportError as exc:
     raise ImportError(
         "upload_delta_bundle requires scripts.workspace_state; ensure the module is available"
@@ -30,24 +28,6 @@ logger = logging.getLogger(__name__)
 
 WORK_DIR = os.environ.get("WORK_DIR") or os.environ.get("WORKDIR") or "/work"
 _SLUGGED_REPO_RE = re.compile(r"^.+-[0-9a-f]{16}(?:_old)?$")
-_DEFAULT_EMPTY_DIR_SWEEP_INTERVAL_SECONDS = 7 * 24 * 60 * 60
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
 
 
 def _normalize_hash_value(value: Any) -> str:
@@ -59,6 +39,26 @@ def _normalize_hash_value(value: Any) -> str:
         if digest.strip():
             return digest.strip().lower()
     return raw.lower()
+
+
+def _build_upsert_journal_entry(path: Path | str, content_hash: Optional[str]) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "path": str(path),
+        "op_type": "upsert",
+    }
+    if content_hash:
+        entry["content_hash"] = content_hash
+    return entry
+
+
+def _build_delete_journal_entry(path: Path | str, content_hash: Optional[str] = None) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "path": str(path),
+        "op_type": "delete",
+    }
+    if content_hash:
+        entry["content_hash"] = content_hash
+    return entry
 
 
 def _load_cache_hashes(cache_path: Path) -> Dict[str, str]:
@@ -129,95 +129,6 @@ def _cleanup_empty_dirs(path: Path, stop_at: Path) -> None:
             path = path.parent
         except Exception:
             break
-
-
-def _sweep_empty_workspace_dirs(workspace_root: Path) -> None:
-    """Best-effort prune of empty directories under a workspace root."""
-    protected_top_level = {".codebase", ".remote-git"}
-    try:
-        workspace_root = workspace_root.resolve()
-    except Exception:
-        pass
-    try:
-        for root, dirnames, _filenames in os.walk(workspace_root, topdown=False):
-            current = Path(root)
-            if current == workspace_root:
-                continue
-            if current.parent == workspace_root and current.name in protected_top_level:
-                continue
-            try:
-                rel = current.relative_to(workspace_root)
-            except Exception:
-                continue
-            if rel.parts and rel.parts[0] in protected_top_level:
-                continue
-            try:
-                if any(current.iterdir()):
-                    continue
-                current.rmdir()
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-
-def _parse_timestamp(value: Any) -> Optional[datetime]:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _should_run_empty_dir_sweep(workspace_root: Path, slug: str) -> bool:
-    if not _env_flag("CTXCE_UPLOAD_EMPTY_DIR_SWEEP", True):
-        return False
-
-    interval_seconds = max(
-        0,
-        _env_int(
-            "CTXCE_UPLOAD_EMPTY_DIR_SWEEP_INTERVAL_SECONDS",
-            _DEFAULT_EMPTY_DIR_SWEEP_INTERVAL_SECONDS,
-        ),
-    )
-    if interval_seconds == 0:
-        return True
-
-    try:
-        state = get_workspace_state(workspace_path=str(workspace_root), repo_name=slug) or {}
-    except Exception:
-        return True
-
-    maintenance = state.get("maintenance") or {}
-    last_sweep_at = _parse_timestamp(maintenance.get("last_empty_dir_sweep_at"))
-    if last_sweep_at is None:
-        return True
-
-    age_seconds = (datetime.now(timezone.utc) - last_sweep_at).total_seconds()
-    return age_seconds >= interval_seconds
-
-
-def _record_empty_dir_sweep(workspace_root: Path, slug: str) -> None:
-    try:
-        state = get_workspace_state(workspace_path=str(workspace_root), repo_name=slug) or {}
-        maintenance = dict(state.get("maintenance") or {})
-        maintenance["last_empty_dir_sweep_at"] = datetime.now(timezone.utc).isoformat()
-        update_workspace_state(
-            workspace_path=str(workspace_root),
-            repo_name=slug,
-            updates={"maintenance": maintenance},
-        )
-    except Exception as exc:
-        logger.debug(
-            "[upload_service] Failed to record empty-dir sweep for %s: %s",
-            workspace_root,
-            exc,
-        )
 
 
 def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) -> Dict[str, Path]:
@@ -353,6 +264,28 @@ def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) 
                 pass
         replica_roots[slug] = path.resolve()
     return replica_roots
+
+
+def _enqueue_replica_journal_entries(
+    *,
+    workspace_root: Path,
+    slug: str,
+    entries: list[Dict[str, Any]],
+) -> None:
+    if not entries:
+        return
+    try:
+        upsert_index_journal_entries(
+            entries,
+            workspace_path=str(workspace_root),
+            repo_name=slug,
+        )
+    except Exception as exc:
+        logger.debug(
+            "[upload_service] Failed to enqueue index journal entries for %s: %s",
+            workspace_root,
+            exc,
+        )
 
 
 def _safe_join(base: Path, rel: str) -> Path:
@@ -523,6 +456,9 @@ def apply_delta_operations(
             slug: _load_replica_cache_hashes(root, slug)
             for slug, root in replica_roots.items()
         }
+        journal_entries_by_slug: Dict[str, list[Dict[str, Any]]] = {
+            slug: [] for slug in replica_roots.keys()
+        }
         normalized_hashes = {
             str(rel_path): _normalize_hash_value(hash_value)
             for rel_path, hash_value in (file_hashes or {}).items()
@@ -574,6 +510,9 @@ def apply_delta_operations(
                             target_path.unlink(missing_ok=True)
                         _cleanup_empty_dirs(target_path.parent, root)
                         replica_hashes.pop(target_key, None)
+                        journal_entries_by_slug.setdefault(slug, []).append(
+                            _build_delete_journal_entry(target_path)
+                        )
                         replica_results[slug] = "applied"
                         continue
 
@@ -596,6 +535,13 @@ def apply_delta_operations(
                         replica_hashes[target_key] = op_content_hash
                     elif moved_hash:
                         replica_hashes[target_key] = moved_hash
+                    move_entry_hash = op_content_hash or moved_hash
+                    journal_entries_by_slug.setdefault(slug, []).extend(
+                        [
+                            _build_delete_journal_entry(safe_source_path, move_entry_hash),
+                            _build_upsert_journal_entry(target_path, move_entry_hash),
+                        ]
+                    )
                     replica_results[slug] = "applied"
                 except Exception as exc:
                     logger.debug(
@@ -622,11 +568,11 @@ def apply_delta_operations(
                 operations_count["failed"] += 1
 
         for slug, root in replica_roots.items():
-            if not _should_run_empty_dir_sweep(root, slug):
-                continue
-            logger.info("[upload_service] Sweeping empty directories under %s", root)
-            _sweep_empty_workspace_dirs(root)
-            _record_empty_dir_sweep(root, slug)
+            _enqueue_replica_journal_entries(
+                workspace_root=root,
+                slug=slug,
+                entries=journal_entries_by_slug.get(slug, []),
+            )
 
         return operations_count
     except Exception as e:
@@ -715,6 +661,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                 slug: _load_replica_cache_hashes(root, slug)
                 for slug, root in replica_roots.items()
             }
+            journal_entries_by_slug: Dict[str, list[Dict[str, Any]]] = {
+                slug: [] for slug in replica_roots.keys()
+            }
 
             # Best-effort: extract git history metadata for watcher to ingest
             try:
@@ -736,10 +685,14 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
             except Exception as git_err:
                 logger.debug(f"[upload_service] Error extracting git history metadata: {git_err}")
 
-            def _apply_operation_to_workspace(slug: str, workspace_root: Path) -> str:
+            def _apply_operation_to_workspace(
+                slug: str,
+                workspace_root: Path,
+                op_type: str,
+                rel_path: str,
+                operation: Dict[str, Any],
+            ) -> str:
                 """Apply a single file operation to a workspace."""
-                nonlocal operations_count, op_type, rel_path, tar, operation
-                
                 target_path = _safe_join(workspace_root, rel_path)
                 target_key = _normalize_cache_key_path(str(target_path))
                 replica_hashes = replica_cache_hashes.setdefault(slug, {})
@@ -768,6 +721,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                                 target_path.write_bytes(file_content.read())
                                 if op_content_hash:
                                     replica_hashes[target_key] = op_content_hash
+                                journal_entries_by_slug.setdefault(slug, []).append(
+                                    _build_upsert_journal_entry(target_path, op_content_hash)
+                                )
                                 return "applied"
                             else:
                                 return "failed"
@@ -787,6 +743,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                                 target_path.write_bytes(file_content.read())
                                 if op_content_hash:
                                     replica_hashes[target_key] = op_content_hash
+                                journal_entries_by_slug.setdefault(slug, []).append(
+                                    _build_upsert_journal_entry(target_path, op_content_hash)
+                                )
                                 return "applied"
                             else:
                                 return "failed"
@@ -796,13 +755,12 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     elif op_type == "deleted":
                         if target_path.exists():
                             target_path.unlink(missing_ok=True)
-                            _cleanup_empty_dirs(target_path.parent, workspace_root)
-                            replica_hashes.pop(target_key, None)
-                            return "applied"
-                        else:
-                            _cleanup_empty_dirs(target_path.parent, workspace_root)
-                            replica_hashes.pop(target_key, None)
-                            return "applied"  # Already deleted
+                        _cleanup_empty_dirs(target_path.parent, workspace_root)
+                        replica_hashes.pop(target_key, None)
+                        journal_entries_by_slug.setdefault(slug, []).append(
+                            _build_delete_journal_entry(target_path)
+                        )
+                        return "applied"
 
                     elif op_type == "moved":
                         if safe_source_path and safe_source_path.exists():
@@ -820,6 +778,13 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                                 replica_hashes[target_key] = op_content_hash
                             elif moved_hash:
                                 replica_hashes[target_key] = moved_hash
+                            move_entry_hash = op_content_hash or moved_hash
+                            journal_entries_by_slug.setdefault(slug, []).extend(
+                                [
+                                    _build_delete_journal_entry(safe_source_path, move_entry_hash),
+                                    _build_upsert_journal_entry(target_path, move_entry_hash),
+                                ]
+                            )
                             return "applied"
                         # Remote uploads may not have the source file on the server (e.g. staging
                         # mirrors). In that case, clients can embed the destination content under
@@ -832,6 +797,13 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                                 target_path.write_bytes(file_content.read())
                                 if op_content_hash:
                                     replica_hashes[target_key] = op_content_hash
+                                if safe_source_path:
+                                    journal_entries_by_slug.setdefault(slug, []).append(
+                                        _build_delete_journal_entry(safe_source_path, op_content_hash)
+                                    )
+                                journal_entries_by_slug.setdefault(slug, []).append(
+                                    _build_upsert_journal_entry(target_path, op_content_hash)
+                                )
                                 return "applied"
                             return "failed"
                         return "failed"
@@ -864,7 +836,13 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
 
                 replica_results: Dict[str, str] = {}
                 for slug, root in replica_roots.items():
-                    replica_results[slug] = _apply_operation_to_workspace(slug, root)
+                    replica_results[slug] = _apply_operation_to_workspace(
+                        slug,
+                        root,
+                        op_type,
+                        rel_path,
+                        operation,
+                    )
 
                 applied_any = any(result == "applied" for result in replica_results.values())
                 skipped_hash_match = bool(replica_results) and all(
@@ -885,11 +863,11 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     operations_count["failed"] += 1
 
         for slug, root in replica_roots.items():
-            if not _should_run_empty_dir_sweep(root, slug):
-                continue
-            logger.info("[upload_service] Sweeping empty directories under %s", root)
-            _sweep_empty_workspace_dirs(root)
-            _record_empty_dir_sweep(root, slug)
+            _enqueue_replica_journal_entries(
+                workspace_root=root,
+                slug=slug,
+                entries=journal_entries_by_slug.get(slug, []),
+            )
 
         return operations_count
 

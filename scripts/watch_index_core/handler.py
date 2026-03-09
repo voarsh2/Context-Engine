@@ -12,7 +12,6 @@ from watchdog.events import FileSystemEventHandler
 import scripts.ingest_code as idx
 from scripts.workspace_state import (
     _extract_repo_name_from_path,
-    _get_global_state_dir,
     get_cached_file_hash,
     log_watcher_activity as _log_activity,
     remove_cached_file,
@@ -27,6 +26,7 @@ from .utils import (
     safe_print,
 )
 from .rename import _rename_in_store
+from .paths import is_internal_metadata_path
 
 
 class IndexHandler(FileSystemEventHandler):
@@ -82,15 +82,7 @@ class IndexHandler(FileSystemEventHandler):
             pass
 
     def _is_internal_metadata_path(self, p: Path) -> bool:
-        try:
-            if any(part == ".codebase" for part in p.parts):
-                return True
-            global_state_dir = _get_global_state_dir()
-            if global_state_dir is not None and p.is_relative_to(global_state_dir):
-                return True
-        except (OSError, ValueError):
-            return False
-        return False
+        return is_internal_metadata_path(p)
 
     def _maybe_enqueue(self, src_path: str) -> None:
         self._maybe_reload_excluder()

@@ -14,13 +14,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.watch_index_core.config import (  # noqa: E402
-    LOGGER,
-    MODEL,
-    QDRANT_URL,
-    ROOT as WATCH_ROOT,
-    default_collection_name,
-)
+from scripts.watch_index_core import config as watch_config  # noqa: E402
+from scripts.watch_index_core.config import LOGGER, MODEL, QDRANT_URL, default_collection_name  # noqa: E402
 from scripts.watch_index_core.utils import (
     get_boolean_env,
     resolve_vector_name_config,
@@ -30,22 +25,24 @@ from scripts.watch_index_core.handler import IndexHandler  # noqa: E402
 from scripts.watch_index_core.pseudo import _start_pseudo_backfill_worker  # noqa: E402
 from scripts.watch_index_core.processor import _process_paths  # noqa: E402
 from scripts.watch_index_core.queue import ChangeQueue  # noqa: E402
+from scripts.watch_index_core.consistency import (  # noqa: E402
+    run_consistency_audit,
+    run_empty_dir_sweep_maintenance,
+)
 from scripts.workspace_state import (  # noqa: E402
-    _extract_repo_name_from_path,
     compute_indexing_config_hash,
-    get_collection_name,
     get_indexing_config_snapshot,
+    list_pending_index_journal_entries,
     is_multi_repo_mode,
     persist_indexing_config,
     update_indexing_status,
-    update_workspace_state,
     initialize_watcher_state,
 )
 
 import scripts.ingest_code as idx  # noqa: E402
 
 logger = LOGGER
-ROOT = WATCH_ROOT
+ROOT = watch_config.ROOT
 # Back-compat: legacy modules/tests expect a module-level COLLECTION constant.
 # We use a sentinel and a getter to ensure the resolved value is returned.
 _COLLECTION: Optional[str] = None
@@ -58,7 +55,63 @@ def get_collection() -> str:
     return default_collection_name()
 
 
+def _set_runtime_root() -> None:
+    global ROOT
+    runtime_root = Path(
+        os.environ.get("WATCH_ROOT")
+        or os.environ.get("WORKSPACE_PATH")
+        or str(ROOT)
+    )
+    try:
+        runtime_root = runtime_root.resolve()
+    except Exception:
+        pass
+
+    ROOT = runtime_root
+    watch_config.ROOT = runtime_root
+
+
+def _drain_pending_journal(queue: ChangeQueue) -> None:
+    pending_path: Optional[str] = None
+    try:
+        for pending_entry in list_pending_index_journal_entries(str(ROOT)):
+            pending_path = str(pending_entry.get("path") or "").strip()
+            if pending_path:
+                queue.add(Path(pending_path), force=True)
+    except Exception as exc:
+        logger.exception(
+            "watch_index::pending_journal_drain_failed",
+            extra={"root": str(ROOT), "pending_path": pending_path, "error": str(exc)},
+        )
+
+
+def _run_periodic_maintenance(client: QdrantClient) -> None:
+    try:
+        run_consistency_audit(client, ROOT)
+    except Exception as exc:
+        logger.exception(
+            "watch_index::consistency_audit_failed",
+            extra={"root": str(ROOT), "error": str(exc)},
+        )
+    try:
+        run_empty_dir_sweep_maintenance(ROOT)
+    except Exception as exc:
+        logger.exception(
+            "watch_index::empty_dir_sweep_failed",
+            extra={"root": str(ROOT), "error": str(exc)},
+        )
+
+
+def _maintenance_interval_secs() -> float:
+    try:
+        return max(0.0, float(os.environ.get("WATCH_MAINTENANCE_INTERVAL_SECS", "300") or 300.0))
+    except Exception:
+        return 300.0
+
+
 def main() -> None:
+    _set_runtime_root()
+
     # Resolve collection name from workspace state before any client/state ops
     try:
         from scripts.workspace_state import get_collection_name_with_staging as _get_coll
@@ -185,8 +238,19 @@ def main() -> None:
     obs.schedule(handler, str(ROOT), recursive=True)
     obs.start()
 
+    maintenance_interval = _maintenance_interval_secs()
+    last_maintenance: Optional[float] = None
+
     try:
         while True:
+            # Watcher is the sole durable journal consumer in v1. Upload/apply
+            # records upsert/delete intent here so missed filesystem events can
+            # still be replayed after watcher/container restarts.
+            _drain_pending_journal(q)
+            now = time.time()
+            if last_maintenance is None or (now - last_maintenance) >= maintenance_interval:
+                _run_periodic_maintenance(client)
+                last_maintenance = now
             time.sleep(1.0)
     except KeyboardInterrupt:
         pass

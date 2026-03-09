@@ -758,9 +758,6 @@ class RemoteUploadClient:
         self.temp_dir = None
         self.logical_repo_id = logical_repo_id
 
-        # Set environment variables for cache functions
-        os.environ["WORKSPACE_PATH"] = workspace_path
-
         # Store repo name and initialize hash cache
         self.repo_name = _extract_repo_name_from_path(workspace_path)
         # Fallback to directory name if repo detection fails (for non-git repos)

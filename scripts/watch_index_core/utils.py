@@ -8,7 +8,8 @@ from typing import Any, Dict, Optional, Type
 from watchdog.observers import Observer
 
 import scripts.ingest_code as idx
-from .config import LOGGER, ROOT, default_collection_name
+from . import config as watch_config
+from .config import LOGGER, default_collection_name
 from scripts.workspace_state import (
     _extract_repo_name_from_path,
     PLACEHOLDER_COLLECTION_NAMES,
@@ -93,13 +94,14 @@ def create_observer(use_polling: bool, observer_cls: Type[Observer] = Observer) 
 
 def _detect_repo_for_file(file_path: Path) -> Optional[Path]:
     """Detect repository root for a file under WATCH root."""
+    root = watch_config.ROOT
     try:
-        rel_path = file_path.resolve().relative_to(ROOT.resolve())
+        rel_path = file_path.resolve().relative_to(root.resolve())
     except Exception:
         return None
     if not rel_path.parts:
-        return ROOT
-    return ROOT / rel_path.parts[0]
+        return root
+    return root / rel_path.parts[0]
 
 
 def _repo_name_or_none(repo_path: Optional[Path]) -> Optional[str]:

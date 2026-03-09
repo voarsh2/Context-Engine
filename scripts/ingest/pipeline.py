@@ -109,7 +109,8 @@ def detect_language(path: Path) -> str:
 _TEXT_LIKE_LANGS = {"unknown", "markdown", "text"}
 
 
-def _is_text_like_language(language: str) -> bool:
+def is_text_like_language(language: str) -> bool:
+    """Classify whether a detected language should skip smart reindexing."""
     return str(language or "").strip().lower() in _TEXT_LIKE_LANGS
 
 
@@ -399,7 +400,6 @@ def _index_single_file_inner(
         text = preloaded_text
 
     language = preloaded_language or detect_language(file_path)
-    is_text_like = _is_text_like_language(language)
     file_hash = preloaded_file_hash or hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
     repo_tag = repo_name_for_cache or _detect_repo_name_from_path(file_path)
@@ -997,6 +997,13 @@ def process_file_with_smart_reindexing(
     except Exception:
         file_path = Path(fp)
 
+    is_text_like = is_text_like_language(language)
+    if is_text_like:
+        print(
+            f"[SMART_REINDEX] {file_path}: text-like language '{language}', "
+            "skipping smart reindex and using full reindex path"
+        )
+        return "failed"
     file_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
     if allowed_vectors is None and allowed_sparse is None:
@@ -1171,7 +1178,6 @@ def process_file_with_smart_reindexing(
     else:
         chunks = chunk_lines(text, CHUNK_LINES, CHUNK_OVERLAP)
 
-    is_text_like = _is_text_like_language(language)
     symbol_spans = _extract_symbols(language, text)
 
     reused_points: list[models.PointStruct] = []

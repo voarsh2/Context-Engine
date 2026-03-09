@@ -203,6 +203,7 @@ from scripts.ingest.qdrant import (
 
 from scripts.ingest.pipeline import (
     _detect_repo_name_from_path,
+    is_text_like_language,
     detect_language,
     build_information,
     pseudo_backfill_tick,
@@ -352,6 +353,7 @@ __all__ = [
     "embed_batch",
     # Pipeline
     "_detect_repo_name_from_path",
+    "is_text_like_language",
     "detect_language",
     "build_information",
     "index_single_file",
