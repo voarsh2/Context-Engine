@@ -833,9 +833,6 @@ def _process_paths(
                         )
                     except Exception as graph_exc:
                         safe_print(f"[deleted:graph_failed] {p} -> {collection}: {graph_exc}")
-                        # Don't mark as deleted_ok if graph cleanup fails
-                        deleted_ok = False
-                        raise
                     safe_print(f"[deleted] {p} -> {collection}")
                     deleted_ok = True
                 except Exception:

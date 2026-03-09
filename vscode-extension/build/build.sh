@@ -83,8 +83,16 @@ BRIDGE_DIR="ctx-mcp-bridge"
 if [[ -d "$BRIDGE_SRC" && -f "$BRIDGE_SRC/package.json" ]]; then
     echo "Bundling MCP bridge npm package into staged extension..."
     mkdir -p "$STAGE_DIR/$BRIDGE_DIR"
-    cp -a "$BRIDGE_SRC/bin" "$STAGE_DIR/$BRIDGE_DIR/"
-    cp -a "$BRIDGE_SRC/src" "$STAGE_DIR/$BRIDGE_DIR/"
+    if [[ -d "$BRIDGE_SRC/bin" ]]; then
+        cp -a "$BRIDGE_SRC/bin" "$STAGE_DIR/$BRIDGE_DIR/"
+    else
+        echo "Warning: Bridge bin directory not found at $BRIDGE_SRC/bin (skipping)"
+    fi
+    if [[ -d "$BRIDGE_SRC/src" ]]; then
+        cp -a "$BRIDGE_SRC/src" "$STAGE_DIR/$BRIDGE_DIR/"
+    else
+        echo "Warning: Bridge src directory not found at $BRIDGE_SRC/src (skipping)"
+    fi
     cp "$BRIDGE_SRC/package.json" "$STAGE_DIR/$BRIDGE_DIR/"
 
     if [[ -d "$BRIDGE_SRC/node_modules" ]]; then

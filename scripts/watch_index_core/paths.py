@@ -13,6 +13,8 @@ from scripts.workspace_state import (
 def is_internal_metadata_path(path: Path) -> bool:
     """Return True when path points into watcher/internal metadata trees."""
     try:
+        # Deliberately match internal segments anywhere in the path to prevent
+        # indexing of nested metadata mirrors (for example in replicated roots).
         if any(part in INTERNAL_STATE_TOP_LEVEL_DIRS for part in path.parts):
             return True
         global_state_dir = _get_global_state_dir()

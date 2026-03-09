@@ -519,8 +519,12 @@ class TestSymbolCachePaths:
         cache_path = ws_module._get_symbol_cache_path(str(file_path))
 
         assert cache_path.exists()
-        assert oct(cache_path.parent.stat().st_mode & 0o777) == "0o777"
-        assert oct(cache_path.stat().st_mode & 0o777) == "0o666"
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits are not stable on Windows")
+        dir_mode = cache_path.parent.stat().st_mode & 0o777
+        file_mode = cache_path.stat().st_mode & 0o777
+        assert dir_mode & 0o700 == 0o700
+        assert file_mode & 0o600 == 0o600
 
 
 class TestCollectionMappings:

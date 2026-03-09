@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import os
 import argparse
+import logging
 from pathlib import Path
 
 from scripts.ingest.config import (
     is_multi_repo_mode,
     get_collection_name,
 )
-from scripts import workspace_state as _ws
 from scripts.collection_health import clear_indexing_caches as _clear_indexing_caches_impl
 from scripts.ingest.pipeline import index_repo
 from scripts.ingest.pseudo import generate_pseudo_tags
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -196,8 +198,14 @@ def main():
     def _clear_indexing_caches(workspace_root: Path, repo_name: str | None) -> None:
         try:
             _clear_indexing_caches_impl(str(workspace_root), repo_name=repo_name)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Failed to clear indexing caches for workspace=%s repo=%s: %s",
+                workspace_root,
+                repo_name,
+                e,
+                exc_info=True,
+            )
 
     qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:6333")
     api_key = os.environ.get("QDRANT_API_KEY")

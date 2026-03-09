@@ -75,7 +75,7 @@ def test_process_bundle_background_tracks_completed_operations(monkeypatch, tmp_
             "failed": 0,
         },
     )
-    monkeypatch.setattr(srv, "log_activity", None)
+    monkeypatch.setattr(srv, "log_activity", lambda *a, **k: None)
 
     asyncio.run(
         srv._process_bundle_background(

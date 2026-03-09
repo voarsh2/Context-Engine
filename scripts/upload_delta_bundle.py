@@ -438,7 +438,16 @@ def plan_delta_upload(
 
         needs_content = False
         for slug, root in replica_roots.items():
-            target_path = _safe_join(root, sanitized)
+            try:
+                target_path = _safe_join(root, sanitized)
+            except ValueError:
+                logger.warning(
+                    "[upload_service] Invalid %s path during plan: %s (root=%s)",
+                    op_type,
+                    sanitized,
+                    root,
+                )
+                continue
             target_key = _normalize_cache_key_path(str(target_path))
             cached_hash = replica_cache_hashes.get(slug, {}).get(target_key)
             if cached_hash != op_content_hash:

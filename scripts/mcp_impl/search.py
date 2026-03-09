@@ -562,8 +562,21 @@ async def _repo_search_impl(
             try:
                 if not any(_re.search(path_regex, pv, flags=flags) for pv in norm_paths):
                     return False
-            except Exception:
-                pass
+            except _re.error as exc:
+                logger.warning(
+                    "Invalid path_regex filter '%s': %s",
+                    path_regex,
+                    exc,
+                )
+                return False
+            except Exception as exc:
+                logger.warning(
+                    "Failed evaluating path_regex filter '%s': %s",
+                    path_regex,
+                    exc,
+                    exc_info=True,
+                )
+                return False
 
         if path_globs_norm and not any(
             _match_glob(g, pv) for g in path_globs_norm for pv in norm_paths
@@ -706,7 +719,7 @@ async def _repo_search_impl(
         
         for item in items:
             path = item.get("path") or ""
-            if not _result_passes_path_filters({"path": path}):
+            if not _result_passes_path_filters(item):
                 continue
 
             payload = item.get("payload") or {}

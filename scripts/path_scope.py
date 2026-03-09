@@ -143,9 +143,19 @@ def _path_forms(path: Any, repo_hint: Any = None) -> Set[str]:
                     forms.add(tail)
 
     if repo:
+        def _cf_to_orig_idx(orig: str, cf_index: int) -> int:
+            if cf_index <= 0:
+                return 0
+            acc = 0
+            for i, ch in enumerate(orig):
+                nxt = acc + len(ch.casefold())
+                if nxt > cf_index:
+                    return i
+                acc = nxt
+            return len(orig)
+
         repo_cf = repo.casefold()
         repo_prefix_cf = repo_cf + "/"
-        marker = "/" + repo + "/"
         marker_cf = "/" + repo_cf + "/"
         for f in list(forms):
             f_cf = f.casefold()
@@ -153,7 +163,8 @@ def _path_forms(path: Any, repo_hint: Any = None) -> Set[str]:
                 forms.add(f[len(repo) + 1 :])
             idx = f_cf.find(marker_cf)
             if idx >= 0:
-                tail = f[idx + len(marker) :]
+                tail_start = _cf_to_orig_idx(f, idx + len(marker_cf))
+                tail = f[tail_start:]
                 if tail:
                     forms.add(tail)
 

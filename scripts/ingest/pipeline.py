@@ -1391,6 +1391,7 @@ def process_file_with_smart_reindexing(
                             pseudo,
                             tags,
                         )
+                        ch["_pseudo_applied"] = True
             except Exception as e:
                 print(f"[PSEUDO_BATCH] Smart reindex batch failed, falling back: {e}")
                 use_batch_pseudo = False
@@ -1419,7 +1420,7 @@ def process_file_with_smart_reindexing(
                             pseudo,
                             tags,
                         )
-                        cd["_pseudo_applied"] = True
+                        ch["_pseudo_applied"] = True
             except Exception:
                 pass
 

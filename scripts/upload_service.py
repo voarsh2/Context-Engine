@@ -1521,7 +1521,7 @@ async def get_status(workspace_path: str):
 
         last_upload = upload_result.get("completed_at")
         upload_status = str(upload_result.get("status") or "")
-        status = "processing" if upload_status == "processing" else "ready"
+        workspace_status = "processing" if upload_status == "processing" else "ready"
 
         return StatusResponse(
             workspace_path=workspace_path,
@@ -1529,7 +1529,7 @@ async def get_status(workspace_path: str):
             last_sequence=last_sequence,
             last_upload=last_upload,
             pending_operations=0,
-            status=status,
+            status=workspace_status,
             server_info={
                 "version": "1.0.0",
                 "max_bundle_size_mb": MAX_BUNDLE_SIZE_MB,
@@ -1652,7 +1652,12 @@ async def plan_delta(request: PlanRequest):
         )
 
         # Enforce collection write access for plan/apply when auth is enabled
-        if AUTH_ENABLED and CTXCE_MCP_ACL_ENFORCE and collection_name:
+        if AUTH_ENABLED and CTXCE_MCP_ACL_ENFORCE:
+            if not collection_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Collection resolution failed for ACL enforcement",
+                )
             uid = str((record or {}).get("user_id") or "").strip()
             if not uid:
                 raise HTTPException(
@@ -1757,7 +1762,12 @@ async def apply_delta_ops(request: ApplyOperationsRequest):
         )
 
         # Enforce collection write access for plan/apply when auth is enabled
-        if AUTH_ENABLED and CTXCE_MCP_ACL_ENFORCE and collection_name:
+        if AUTH_ENABLED and CTXCE_MCP_ACL_ENFORCE:
+            if not collection_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Collection resolution failed for ACL enforcement",
+                )
             uid = str((record or {}).get("user_id") or "").strip()
             if not uid:
                 raise HTTPException(
@@ -1819,7 +1829,8 @@ async def apply_delta_ops(request: ApplyOperationsRequest):
             + (operations_count or {}).get("moved", 0)
         )
         status_value = "completed" if failed_count == 0 else "failed"
-        _sequence_tracker[key] = sequence_number
+        if applied_count > 0:
+            _sequence_tracker[key] = sequence_number
         _upload_result_tracker[key] = {
             "workspace_path": workspace_path,
             "bundle_id": bundle_id,

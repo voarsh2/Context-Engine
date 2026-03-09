@@ -138,8 +138,14 @@ def ensure_graph_collection(client: Any, base_collection: str) -> Optional[str]:
                     field_name=field,
                     field_schema=qmodels.PayloadSchemaType.KEYWORD,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "Failed to create graph payload index '%s' for %s: %s",
+                    field,
+                    graph_coll,
+                    e,
+                    exc_info=True,
+                )
 
         _ENSURED_GRAPH_COLLECTIONS.add(graph_coll)
         _MISSING_GRAPH_COLLECTIONS.discard(graph_coll)
@@ -244,6 +250,7 @@ def delete_edges_by_path(
     caller_path: str,
     repo: str | None = None,
 ) -> int:
+    from qdrant_client.http.exceptions import UnexpectedResponse
     graph_coll = get_graph_collection_name(base_collection)
     if graph_coll in _MISSING_GRAPH_COLLECTIONS:
         return 0
@@ -264,15 +271,38 @@ def delete_edges_by_path(
             )
 
     try:
-        client.delete(
+        resp = client.delete(
             collection_name=graph_coll,
             points_selector=qmodels.FilterSelector(filter=qmodels.Filter(must=must)),
         )
-        return 1
-    except Exception as e:
-        err = str(e).lower()
-        if "404" in err or "doesn't exist" in err or "not found" in err:
+        result_status = getattr(getattr(resp, "result", None), "status", None)
+        if result_status is None:
+            result_status = getattr(resp, "status", None)
+        if result_status is None:
+            return 1
+        status_s = str(result_status).strip().lower()
+        return 1 if status_s in {"acknowledged", "completed", "ok", "success"} else 0
+    except UnexpectedResponse as e:
+        if getattr(e, "status_code", None) == 404:
             _MISSING_GRAPH_COLLECTIONS.add(graph_coll)
+            return 0
+        logger.debug(
+            "Graph edge delete failed for %s in %s (status=%s): %s",
+            norm_path,
+            graph_coll,
+            getattr(e, "status_code", None),
+            e,
+            exc_info=True,
+        )
+        return 0
+    except Exception as e:
+        logger.debug(
+            "Graph edge delete failed for %s in %s: %s",
+            norm_path,
+            graph_coll,
+            e,
+            exc_info=True,
+        )
         return 0
 
 

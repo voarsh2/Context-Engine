@@ -98,7 +98,6 @@ function createBridgeManager(deps) {
 
   function resolveBridgeCliInvocation() {
     const binPath = findLocalBridgeBin();
-    const mode = getBridgeMode();
     if (binPath) {
       // Use absolute Node runtime to avoid PATH dependency in extension hosts
       const bundledBin = findBundledBridgeBin();
