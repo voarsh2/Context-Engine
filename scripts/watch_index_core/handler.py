@@ -157,7 +157,31 @@ class IndexHandler(FileSystemEventHandler):
             dest = Path(event.dest_path).resolve()
         except Exception:
             return
-        if self._is_internal_metadata_path(src) or self._is_internal_metadata_path(dest):
+        # Handle internal-boundary moves properly
+        src_internal = self._is_internal_metadata_path(src)
+        dest_internal = self._is_internal_metadata_path(dest)
+        if src_internal and dest_internal:
+            # Both internal -> ignore
+            return
+        if dest_internal:
+            # External -> internal: delete source, don't index destination
+            if idx.is_indexable_file(src):
+                try:
+                    coll = self._resolve_collection(src)
+                    deleted = False
+                    if self.client is not None and coll is not None:
+                        idx.delete_points_by_path(self.client, coll, str(src))
+                        deleted = True
+                    if deleted:
+                        safe_print(f"[moved:external_to_internal] deleted {src}")
+                    self._invalidate_cache(src)
+                except Exception:
+                    pass
+            return
+        if src_internal:
+            # Internal -> external: index destination as new file
+            if idx.is_indexable_file(dest):
+                self._maybe_enqueue(str(dest))
             return
         if not idx.is_indexable_file(dest) and not idx.is_indexable_file(src):
             return
@@ -171,16 +195,13 @@ class IndexHandler(FileSystemEventHandler):
                 if idx.is_indexable_file(src):
                     try:
                         coll = self._resolve_collection(src)
+                        deleted = False
                         if self.client is not None and coll is not None:
                             idx.delete_points_by_path(self.client, coll, str(src))
-                        safe_print(f"[moved:ignored_dest_deleted_src] {src} -> {dest}")
-                        src_repo_path = _detect_repo_for_file(src)
-                        src_repo_name = _repo_name_or_none(src_repo_path)
-                        try:
-                            if src_repo_name:
-                                remove_cached_file(str(src), src_repo_name)
-                        except Exception:
-                            pass
+                            deleted = True
+                        if deleted:
+                            safe_print(f"[moved:ignored_dest_deleted_src] {src} -> {dest}")
+                        self._invalidate_cache(src)
                     except Exception:
                         pass
                 return

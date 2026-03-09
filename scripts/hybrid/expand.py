@@ -605,10 +605,11 @@ def expand_via_embeddings(
 
     # Search for soft matches (we want semantically similar docs, not exact matches)
     try:
+        initial_limit = 8 if not eff_under else max(32, int(max_terms) * 8)
         search_kwargs = {
             "collection_name": collection,
             "query_vector": (vec_name, query_vector) if vec_name else query_vector,
-            "limit": 8,  # Get top 8 neighbors
+            "limit": initial_limit,  # Over-fetch when `under` is set (we post-filter).
             "with_payload": True,
             "score_threshold": 0.3,  # Lower threshold to get more diverse results
         }

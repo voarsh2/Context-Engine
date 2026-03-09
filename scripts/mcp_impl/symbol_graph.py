@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 
 from scripts.path_scope import (
@@ -36,7 +37,36 @@ except Exception:
     _GRAPH_SUFFIX = "_graph"
 
 GRAPH_COLLECTION_SUFFIX = _GRAPH_SUFFIX
-_MISSING_GRAPH_COLLECTIONS: set[str] = set()
+# Time-based cache: collection -> expiry timestamp (5 minutes TTL)
+_MISSING_GRAPH_COLLECTIONS: dict[str, float] = {}
+_MISSING_GRAPH_TTL = 300  # 5 minutes
+
+
+def _clean_expired_missing_graphs() -> None:
+    """Remove expired entries from the missing graph cache."""
+    now = time.monotonic()
+    expired = [coll for coll, expiry in _MISSING_GRAPH_COLLECTIONS.items() if expiry <= now]
+    for coll in expired:
+        _MISSING_GRAPH_COLLECTIONS.pop(coll, None)
+
+
+def _is_graph_missing(collection: str) -> bool:
+    """Check if a graph collection is marked as missing (with expiration)."""
+    _clean_expired_missing_graphs()
+    if collection in _MISSING_GRAPH_COLLECTIONS:
+        return _MISSING_GRAPH_COLLECTIONS.get(collection, 0) > time.monotonic()
+    return False
+
+
+def _mark_graph_missing(collection: str) -> None:
+    """Mark a graph collection as missing (with TTL)."""
+    _MISSING_GRAPH_COLLECTIONS[collection] = time.monotonic() + _MISSING_GRAPH_TTL
+
+
+def _clear_graph_missing(collection: str) -> None:
+    """Remove a collection from the missing graph cache (e.g., after successful creation)."""
+    _MISSING_GRAPH_COLLECTIONS.pop(collection, None)
+
 
 __all__ = [
     "_symbol_graph_impl",
@@ -313,7 +343,7 @@ async def _query_graph_edges_collection(
     from qdrant_client import models as qmodels
 
     graph_coll = f"{collection}{GRAPH_COLLECTION_SUFFIX}"
-    if graph_coll in _MISSING_GRAPH_COLLECTIONS:
+    if _is_graph_missing(graph_coll):
         return []
 
     # Build graph filter
@@ -363,7 +393,7 @@ async def _query_graph_edges_collection(
         except Exception as e:
             err = str(e).lower()
             if "404" in err or "doesn't exist" in err or "not found" in err:
-                _MISSING_GRAPH_COLLECTIONS.add(graph_coll)
+                _mark_graph_missing(graph_coll)
                 return []
             logger.exception(
                 "_query_graph_edges_collection scroll failed for %s", graph_coll
@@ -770,6 +800,7 @@ async def _fallback_semantic_search(
             limit=limit,
             language=language,
             under=under,
+            collection=collection,
             session=session,
             output_format="json",  # Avoid TOON encoding for internal calls
         )

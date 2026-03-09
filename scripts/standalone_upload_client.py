@@ -1530,17 +1530,41 @@ class RemoteUploadClient:
     def _build_apply_only_payload(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Dict[str, Any]:
         payload = self._last_plan_payload or self._build_plan_payload(changes)
         needed = plan.get("needed_files", {}) if isinstance(plan, dict) else {}
+        created_needed = set(needed.get("created", []) or [])
+        updated_needed = set(needed.get("updated", []) or [])
         moved_needed = set(needed.get("moved", []) or [])
+
+        # Check if ALL operations are hash-matched (nothing needs content at all)
+        # This happens when all needed_files lists are empty and there are no actual changes requiring content
+        has_changes_needing_content = bool(created_needed or updated_needed or moved_needed)
+        has_deletes = bool(changes.get("deleted", []))
+
+        # Only skip apply-only if there are NO operations needing content AND NO deletes
+        if not has_changes_needing_content and not has_deletes:
+            return {
+                "manifest": payload.get("manifest", {}),
+                "operations": [],
+                "file_hashes": {},
+            }
+
         filtered_ops: List[Dict[str, Any]] = []
         filtered_hashes: Dict[str, str] = {}
         for operation in payload.get("operations", []):
             op_type = str(operation.get("operation") or "")
             rel_path = str(operation.get("path") or "")
-            if op_type == "deleted":
-                filtered_ops.append(operation)
+            # Determine if this operation needs content (only those skip filtered_hashes)
+            needs_content = (
+                (op_type == "created" and rel_path in created_needed)
+                or (op_type == "updated" and rel_path in updated_needed)
+                or (op_type == "moved" and rel_path in moved_needed)
+            )
+            if needs_content:
+                # Skip operations that need content - they'll be uploaded separately
                 continue
-            if op_type == "moved" and rel_path not in moved_needed:
-                filtered_ops.append(operation)
+            # Preserve all other operations so server advances state
+            filtered_ops.append(operation)
+            # Include hash for non-deleted operations
+            if op_type != "deleted":
                 hash_value = payload.get("file_hashes", {}).get(rel_path)
                 if hash_value:
                     filtered_hashes[rel_path] = hash_value
@@ -2079,6 +2103,7 @@ class RemoteUploadClient:
                 if not has_content_work:
                     apply_only_result = self._apply_operations_without_content(changes, plan)
                     if apply_only_result is True:
+                        flush_cached_file_hashes()
                         return True
                 if not self.has_meaningful_changes(planned_changes):
                     logger.info("[remote_upload] Plan found no upload work; skipping bundle upload")
@@ -2088,6 +2113,7 @@ class RemoteUploadClient:
                         plan_preview=preview,
                         needed_size_bytes=plan.get("needed_size_bytes", 0),
                     )
+                    flush_cached_file_hashes()
                     return True
 
             # Create delta bundle
@@ -2113,6 +2139,7 @@ class RemoteUploadClient:
                 response = self.upload_bundle(bundle_path, manifest)
 
                 if response.get("success", False):
+                    async_failed = False
                     processed_ops = response.get("processed_operations")
                     if processed_ops is None:
                         logger.info(
@@ -2139,10 +2166,18 @@ class RemoteUploadClient:
                                     async_result.get("processed_operations") or {},
                                 )
                             elif async_result["outcome"] == "failed":
-                                logger.warning(
+                                async_failed = True
+                                logger.error(
                                     "[remote_upload] Async processing failed for bundle %s: %s",
                                     manifest["bundle_id"],
                                     async_result.get("error"),
+                                )
+                                self._set_last_upload_result(
+                                    "failed",
+                                    stage="async_processing",
+                                    bundle_id=async_result.get("bundle_id") or manifest["bundle_id"],
+                                    sequence_number=async_result.get("sequence_number") or response.get("sequence_number"),
+                                    error=async_result.get("error"),
                                 )
                     else:
                         logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
@@ -2154,7 +2189,8 @@ class RemoteUploadClient:
                             sequence_number=response.get("sequence_number"),
                             processed_operations=processed_ops,
                         )
-                    flush_cached_file_hashes()
+                    if not async_failed:
+                        flush_cached_file_hashes()
 
                     # Clean up temporary bundle after successful upload
                     try:
@@ -2166,7 +2202,7 @@ class RemoteUploadClient:
                     except Exception as cleanup_error:
                         logger.warning(f"[remote_upload] Failed to cleanup bundle {bundle_path}: {cleanup_error}")
 
-                    return True
+                    return not async_failed
                 else:
                     error_msg = response.get('error', {}).get('message', 'Unknown upload error')
                     logger.error(f"[remote_upload] Upload failed: {error_msg}")
@@ -2252,6 +2288,8 @@ class RemoteUploadClient:
             def _process_pending_changes(self):
                 """Process accumulated changes after debounce period."""
                 with self._lock:
+                    # Timer fired; allow a new debounce to be armed while we process.
+                    self._debounce_timer = None
                     if self._processing:
                         return
                     if not self._pending_paths:
@@ -2308,6 +2346,12 @@ class RemoteUploadClient:
                 finally:
                     with self._lock:
                         self._processing = False
+                        if self._pending_paths and self._debounce_timer is None:
+                            self._debounce_timer = threading.Timer(
+                                self.debounce_seconds,
+                                self._process_pending_changes,
+                            )
+                            self._debounce_timer.start()
         
         observer = Observer()
         handler = CodeFileEventHandler(self, debounce_seconds=2.0)

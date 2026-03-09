@@ -502,11 +502,16 @@ def run_pure_dense_search(
     )
 
     try:
-        # Single dense query - no pooling, no re-scoring
-        ranked_points = dense_query(client, vec_name, vec_list, flt, limit, coll, query_text=query)
+        # Single dense query - no pooling, no re-scoring.
+        # When `under` is set, we post-filter by path metadata. Over-fetch so we
+        # can still return up to `limit` in-scope results.
+        eff_under = _normalize_under_scope(under)
+        fetch_limit = int(limit)
+        if eff_under:
+            fetch_limit = min(max(fetch_limit * 4, fetch_limit + 16), 2000)
+        ranked_points = dense_query(client, vec_name, vec_list, flt, fetch_limit, coll, query_text=query)
 
         # Build output
-        eff_under = _normalize_under_scope(under)
         results = []
         for p in ranked_points:
             payload = p.payload or {}
@@ -527,6 +532,8 @@ def run_pure_dense_search(
                 "doc_id": payload.get("code_id") or payload.get("_id") or "",
                 "payload": payload,
             })
+            if len(results) >= int(limit):
+                break
 
         return results
 

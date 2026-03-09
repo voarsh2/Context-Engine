@@ -242,9 +242,9 @@ def _is_index_eligible_path(path_str: str, workspace_root: Path, excluder) -> bo
     if is_internal_metadata_path(p):
         return False
 
-    # Keep git-history manifests indexable even when .remote-git is excluded.
-    if any(part == ".remote-git" for part in p.parts) and p.suffix.lower() == ".json":
-        return True
+    # .remote-git manifests are control files and must not be treated as indexable.
+    if _is_remote_git_manifest(p.as_posix()):
+        return False
 
     try:
         rel_dir = "/" + str(rel.parent).replace(os.sep, "/")
@@ -354,6 +354,15 @@ def _record_consistency_audit(
         pass
 
 
+def _is_remote_git_manifest(path: str) -> bool:
+    """Check if path is a .remote-git git history manifest file (control file, not indexable content)."""
+    try:
+        p = Path(path)
+        return any(part == ".remote-git" for part in p.parts) and p.suffix.lower() == ".json"
+    except Exception:
+        return False
+
+
 def _enqueue_consistency_repairs(
     workspace_root: Path,
     workspace_path: str,
@@ -377,6 +386,9 @@ def _enqueue_consistency_repairs(
     for path in stale_paths:
         if len(entries) >= max_ops:
             break
+        # Skip .remote-git git history manifests - they are control files, not indexable content
+        if _is_remote_git_manifest(path):
+            continue
         # Cache can lag after state resets/rebuilds; if the path still exists and is
         # index-eligible, treat it as missing/upsert instead of stale/delete.
         if _is_index_eligible_path(path, workspace_root, excluder):
@@ -387,6 +399,9 @@ def _enqueue_consistency_repairs(
     for path in sorted(missing_set):
         if len(entries) >= max_ops:
             break
+        # Skip .remote-git git history manifests - they are control files, not indexable content
+        if _is_remote_git_manifest(path):
+            continue
         entries.append(
             {
                 "path": path,

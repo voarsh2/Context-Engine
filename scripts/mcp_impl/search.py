@@ -603,6 +603,7 @@ async def _repo_search_impl(
     ):
         if ".git" not in not_globs:
             not_globs.append(".git")
+            not_globs_norm = [g if case_sensitive else g.lower() for g in not_globs]
 
     # Accept top-level alias `queries` as a drop-in for `query`
     # Many clients send queries=[...] instead of query=[...]
@@ -1616,6 +1617,9 @@ async def _repo_search_impl(
     try:
         _res_code = int((res or {}).get("code", 0))
     except Exception:
+        _res_code = 0
+    if results:
+        _res_ok = True
         _res_code = 0
 
     response = {

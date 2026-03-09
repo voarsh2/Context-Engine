@@ -140,7 +140,7 @@ def _run_git_history_ingest(
     repo_name: Optional[str],
     env_snapshot: Optional[Dict[str, str]] = None,
 ) -> None:
-    script = ROOT_DIR / "scripts" / "ingest_history.py"
+    script = watch_config.ROOT_DIR / "scripts" / "ingest_history.py"
     if not script.exists():
         logger.warning("[git_history_manifest] ingest script missing: %s", script)
         return
@@ -272,15 +272,38 @@ def _run_git_history_ingest(
         )
 
 
-def _on_git_history_done(manifest_key: str, future: Future) -> None:
+def _on_git_history_done(manifest_path: Path, collection: str, repo_name: Optional[str], future: Future) -> None:
+    manifest_key = _manifest_key(manifest_path)
     with _GIT_HISTORY_INFLIGHT_LOCK:
         _GIT_HISTORY_INFLIGHT.discard(manifest_key)
         remaining = len(_GIT_HISTORY_INFLIGHT)
     logger.info("[git_history_manifest] in-flight remaining=%d", remaining)
     try:
         future.result()
+        # Mark journal as done after successful completion
+        repo_path = _detect_repo_for_file(manifest_path)
+        if repo_path:
+            repo_key = str(repo_path)
+            _mark_journal_done(manifest_path, repo_key, repo_name)
+            logger.info("[git_history_manifest] marked journal as done: %s", manifest_path)
     except Exception as e:
-        logger.warning("[git_history_manifest] worker crashed for %s: %s", manifest_key, e)
+        repo_path = _detect_repo_for_file(manifest_path)
+        repo_key = str(repo_path) if repo_path else ""
+        if repo_key:
+            _mark_journal_failed(
+                manifest_path,
+                repo_key,
+                repo_name,
+                f"git history worker failed for collection '{collection}': {e}",
+            )
+        logger.warning(
+            "[git_history_manifest] worker crashed for %s (collection=%s, repo_key=%s): %s",
+            manifest_key,
+            collection,
+            repo_key or "<unknown>",
+            e,
+            exc_info=True,
+        )
 
 
 def _process_git_history_manifest(
@@ -318,7 +341,7 @@ def _process_git_history_manifest(
         repo_name,
         env_snapshot,
     )
-    future.add_done_callback(lambda fut, manifest_key=key: _on_git_history_done(manifest_key, fut))
+    future.add_done_callback(lambda fut, manifest_path=p, coll=collection, rn=repo_name: _on_git_history_done(manifest_path, coll, rn, fut))
 
 
 def _advance_progress(

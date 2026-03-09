@@ -2722,6 +2722,33 @@ def compare_symbol_changes(old_symbols: dict, new_symbols: dict) -> tuple[list, 
         if kind and name:
             remaining_old_by_name_kind.setdefault((kind, name), []).append(old_symbol_id)
 
+    def _consume_old_symbol(old_id: str, old_info: dict) -> None:
+        remaining_old_by_exact.pop(old_id, None)
+
+        old_kind = str(old_info.get("type") or "")
+        old_name = str(old_info.get("name") or "")
+        old_hash = str(old_info.get("content_hash") or "")
+
+        if old_kind and old_name and old_hash:
+            sig = (old_kind, old_name, old_hash)
+            sig_ids = remaining_old_by_signature.get(sig) or []
+            if old_id in sig_ids:
+                sig_ids.remove(old_id)
+                if sig_ids:
+                    remaining_old_by_signature[sig] = sig_ids
+                else:
+                    remaining_old_by_signature.pop(sig, None)
+
+        if old_kind and old_name:
+            nk = (old_kind, old_name)
+            nk_ids = remaining_old_by_name_kind.get(nk) or []
+            if old_id in nk_ids:
+                nk_ids.remove(old_id)
+                if nk_ids:
+                    remaining_old_by_name_kind[nk] = nk_ids
+                else:
+                    remaining_old_by_name_kind.pop(nk, None)
+
     for symbol_id, symbol_info in new_symbols.items():
         if symbol_id in old_symbols:
             old_info = old_symbols[symbol_id]
@@ -2730,7 +2757,7 @@ def compare_symbol_changes(old_symbols: dict, new_symbols: dict) -> tuple[list, 
                 unchanged.append(symbol_id)
             else:
                 changed.append(symbol_id)
-            remaining_old_by_exact.pop(symbol_id, None)
+            _consume_old_symbol(symbol_id, old_info)
             continue
 
         kind = str(symbol_info.get("type") or "")
@@ -2742,15 +2769,7 @@ def compare_symbol_changes(old_symbols: dict, new_symbols: dict) -> tuple[list, 
             old_id = matched_old_ids.pop(0)
             if not matched_old_ids:
                 remaining_old_by_signature.pop(signature, None)
-            remaining_old_by_exact.pop(old_id, None)
-            nk = (kind, name)
-            nk_ids = remaining_old_by_name_kind.get(nk) or []
-            if old_id in nk_ids:
-                nk_ids.remove(old_id)
-                if nk_ids:
-                    remaining_old_by_name_kind[nk] = nk_ids
-                else:
-                    remaining_old_by_name_kind.pop(nk, None)
+            _consume_old_symbol(old_id, old_symbols.get(old_id, {}))
             unchanged.append(symbol_id)
             continue
 

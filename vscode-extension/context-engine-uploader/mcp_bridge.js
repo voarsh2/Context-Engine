@@ -100,10 +100,15 @@ function createBridgeManager(deps) {
     const binPath = findLocalBridgeBin();
     const mode = getBridgeMode();
     if (binPath) {
+      // Use absolute Node runtime to avoid PATH dependency in extension hosts
+      const bundledBin = findBundledBridgeBin();
+      const resolvedKind = bundledBin && path.resolve(binPath) === path.resolve(bundledBin)
+        ? 'bundled'
+        : 'local';
       return {
-        command: 'node',
+        command: process.execPath,
         args: [binPath],
-        kind: mode === 'bundled' ? 'bundled' : 'local'
+        kind: resolvedKind
       };
     }
     const isWindows = process.platform === 'win32';

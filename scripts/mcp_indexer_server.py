@@ -1215,6 +1215,7 @@ async def repo_search_compat(**arguments) -> Dict[str, Any]:
             "not_": not_value,
             "case": args.get("case"),
             "compact": args.get("compact"),
+            "debug": args.get("debug"),
             "mode": args.get("mode"),
             "repo": args.get("repo"),  # Cross-codebase isolation
             "output_format": args.get("output_format"),  # "json" or "toon"

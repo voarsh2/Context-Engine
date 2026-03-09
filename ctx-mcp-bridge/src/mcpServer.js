@@ -115,39 +115,81 @@ async function listMemoryTools(client) {
   }
 }
 
-async function listResourcesSafe(client, label) {
-  if (!client) {
-    return [];
-  }
+function encodeCompositeCursor(cursorObj) {
   try {
-    const timeoutMs = getBridgeListTimeoutMs();
-    const remote = await withTimeout(
-      client.listResources(),
-      timeoutMs,
-      `${label} resources/list`,
-    );
-    return Array.isArray(remote?.resources) ? remote.resources.slice() : [];
-  } catch (err) {
-    debugLog(`[ctxce] Error calling ${label} resources/list: ` + String(err));
-    return [];
+    const payload = JSON.stringify(cursorObj || {});
+    return Buffer.from(payload, "utf8").toString("base64");
+  } catch {
+    return "";
   }
 }
 
-async function listResourceTemplatesSafe(client, label) {
+function decodeCompositeCursor(raw) {
+  try {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) {
+      return null;
+    }
+    const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+    const parsed = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function listResourcesSafe(client, label, cursor) {
   if (!client) {
-    return [];
+    return { resources: [], nextCursor: null };
   }
   try {
     const timeoutMs = getBridgeListTimeoutMs();
+    const params = cursor ? { cursor } : {};
     const remote = await withTimeout(
-      client.listResourceTemplates(),
+      client.listResources(params),
+      timeoutMs,
+      `${label} resources/list`,
+    );
+    return {
+      resources: Array.isArray(remote?.resources) ? remote.resources.slice() : [],
+      nextCursor:
+        remote && typeof remote.nextCursor === "string" && remote.nextCursor
+          ? remote.nextCursor
+          : null,
+    };
+  } catch (err) {
+    debugLog(`[ctxce] Error calling ${label} resources/list: ` + String(err));
+    return { resources: [], nextCursor: null };
+  }
+}
+
+async function listResourceTemplatesSafe(client, label, cursor) {
+  if (!client) {
+    return { resourceTemplates: [], nextCursor: null };
+  }
+  try {
+    const timeoutMs = getBridgeListTimeoutMs();
+    const params = cursor ? { cursor } : {};
+    const remote = await withTimeout(
+      client.listResourceTemplates(params),
       timeoutMs,
       `${label} resources/templates/list`,
     );
-    return Array.isArray(remote?.resourceTemplates) ? remote.resourceTemplates.slice() : [];
+    return {
+      resourceTemplates: Array.isArray(remote?.resourceTemplates)
+        ? remote.resourceTemplates.slice()
+        : [],
+      nextCursor:
+        remote && typeof remote.nextCursor === "string" && remote.nextCursor
+          ? remote.nextCursor
+          : null,
+    };
   } catch (err) {
     debugLog(`[ctxce] Error calling ${label} resources/templates/list: ` + String(err));
-    return [];
+    return { resourceTemplates: [], nextCursor: null };
   }
 }
 
@@ -666,7 +708,7 @@ async function createBridgeServer(options) {
 
   async function ensureRemoteDefaults(force = false) {
     defaultsPayload.session = sessionId;
-    if (!sessionId || Object.keys(defaultsPayload).length <= 1) {
+    if (!sessionId) {
       return;
     }
     if (!force && lastDefaultsSyncedSessionId === sessionId) {
@@ -692,6 +734,22 @@ async function createBridgeServer(options) {
       } catch {
         // ignore logging failures
       }
+      try {
+        if (indexerClient && typeof indexerClient.close === "function") {
+          await indexerClient.close();
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        if (memoryClient && typeof memoryClient.close === "function") {
+          await memoryClient.close();
+        }
+      } catch {
+        // ignore
+      }
+      indexerClient = null;
+      memoryClient = null;
     }
 
     let nextIndexerClient = null;
@@ -749,7 +807,19 @@ async function createBridgeServer(options) {
     await ensureRemoteDefaults(true);
   }
 
-  await initializeRemoteClients(false);
+  async function refreshSessionAndSyncDefaults() {
+    const freshSession = resolveSessionId() || sessionId;
+    const changed = Boolean(freshSession && freshSession !== sessionId);
+    if (changed) {
+      sessionId = freshSession;
+      defaultsPayload.session = sessionId;
+      lastDefaultsSyncedSessionId = "";
+    }
+    await initializeRemoteClients(false);
+    await ensureRemoteDefaults(changed);
+  }
+
+  await refreshSessionAndSyncDefaults();
 
   const server = new Server( // TODO: marked as depreciated
     {
@@ -769,7 +839,7 @@ async function createBridgeServer(options) {
     let remote;
     try {
       debugLog("[ctxce] tools/list: fetching tools from indexer");
-      await initializeRemoteClients(false);
+      await refreshSessionAndSyncDefaults();
       if (!indexerClient) {
         throw new Error("Indexer MCP client not initialized");
       }
@@ -803,28 +873,78 @@ async function createBridgeServer(options) {
     return { tools };
   });
 
-  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
     // Proxy resource discovery/read-through so clients that use MCP resources
     // (not only tools) can access upstream indexer/memory resources directly.
-    await initializeRemoteClients(false);
-    const indexerResources = await listResourcesSafe(indexerClient, "indexer");
-    const memoryResources = await listResourcesSafe(memoryClient, "memory");
-    const resources = dedupeResources([...indexerResources, ...memoryResources]);
+    await refreshSessionAndSyncDefaults();
+    const cursor =
+      request && request.params && typeof request.params.cursor === "string"
+        ? request.params.cursor
+        : null;
+    const decoded = decodeCompositeCursor(cursor);
+    const indexerCursor =
+      decoded && typeof decoded.i === "string" ? decoded.i : cursor;
+    const memoryCursor =
+      decoded && typeof decoded.m === "string" ? decoded.m : cursor;
+    if (cursor && decoded === null) {
+      debugLog("[ctxce] resources/list: received non-composite cursor; forwarding to both upstreams.");
+    }
+    const indexerRes = await listResourcesSafe(indexerClient, "indexer", indexerCursor);
+    const memoryRes = await listResourcesSafe(memoryClient, "memory", memoryCursor);
+    const resources = dedupeResources([
+      ...indexerRes.resources,
+      ...memoryRes.resources,
+    ]);
+    const nextCursorObj = {
+      i: indexerRes.nextCursor || "",
+      m: memoryRes.nextCursor || "",
+    };
+    const nextCursor =
+      nextCursorObj.i || nextCursorObj.m ? encodeCompositeCursor(nextCursorObj) : "";
     debugLog(`[ctxce] resources/list: returning ${resources.length} resources`);
-    return { resources };
+    return nextCursor ? { resources, nextCursor } : { resources };
   });
 
-  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-    await initializeRemoteClients(false);
-    const indexerTemplates = await listResourceTemplatesSafe(indexerClient, "indexer");
-    const memoryTemplates = await listResourceTemplatesSafe(memoryClient, "memory");
-    const resourceTemplates = dedupeResourceTemplates([...indexerTemplates, ...memoryTemplates]);
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async (request) => {
+    await refreshSessionAndSyncDefaults();
+    const cursor =
+      request && request.params && typeof request.params.cursor === "string"
+        ? request.params.cursor
+        : null;
+    const decoded = decodeCompositeCursor(cursor);
+    const indexerCursor =
+      decoded && typeof decoded.i === "string" ? decoded.i : cursor;
+    const memoryCursor =
+      decoded && typeof decoded.m === "string" ? decoded.m : cursor;
+    if (cursor && decoded === null) {
+      debugLog("[ctxce] resources/templates/list: received non-composite cursor; forwarding to both upstreams.");
+    }
+    const indexerRes = await listResourceTemplatesSafe(
+      indexerClient,
+      "indexer",
+      indexerCursor,
+    );
+    const memoryRes = await listResourceTemplatesSafe(
+      memoryClient,
+      "memory",
+      memoryCursor,
+    );
+    const resourceTemplates = dedupeResourceTemplates([
+      ...indexerRes.resourceTemplates,
+      ...memoryRes.resourceTemplates,
+    ]);
+    const nextCursorObj = {
+      i: indexerRes.nextCursor || "",
+      m: memoryRes.nextCursor || "",
+    };
+    const nextCursor =
+      nextCursorObj.i || nextCursorObj.m ? encodeCompositeCursor(nextCursorObj) : "";
     debugLog(`[ctxce] resources/templates/list: returning ${resourceTemplates.length} templates`);
-    return { resourceTemplates };
+    return nextCursor ? { resourceTemplates, nextCursor } : { resourceTemplates };
   });
 
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-    await initializeRemoteClients(false);
+    await refreshSessionAndSyncDefaults();
     const params = request.params || {};
     const timeoutMs = getBridgeToolTimeoutMs();
     const uri =
@@ -862,14 +982,7 @@ async function createBridgeServer(options) {
 
     debugLog(`[ctxce] tools/call: ${name || "<no-name>"}`);
 
-    // Check if session changed (e.g., after auth login), and re-send defaults if so.
-    const freshSession = resolveSessionId() || sessionId;
-    if (freshSession && freshSession !== sessionId) {
-      sessionId = freshSession;
-      defaultsPayload.session = sessionId;
-      await initializeRemoteClients(false);
-      await ensureRemoteDefaults(true);
-    }
+    await refreshSessionAndSyncDefaults();
 
     if (sessionId && (args === undefined || args === null || typeof args === "object")) {
       const obj = args && typeof args === "object" ? { ...args } : {};
@@ -892,9 +1005,6 @@ async function createBridgeServer(options) {
       }
       return indexerResult;
     }
-
-    await initializeRemoteClients(false);
-    await ensureRemoteDefaults(false);
 
     const timeoutMs = getBridgeToolTimeoutMs();
     const maxAttempts = getBridgeRetryAttempts();

@@ -97,6 +97,35 @@ def _load_replica_cache_hashes(workspace_root: Path, slug: str) -> Dict[str, str
     return merged
 
 
+def _flush_replica_cache_hashes(workspace_root: Path, slug: str, hashes: Dict[str, str]) -> None:
+    """Flush replica hashes to workspace cache.json."""
+    try:
+        cache_path = workspace_root / ".codebase" / "cache.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read existing cache to preserve other entries
+        existing_data = {}
+        if cache_path.exists():
+            try:
+                with cache_path.open("r", encoding="utf-8-sig") as f:
+                    existing_data = json.load(f)
+            except (OSError, ValueError, json.JSONDecodeError):
+                existing_data = {}
+
+        # Update file_hashes section
+        if not isinstance(existing_data, dict):
+            existing_data = {}
+        existing_data["file_hashes"] = hashes
+
+        # Write back atomically
+        temp_path = cache_path.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(existing_data, f, indent=2)
+        temp_path.replace(cache_path)
+    except Exception as e:
+        logger.debug(f"[upload_service] Failed to flush cache for {slug}: {e}")
+
+
 def get_workspace_key(workspace_path: str) -> str:
     """Generate 16-char hash for collision avoidance in remote uploads.
 
@@ -573,6 +602,10 @@ def apply_delta_operations(
                 slug=slug,
                 entries=journal_entries_by_slug.get(slug, []),
             )
+            # Flush updated replica hashes to disk
+            replica_hashes = replica_cache_hashes.get(slug, {})
+            if replica_hashes:
+                _flush_replica_cache_hashes(root, slug, replica_hashes)
 
         return operations_count
     except Exception as e:
@@ -868,6 +901,10 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                 slug=slug,
                 entries=journal_entries_by_slug.get(slug, []),
             )
+            # Flush updated replica hashes to disk
+            replica_hashes = replica_cache_hashes.get(slug, {})
+            if replica_hashes:
+                _flush_replica_cache_hashes(root, slug, replica_hashes)
 
         return operations_count
 

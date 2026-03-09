@@ -597,6 +597,14 @@ def ensure_payload_indexes(client: QdrantClient, collection: str):
             )
         except Exception:
             pass
+    try:
+        info = client.get_collection(collection)
+    except Exception:
+        return
+    if _missing_payload_indexes(info):
+        # Do not memoize; a later call should retry.
+        return
+    # Even if create_payload_index threw, get_collection confirms indexes exist.
     ENSURED_PAYLOAD_INDEX_COLLECTIONS.add(collection)
 
 
