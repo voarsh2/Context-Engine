@@ -442,7 +442,16 @@ async def search_cosqa_corpus(
         name = s.rsplit("/", 1)[-1]
         if name.endswith(".py"):
             name = name[: -3]
-        return name.strip() or None
+        name = name.strip()
+        if not name:
+            return None
+        # CoSQA synthetic filenames are often "<func_name>__<code_id>".
+        # Recover canonical code_id so relevance matching aligns with qrels.
+        if "__" in name:
+            tail = name.rsplit("__", 1)[-1].strip()
+            if tail.startswith("cosqa-"):
+                return tail
+        return name
 
     # Extract stable code_ids for evaluation.
     # NOTE: rerank paths may not include payload; for CoSQA we can fall back to parsing
@@ -915,8 +924,8 @@ async def run_full_benchmark(
         print(f"  Limited corpus to {len(corpus)} entries")
 
     if skip_index:
-        print("  [skip-index] Skipping indexing...")
-        result = {"reused": True, "indexed": len(corpus), "skipped": 0, "errors": 0}
+        print("  [skip-index] Skipping indexing (using existing collection as-is)...")
+        result = {"reused": False, "indexed": 0, "skipped": len(corpus), "errors": 0}
     else:
         # Check if already indexed (use fingerprint matching, not just points_count)
         # The indexer handles fingerprint checking internally and will recreate if needed
@@ -1017,6 +1026,12 @@ def main():
     parser.add_argument("--mode", type=str, default="hybrid", choices=["hybrid", "dense", "lexical"],
                         help="Search mode: 'hybrid' (default), 'dense' (pure semantic), or 'lexical' (pure BM25-style)")
     args = parser.parse_args()
+
+    # Benchmarks must not require MCP auth sessions.
+    # runner imports dotenv at module import time with override=True, so enforce this
+    # after args parsing to guarantee process-local benchmark behavior.
+    os.environ["CTXCE_AUTH_ENABLED"] = "0"
+    os.environ["CTXCE_MCP_ACL_ENFORCE"] = "0"
 
     # Enable Context-Engine features for accurate benchmarking.
     # Semantic expansion is always enabled (it may still be a no-op if query expansion is disabled).
