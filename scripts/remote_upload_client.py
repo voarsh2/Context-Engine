@@ -2219,6 +2219,7 @@ class RemoteUploadClient:
                     check_deletions = self._check_for_deletions
                     self._check_for_deletions = False
 
+                upload_succeeded = False
                 try:
                     # Only include cached paths when deletion-related events occurred
                     if check_deletions:
@@ -2245,6 +2246,7 @@ class RemoteUploadClient:
                         success = self.client.process_changes_and_upload(changes)
                         if success:
                             self.client.log_watch_upload_result()
+                            upload_succeeded = True
                         else:
                             logger.error("[watch] Failed to upload changes")
                     else:
@@ -2260,19 +2262,29 @@ class RemoteUploadClient:
                             success = self.client.upload_git_history_only(git_history)
                             if success:
                                 logger.info("[watch] Successfully uploaded git history metadata")
+                                upload_succeeded = True
                             else:
                                 logger.error("[watch] Failed to upload git history metadata")
+                        else:
+                            upload_succeeded = True  # No changes to process
                 except Exception as e:
                     logger.error(f"[watch] Error processing changes: {e}")
                 finally:
                     # Clear processing flag even if an error occurred
                     with self._lock:
                         self._processing = False
+                        # Re-queue pending paths if upload failed
+                        if not upload_succeeded and pending:
+                            # Merge pending paths back into _pending_paths
+                            for p in pending:
+                                self._pending_paths.add(p)
+                        # Arm next pass if there are pending paths
                         if self._pending_paths and self._debounce_timer is None:
                             self._debounce_timer = threading.Timer(
                                 self.debounce_seconds,
                                 self._process_pending_changes,
                             )
+                            self._debounce_timer.start()
                             self._debounce_timer.start()
 
         

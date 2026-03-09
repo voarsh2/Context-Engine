@@ -161,8 +161,13 @@ def _record_empty_dir_sweep(workspace_path: str, repo_name: Optional[str]) -> No
             repo_name=repo_name,
             updates={"maintenance": maintenance},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Failed to record empty dir sweep timestamp: %s (workspace=%s, repo=%s)",
+            exc,
+            workspace_path,
+            repo_name,
+        )
 
 
 def _load_cached_hashes(
@@ -282,6 +287,12 @@ def _scan_indexable_fs_paths(workspace_root: Path, *, max_paths: int) -> Tuple[S
             child = current / dirname
             if is_internal_metadata_path(child):
                 continue
+            try:
+                rel_dir = "/" + str(child.relative_to(workspace_root)).replace(os.sep, "/")
+                if excluder.exclude_dir(rel_dir):
+                    continue
+            except Exception:
+                pass
             pruned_dirnames.append(dirname)
         dirnames[:] = pruned_dirnames
 
@@ -350,8 +361,13 @@ def _record_consistency_audit(
             repo_name=repo_name,
             updates={"maintenance": maintenance},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Failed to record consistency audit: %s (workspace=%s, repo=%s)",
+            exc,
+            workspace_path,
+            repo_name,
+        )
 
 
 def _is_remote_git_manifest(path: str) -> bool:
