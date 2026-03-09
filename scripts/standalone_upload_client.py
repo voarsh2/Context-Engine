@@ -1618,16 +1618,25 @@ class RemoteUploadClient:
             if not body.get("success", False):
                 logger.warning("[remote_upload] apply_ops failed; falling back to bundle upload: %s", body.get("error"))
                 return None
-            self._finalize_successful_changes(changes)
+            # Only finalize changes that were actually processed by the server
+            # apply_delta_operations only handles deleted/moved operations
+            processed_ops = body.get("processed_operations") or {}
+            applied_changes = {
+                "deleted": changes.get("deleted", []),
+                "moved": changes.get("moved", []),
+                "created": [],
+                "updated": [],
+            }
+            self._finalize_successful_changes(applied_changes)
             self._set_last_upload_result(
                 "uploaded",
                 bundle_id=body.get("bundle_id"),
                 sequence_number=body.get("sequence_number"),
-                processed_operations=body.get("processed_operations"),
+                processed_operations=processed_ops,
             )
             logger.info(
                 "[remote_upload] Metadata-only operations applied: %s",
-                body.get("processed_operations") or {},
+                processed_ops,
             )
             return True
         except Exception as e:
@@ -2161,7 +2170,14 @@ class RemoteUploadClient:
                             manifest["bundle_id"],
                             response.get("sequence_number"),
                         )
-                        if async_result:
+                        if async_result is None:
+                            # Server didn't respond in time - treat as pending, not success
+                            async_failed = True
+                            logger.warning(
+                                "[remote_upload] Async upload timed out awaiting server response for bundle %s",
+                                manifest["bundle_id"],
+                            )
+                        else:
                             self.last_upload_result = async_result
                             if async_result["outcome"] == "uploaded_async":
                                 self._finalize_successful_changes(planned_changes)

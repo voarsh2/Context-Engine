@@ -104,12 +104,13 @@ def _should_run_consistency_audit(workspace_path: str, repo_name: Optional[str])
     return age >= interval
 
 
-def _sweep_empty_workspace_dirs(workspace_root: Path) -> None:
+def _sweep_empty_workspace_dirs(workspace_root: Path) -> bool:
+    """Sweep empty workspace directories and return True if fully successful."""
     protected_top_level = {".codebase", ".remote-git"}
     try:
         workspace_root = workspace_root.resolve()
     except Exception:
-        pass
+        return False
     try:
         for root, _dirnames, _filenames in os.walk(workspace_root, topdown=False):
             current = Path(root)
@@ -128,9 +129,11 @@ def _sweep_empty_workspace_dirs(workspace_root: Path) -> None:
                     continue
                 current.rmdir()
             except Exception:
-                continue
+                # If any directory operation fails, the sweep was not fully successful
+                return False
     except Exception:
-        pass
+        return False
+    return True
 
 
 def _should_run_empty_dir_sweep(workspace_path: str, repo_name: Optional[str]) -> bool:
@@ -153,9 +156,14 @@ def _should_run_empty_dir_sweep(workspace_path: str, repo_name: Optional[str]) -
 
 def _record_empty_dir_sweep(workspace_path: str, repo_name: Optional[str]) -> None:
     try:
+        # Read fresh state to get latest maintenance dict
         state = get_workspace_state(workspace_path=workspace_path, repo_name=repo_name) or {}
+        # Merge into existing maintenance dict rather than replacing it
         maintenance = dict(state.get("maintenance") or {})
         maintenance["last_empty_dir_sweep_at"] = datetime.now(timezone.utc).isoformat()
+        # Note: This is a best-effort update. Concurrent updates to other maintenance
+        # fields could be lost due to shallow merging in update_workspace_state.
+        # For production use, consider adding a deep-merge helper or locking at a higher level.
         update_workspace_state(
             workspace_path=workspace_path,
             repo_name=repo_name,
@@ -352,10 +360,15 @@ def _record_consistency_audit(
     summary: Dict[str, Any],
 ) -> None:
     try:
+        # Read fresh state to get latest maintenance dict
         state = get_workspace_state(workspace_path=workspace_path, repo_name=repo_name) or {}
+        # Merge into existing maintenance dict rather than replacing it
         maintenance = dict(state.get("maintenance") or {})
         maintenance["last_consistency_audit_at"] = datetime.now(timezone.utc).isoformat()
         maintenance["last_consistency_audit_summary"] = summary
+        # Note: This is a best-effort update. Concurrent updates to other maintenance
+        # fields could be lost due to shallow merging in update_workspace_state.
+        # For production use, consider adding a deep-merge helper or locking at a higher level.
         update_workspace_state(
             workspace_path=workspace_path,
             repo_name=repo_name,
@@ -429,9 +442,48 @@ def _enqueue_consistency_repairs(
 
     if not entries:
         return 0, 0
+
+    # Fetch existing journal entries to preserve retry state
+    existing_entries: Dict[str, Dict[str, Any]] = {}
+    try:
+        from scripts.workspace_state import list_pending_index_journal_entries
+        all_pending = list_pending_index_journal_entries(
+            workspace_path=workspace_path,
+            repo_name=repo_name,
+        )
+        for entry in all_pending or []:
+            path = str(entry.get("path") or "")
+            if path:
+                existing_entries[path] = entry
+    except Exception:
+        pass  # If we can't fetch existing entries, proceed without preserving state
+
+    # Merge existing retry state into new entries where appropriate
+    merged_entries = []
+    for entry in entries:
+        path = str(entry.get("path") or "")
+        existing = existing_entries.get(path)
+
+        # Skip if already pending/in-progress to avoid duplicate work
+        if existing and existing.get("status") in {"pending", "in_progress"}:
+            continue
+
+        # Preserve retry state from existing failed entries
+        if existing and existing.get("status") == "failed":
+            entry["attempts"] = existing.get("attempts", 0)
+            entry["last_error"] = existing.get("last_error")
+            # Keep created_at from existing entry to preserve original enqueue time
+            if existing.get("created_at"):
+                entry["created_at"] = existing["created_at"]
+
+        merged_entries.append(entry)
+
+    if not merged_entries:
+        return 0, 0
+
     try:
         upsert_index_journal_entries(
-            entries,
+            merged_entries,
             workspace_path=workspace_path,
             repo_name=repo_name,
         )
@@ -443,6 +495,10 @@ def _enqueue_consistency_repairs(
             exc,
         )
         return 0, 0
+
+    # Return counts based on actually enqueued entries
+    enqueued_stale = sum(1 for e in merged_entries if e.get("op_type") == "delete")
+    enqueued_missing = sum(1 for e in merged_entries if e.get("op_type") == "upsert")
     return enqueued_stale, enqueued_missing
 
 
@@ -559,8 +615,15 @@ def run_empty_dir_sweep_maintenance(root: Path) -> None:
             continue
         try:
             logger.info("[empty_dir_sweep] Sweeping empty directories under %s", workspace_path)
-            _sweep_empty_workspace_dirs(Path(workspace_path))
-            _record_empty_dir_sweep(workspace_path, repo_name)
+            sweep_success = _sweep_empty_workspace_dirs(Path(workspace_path))
+            if sweep_success:
+                _record_empty_dir_sweep(workspace_path, repo_name)
+            else:
+                logger.debug(
+                    "[empty_dir_sweep] sweep had failures workspace=%s repo=%s - not recording success",
+                    workspace_path,
+                    repo_name,
+                )
         except Exception as exc:
             logger.debug(
                 "[empty_dir_sweep] failed workspace=%s repo=%s: %s",
