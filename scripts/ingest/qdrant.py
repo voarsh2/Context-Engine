@@ -586,8 +586,18 @@ def ensure_payload_indexes(client: QdrantClient, collection: str):
     """Create helpful payload indexes if they don't exist (idempotent)."""
     if not collection:
         return
+
+    # On memo hit, verify collection still exists and indexes are present
     if collection in ENSURED_PAYLOAD_INDEX_COLLECTIONS:
-        return
+        try:
+            info = client.get_collection(collection)
+            if not _missing_payload_indexes(info):
+                # Memo is still valid
+                return
+        except Exception:
+            # Collection doesn't exist or error accessing it; remove from memo
+            ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard(collection)
+
     for field in PAYLOAD_INDEX_FIELDS:
         try:
             client.create_payload_index(

@@ -37,7 +37,7 @@ from scripts.workspace_state import (
 )
 from . import config as watch_config
 from .rename import _rename_in_store
-from .paths import is_internal_top_level_path
+from .paths import is_internal_metadata_path
 
 from .utils import (
     _detect_repo_for_file, 
@@ -60,7 +60,7 @@ class _SkipUnchanged(Exception):
 
 
 def _is_internal_ignored_path(path: Path) -> bool:
-    return is_internal_top_level_path(path, watch_config.ROOT)
+    return is_internal_metadata_path(path, watch_config.ROOT)
 
 
 def _staging_requires_subprocess(state: Optional[Dict[str, object]]) -> bool:

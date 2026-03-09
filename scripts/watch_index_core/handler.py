@@ -171,6 +171,15 @@ class IndexHandler(FileSystemEventHandler):
                     deleted = False
                     if self.client is not None and coll is not None:
                         idx.delete_points_by_path(self.client, coll, str(src))
+                        # Clean up graph edges for the moved file
+                        try:
+                            idx.delete_graph_edges_by_path(
+                                self.client,
+                                f"{coll}_graph",
+                                caller_path=str(src),
+                            )
+                        except Exception:
+                            pass  # Graph cleanup is best-effort
                         deleted = True
                     if deleted:
                         safe_print(f"[moved:external_to_internal] deleted {src}")
@@ -199,6 +208,15 @@ class IndexHandler(FileSystemEventHandler):
                         deleted = False
                         if self.client is not None and coll is not None:
                             idx.delete_points_by_path(self.client, coll, str(src))
+                            # Clean up graph edges for the moved file
+                            try:
+                                idx.delete_graph_edges_by_path(
+                                    self.client,
+                                    f"{coll}_graph",
+                                    caller_path=str(src),
+                                )
+                            except Exception:
+                                pass  # Graph cleanup is best-effort
                             deleted = True
                         if deleted:
                             safe_print(f"[moved:ignored_dest_deleted_src] {src} -> {dest}")

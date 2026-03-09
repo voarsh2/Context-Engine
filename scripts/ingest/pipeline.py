@@ -310,6 +310,15 @@ def index_single_file(
                 delete_points_by_path(client, collection, str(file_path))
             except Exception:
                 pass
+            # Clean up graph edges for excluded file
+            _sync_graph_edges_best_effort(
+                client,
+                collection,
+                str(file_path),
+                repo_tag,
+                None,  # No calls when file is excluded
+                None,  # No imports when file is excluded
+            )
             print(f"Skipping excluded file: {file_path}")
             return False
     except Exception:
@@ -986,6 +995,15 @@ def process_file_with_smart_reindexing(
                 _delete_points_fn(client, current_collection, str(p))
             except Exception:
                 pass
+            # Clean up graph edges for excluded file
+            _sync_graph_edges_best_effort(
+                client,
+                current_collection,
+                str(p),
+                repo_name_for_cache or _detect_repo_name_from_path(file_path),
+                None,  # No calls when file is excluded
+                None,  # No imports when file is excluded
+            )
             print(f"[SMART_REINDEX] Skipping excluded file: {file_path}")
             return "skipped"
     except Exception:

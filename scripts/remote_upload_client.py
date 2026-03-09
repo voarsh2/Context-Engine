@@ -2055,6 +2055,15 @@ class RemoteUploadClient:
                                     sequence_number=async_result.get("sequence_number") or response.get("sequence_number"),
                                     error=async_result.get("error"),
                                 )
+                        else:
+                            # async_result is None - treat as pending/failed
+                            # Don't finalize changes, keep bundle marked as queued
+                            logger.warning(
+                                "[remote_upload] Async upload result unavailable for bundle %s (sequence=%s) - treating as pending",
+                                manifest["bundle_id"],
+                                response.get("sequence_number"),
+                            )
+                            async_failed = True
                     else:
                         logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
                         logger.info(f"[remote_upload] Processed operations: {processed_ops}")
@@ -2225,7 +2234,8 @@ class RemoteUploadClient:
                     if check_deletions:
                         cached_file_hashes = _load_local_cache_file_hashes(
                             self.client.workspace_path,
-                            self.client.repo_name
+                            self.client.repo_name,
+                            metadata_root=self.client.metadata_root,
                         )
                         cached_paths = [Path(p) for p in cached_file_hashes.keys()]
                         all_paths = list(set(pending + cached_paths))
@@ -2335,7 +2345,11 @@ class RemoteUploadClient:
                         path_map[resolved] = p
 
                     # Include any paths that are only present in the local cache (deleted files)
-                    cached_file_hashes = _load_local_cache_file_hashes(self.workspace_path, self.repo_name)
+                    cached_file_hashes = _load_local_cache_file_hashes(
+                        self.workspace_path,
+                        self.repo_name,
+                        metadata_root=self.metadata_root,
+                    )
                     for cached_abs in cached_file_hashes.keys():
                         try:
                             cached_path = Path(cached_abs)

@@ -552,10 +552,27 @@ def _ingest_from_manifest(
             "[ingest_history] skipping prune for run_id=%s because the snapshot ingest was incomplete",
             run_id,
         )
-    try:
-        _cleanup_manifest_files(manifest_path)
-    except Exception as e:
-        logger.warning("[ingest_history] manifest cleanup failed for %s: %s", manifest_path, e)
+
+    # Only cleanup manifest if ingest completed successfully
+    ingest_complete = (
+        prepared_count > 0
+        and invalid_commit_records == 0
+        and embed_failures == 0
+        and point_build_failures == 0
+        and upsert_failures == 0
+        and persisted_count == prepared_count
+    )
+    if ingest_complete:
+        try:
+            _cleanup_manifest_files(manifest_path)
+        except Exception as e:
+            logger.warning("[ingest_history] manifest cleanup failed for %s: %s", manifest_path, e)
+    else:
+        logger.warning(
+            "[ingest_history] keeping manifest %s because ingest was incomplete",
+            manifest_path,
+        )
+
     logger.info(
         "Ingested commits from manifest %s into %s: persisted=%d prepared=%d invalid=%d "
         "embed_failures=%d point_failures=%d upsert_failures=%d",
@@ -568,7 +585,7 @@ def _ingest_from_manifest(
         point_build_failures,
         upsert_failures,
     )
-    return persisted_count
+    return persisted_count, ingest_complete
 
 
 def main():
@@ -621,7 +638,7 @@ def main():
     client = QdrantClient(url=QDRANT_URL, api_key=API_KEY or None)
 
     if args.manifest_json:
-        _ingest_from_manifest(
+        persisted_count, ingest_complete = _ingest_from_manifest(
             args.manifest_json,
             model,
             client,
@@ -629,6 +646,8 @@ def main():
             args.include_body,
             args.per_batch,
         )
+        if not ingest_complete:
+            raise SystemExit(1)
         return
 
     commits = list_commits(args)
@@ -637,6 +656,8 @@ def main():
         return
 
     points: List[models.PointStruct] = []
+    persisted_count = 0
+    upsert_failures = 0
     for sha in commits:
         md = commit_metadata(sha)
         text = build_text(md, include_body=args.include_body)
@@ -686,7 +707,9 @@ def main():
             batch_size = len(points)
             try:
                 client.upsert(collection_name=COLLECTION, points=points)
+                persisted_count += batch_size
             except Exception as e:
+                upsert_failures += batch_size
                 logger.error(
                     "[ingest_history] batch upsert failed collection=%s repo=%s size=%d path=%s: %s",
                     COLLECTION,
@@ -701,7 +724,9 @@ def main():
         final_size = len(points)
         try:
             client.upsert(collection_name=COLLECTION, points=points)
+            persisted_count += final_size
         except Exception as e:
+            upsert_failures += final_size
             logger.error(
                 "[ingest_history] final upsert failed collection=%s repo=%s size=%d path=%s: %s",
                 COLLECTION,
@@ -710,7 +735,9 @@ def main():
                 args.path or "",
                 e,
             )
-    print(f"Ingested {len(commits)} commits into {COLLECTION}.")
+    if upsert_failures:
+        raise SystemExit(1)
+    print(f"Ingested {persisted_count} commits into {COLLECTION}.")
 
 
 if __name__ == "__main__":
