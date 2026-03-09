@@ -60,7 +60,7 @@ class _SkipUnchanged(Exception):
 
 
 def _is_internal_ignored_path(path: Path) -> bool:
-    return is_internal_metadata_path(path, watch_config.ROOT)
+    return is_internal_metadata_path(path)
 
 
 def _staging_requires_subprocess(state: Optional[Dict[str, object]]) -> bool:

@@ -2018,6 +2018,7 @@ class RemoteUploadClient:
 
                 if response.get("success", False):
                     async_failed = False
+                    async_pending = False
                     processed_ops = response.get("processed_operations")
                     if processed_ops is None:
                         logger.info(
@@ -2035,22 +2036,23 @@ class RemoteUploadClient:
                             response.get("sequence_number"),
                         )
                         if async_result is None:
-                            # Server didn't respond in time - treat as pending, not success
-                            async_failed = True
+                            # Server accepted the bundle but status is still pending.
+                            async_pending = True
                             logger.warning(
                                 "[remote_upload] Async upload timed out awaiting server response for bundle %s",
                                 manifest["bundle_id"],
                             )
                         else:
                             self.last_upload_result = async_result
-                            if async_result["outcome"] == "uploaded_async":
+                            outcome = str(async_result.get("outcome") or "")
+                            if outcome == "uploaded_async":
                                 self._finalize_successful_changes(planned_changes)
                                 logger.info(
                                     "[remote_upload] Async processing completed for bundle %s: %s",
                                     manifest["bundle_id"],
                                     async_result.get("processed_operations") or {},
                                 )
-                            elif async_result["outcome"] == "failed":
+                            elif outcome == "failed":
                                 async_failed = True
                                 logger.error(
                                     "[remote_upload] Async processing failed for bundle %s: %s",
@@ -2064,15 +2066,20 @@ class RemoteUploadClient:
                                     sequence_number=async_result.get("sequence_number") or response.get("sequence_number"),
                                     error=async_result.get("error"),
                                 )
-                        else:
-                            # async_result is None - treat as pending/failed
-                            # Don't finalize changes, keep bundle marked as queued
-                            logger.warning(
-                                "[remote_upload] Async upload result unavailable for bundle %s (sequence=%s) - treating as pending",
-                                manifest["bundle_id"],
-                                response.get("sequence_number"),
-                            )
-                            async_failed = True
+                            else:
+                                async_pending = True
+                                # Keep queued state for non-terminal async outcomes.
+                                self._set_last_upload_result(
+                                    "queued",
+                                    bundle_id=async_result.get("bundle_id") or manifest["bundle_id"],
+                                    sequence_number=async_result.get("sequence_number") or response.get("sequence_number"),
+                                )
+                                logger.warning(
+                                    "[remote_upload] Async upload still pending for bundle %s (sequence=%s, outcome=%s)",
+                                    manifest["bundle_id"],
+                                    response.get("sequence_number"),
+                                    outcome or "<unknown>",
+                                )
                     else:
                         logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
                         logger.info(f"[remote_upload] Processed operations: {processed_ops}")
@@ -2082,6 +2089,11 @@ class RemoteUploadClient:
                             bundle_id=manifest["bundle_id"],
                             sequence_number=response.get("sequence_number"),
                             processed_operations=processed_ops,
+                        )
+                    if async_pending:
+                        logger.info(
+                            "[remote_upload] Bundle %s accepted and queued; deferring local finalization",
+                            manifest["bundle_id"],
                         )
 
                     # Clean up temporary bundle after successful upload
