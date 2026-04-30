@@ -72,21 +72,19 @@ def _format_pattern_results_as_toon(
     response: Dict[str, Any],
     compact: bool = False,
 ) -> Dict[str, Any]:
-    """Convert pattern search response to TOON format.
+    """Add a TOON render while preserving structured pattern results.
 
     Args:
         response: Pattern search response dict with 'results' key
         compact: If True, use minimal fields only
 
     Returns:
-        Modified response with TOON-encoded results
+        Modified response with TOON-encoded text
     """
     try:
         results = response.get("results", [])
         if isinstance(results, list):
-            # Encode results to TOON format
-            toon_results = encode_pattern_results(results, compact=compact)
-            response["results"] = toon_results
+            response["text"] = encode_pattern_results(results, compact=compact)
         response["output_format"] = "toon"
         return response
     except Exception as e:

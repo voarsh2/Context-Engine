@@ -51,9 +51,9 @@ def _should_use_toon(output_format: Any) -> bool:
 # TOON response formatting
 # ---------------------------------------------------------------------------
 def _format_results_as_toon(response: Dict[str, Any], compact: bool = False) -> Dict[str, Any]:
-    """Convert response to use TOON-formatted results string instead of JSON array.
+    """Add a TOON-formatted render while preserving structured results.
 
-    Replaces 'results' array with 'results' string in TOON format to save tokens.
+    Keeps 'results' as JSON-compatible structured data for machine callers.
     Always adds output_format marker when TOON is requested, even for empty results.
     
     Args:
@@ -61,16 +61,14 @@ def _format_results_as_toon(response: Dict[str, Any], compact: bool = False) -> 
         compact: If True, use more compact TOON encoding
         
     Returns:
-        Modified response with TOON-encoded results
+        Modified response with TOON-encoded text
     """
     try:
         from scripts.toon_encoder import encode_search_results
 
         results = response.get("results", [])
         if isinstance(results, list):
-            # Replace JSON array with TOON string (handles empty arrays too)
-            toon_results = encode_search_results(results, compact=compact)
-            response["results"] = toon_results
+            response["text"] = encode_search_results(results, compact=compact)
         response["output_format"] = "toon"
 
         return response
@@ -83,25 +81,25 @@ def _format_results_as_toon(response: Dict[str, Any], compact: bool = False) -> 
 
 
 def _format_context_results_as_toon(response: Dict[str, Any], compact: bool = False) -> Dict[str, Any]:
-    """Convert context_search response to TOON format, handling mixed code/memory results.
+    """Add a TOON render for context_search mixed code/memory results.
 
     Uses encode_context_results which properly handles memory entries (content/score)
     vs code entries (path/line), avoiding blank rows or dropped content.
+    Keeps 'results' as JSON-compatible structured data for machine callers.
     
     Args:
         response: Context search response dict with 'results' key
         compact: If True, use more compact TOON encoding
         
     Returns:
-        Modified response with TOON-encoded results
+        Modified response with TOON-encoded text
     """
     try:
         from scripts.toon_encoder import encode_context_results
 
         results = response.get("results", [])
         if isinstance(results, list):
-            toon_results = encode_context_results(results, compact=compact)
-            response["results"] = toon_results
+            response["text"] = encode_context_results(results, compact=compact)
         response["output_format"] = "toon"
 
         return response
@@ -111,4 +109,3 @@ def _format_context_results_as_toon(response: Dict[str, Any], compact: bool = Fa
     except Exception as e:
         logger.debug(f"TOON encoding failed: {e}")
         return response
-

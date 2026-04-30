@@ -808,7 +808,7 @@ async def _fallback_semantic_search(
         # Handle case where results might be TOON-encoded string (shouldn't happen with output_format="json")
         results = search_result.get("results", [])
         if isinstance(results, str):
-            # If somehow still a string, return empty - TOON decoding is not worth it here
+            # Internal callers require structured rows; skip malformed text-only responses.
             logger.debug("Fallback search returned TOON-encoded results, skipping")
             return []
         return results

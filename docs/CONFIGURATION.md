@@ -513,7 +513,9 @@ Set `FNAME_BOOST=0` to disable, or increase (e.g., `0.25`) for stronger path wei
 
 ### TOON (Token-Oriented Object Notation)
 
-Compact output format that reduces token usage by 40-60%.
+Compact display format for search results. In practice this is usually about
+20-25% smaller than compact JSON for search-shaped payloads, with larger savings
+only when comparing against pretty-printed JSON.
 
 | Name | Description | Default |
 |------|-------------|---------|
