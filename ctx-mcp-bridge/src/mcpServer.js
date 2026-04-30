@@ -102,17 +102,38 @@ function dedupeResourceTemplates(templates) {
   return out;
 }
 
-async function listMemoryTools(client) {
-  if (!client) {
+async function callListWithSessionRecovery(call, label, onSessionError) {
+  try {
+    return await withTransientRetry(call, label);
+  } catch (err) {
+    if (isSessionError(err) && typeof onSessionError === "function") {
+      try {
+        await onSessionError();
+        return await withTransientRetry(call, `${label} (retry)`);
+      } catch (retryErr) {
+        debugLog(`[ctxce] ${label} failed after MCP session recovery: ` + String(retryErr));
+      }
+    }
+    throw err;
+  }
+}
+
+async function listMemoryTools(getClient, onSessionError) {
+  if (typeof getClient !== "function" || !getClient()) {
     return [];
   }
   try {
-    const remote = await withTransientRetry(
+    const remote = await callListWithSessionRecovery(
       () => {
+        const client = getClient();
+        if (!client) {
+          throw new Error("Memory MCP client not initialized");
+        }
         const timeoutMs = getBridgeListTimeoutMs();
         return withTimeout(client.listTools(), timeoutMs, "memory tools/list");
       },
       "memory tools/list",
+      onSessionError,
     );
     return Array.isArray(remote?.tools) ? remote.tools.slice() : [];
   } catch (err) {
@@ -147,14 +168,18 @@ function decodeCompositeCursor(raw) {
   }
 }
 
-async function listResourcesSafe(client, label, cursor) {
-  if (!client) {
+async function listResourcesSafe(getClient, label, cursor, onSessionError) {
+  if (typeof getClient !== "function" || !getClient()) {
     return { resources: [], nextCursor: null };
   }
   try {
     const params = cursor ? { cursor } : {};
-    const remote = await withTransientRetry(
+    const remote = await callListWithSessionRecovery(
       () => {
+        const client = getClient();
+        if (!client) {
+          throw new Error(`${label} MCP client not initialized`);
+        }
         const timeoutMs = getBridgeListTimeoutMs();
         return withTimeout(
           client.listResources(params),
@@ -163,6 +188,7 @@ async function listResourcesSafe(client, label, cursor) {
         );
       },
       `${label} resources/list`,
+      onSessionError,
     );
     return {
       resources: Array.isArray(remote?.resources) ? remote.resources.slice() : [],
@@ -177,14 +203,18 @@ async function listResourcesSafe(client, label, cursor) {
   }
 }
 
-async function listResourceTemplatesSafe(client, label, cursor) {
-  if (!client) {
+async function listResourceTemplatesSafe(getClient, label, cursor, onSessionError) {
+  if (typeof getClient !== "function" || !getClient()) {
     return { resourceTemplates: [], nextCursor: null };
   }
   try {
     const params = cursor ? { cursor } : {};
-    const remote = await withTransientRetry(
+    const remote = await callListWithSessionRecovery(
       () => {
+        const client = getClient();
+        if (!client) {
+          throw new Error(`${label} MCP client not initialized`);
+        }
         const timeoutMs = getBridgeListTimeoutMs();
         return withTimeout(
           client.listResourceTemplates(params),
@@ -193,6 +223,7 @@ async function listResourceTemplatesSafe(client, label, cursor) {
         );
       },
       `${label} resources/templates/list`,
+      onSessionError,
     );
     return {
       resourceTemplates: Array.isArray(remote?.resourceTemplates)
@@ -301,6 +332,7 @@ function isSessionError(error) {
       msg.includes("No valid session ID") ||
       msg.includes("Mcp-Session-Id header is required") ||
       msg.includes("Server not initialized") ||
+      msg.includes("Received request before initialization was complete") ||
       msg.includes("Session not found")
     );
   } catch {
@@ -863,6 +895,18 @@ async function createBridgeServer(options) {
     await ensureRemoteDefaults(changed);
   }
 
+  async function recoverRemoteClientsAfterSessionError() {
+    const freshSession = resolveSessionId() || sessionId;
+    const changed = Boolean(freshSession && freshSession !== sessionId);
+    if (changed) {
+      sessionId = freshSession;
+      defaultsPayload.session = sessionId;
+      lastDefaultsSyncedSessionId = "";
+    }
+    await initializeRemoteClients(true);
+    await ensureRemoteDefaults(true);
+  }
+
   await refreshSessionAndSyncDefaults();
 
   const server = new Server( // TODO: marked as depreciated
@@ -881,16 +925,16 @@ async function createBridgeServer(options) {
   // tools/list → fetch tools from remote indexer
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     let remote;
+    let listError = null;
     try {
       await initializeRemoteClients(false);
       await ensureRemoteDefaults(false);
-      if (!indexerClient) {
-        throw new Error("Indexer MCP client not initialized");
-      }
-
       debugLog("[ctxce] tools/list: fetching tools from indexer");
-      remote = await withTransientRetry(
+      remote = await callListWithSessionRecovery(
         () => {
+          if (!indexerClient) {
+            throw new Error("Indexer MCP client not initialized");
+          }
           const timeoutMs = getBridgeListTimeoutMs();
           return withTimeout(
             indexerClient.listTools(),
@@ -899,10 +943,18 @@ async function createBridgeServer(options) {
           );
         },
         "indexer tools/list",
+        recoverRemoteClientsAfterSessionError,
       );
     } catch (err) {
-      debugLog("[ctxce] Error calling remote tools/list: " + String(err));
-      const memoryToolsFallback = await listMemoryTools(memoryClient);
+      listError = err;
+    }
+
+    if (!remote) {
+      debugLog("[ctxce] Error calling remote tools/list: " + String(listError));
+      const memoryToolsFallback = await listMemoryTools(
+        () => memoryClient,
+        recoverRemoteClientsAfterSessionError,
+      );
       const toolsFallback = dedupeTools([...memoryToolsFallback]);
       return { tools: toolsFallback };
     }
@@ -918,7 +970,10 @@ async function createBridgeServer(options) {
     }
 
     const indexerTools = Array.isArray(remote?.tools) ? remote.tools.slice() : [];
-    const memoryTools = await listMemoryTools(memoryClient);
+    const memoryTools = await listMemoryTools(
+      () => memoryClient,
+      recoverRemoteClientsAfterSessionError,
+    );
     const tools = dedupeTools([...indexerTools, ...memoryTools]);
     debugLog(`[ctxce] tools/list: returning ${tools.length} tools`);
     return { tools };
@@ -941,8 +996,18 @@ async function createBridgeServer(options) {
     if (cursor && decoded === null) {
       debugLog("[ctxce] resources/list: received non-composite cursor; forwarding to both upstreams.");
     }
-    const indexerRes = await listResourcesSafe(indexerClient, "indexer", indexerCursor);
-    const memoryRes = await listResourcesSafe(memoryClient, "memory", memoryCursor);
+    const indexerRes = await listResourcesSafe(
+      () => indexerClient,
+      "indexer",
+      indexerCursor,
+      recoverRemoteClientsAfterSessionError,
+    );
+    const memoryRes = await listResourcesSafe(
+      () => memoryClient,
+      "memory",
+      memoryCursor,
+      recoverRemoteClientsAfterSessionError,
+    );
     const resources = dedupeResources([
       ...indexerRes.resources,
       ...memoryRes.resources,
@@ -973,14 +1038,16 @@ async function createBridgeServer(options) {
       debugLog("[ctxce] resources/templates/list: received non-composite cursor; forwarding to both upstreams.");
     }
     const indexerRes = await listResourceTemplatesSafe(
-      indexerClient,
+      () => indexerClient,
       "indexer",
       indexerCursor,
+      recoverRemoteClientsAfterSessionError,
     );
     const memoryRes = await listResourceTemplatesSafe(
-      memoryClient,
+      () => memoryClient,
       "memory",
       memoryCursor,
+      recoverRemoteClientsAfterSessionError,
     );
     const resourceTemplates = dedupeResourceTemplates([
       ...indexerRes.resourceTemplates,
