@@ -147,6 +147,16 @@ def main() -> None:
         f"Watch mode: root={ROOT} qdrant={QDRANT_URL} collection={default_collection} model={MODEL}"
     )
 
+    # Guardrail: deferring pseudo to a worker only makes sense if the worker is enabled.
+    # Otherwise you'd silently disable pseudo generation (old behavior).
+    pseudo_defer = get_boolean_env("PSEUDO_DEFER_TO_WORKER")
+    pseudo_backfill_enabled = get_boolean_env("PSEUDO_BACKFILL_ENABLED")
+    if pseudo_defer and not pseudo_backfill_enabled:
+        print(
+            "[pseudo] Warning: PSEUDO_DEFER_TO_WORKER=1 but PSEUDO_BACKFILL_ENABLED=0; "
+            "inline pseudo will remain enabled (no deferral)."
+        )
+
     # Health check: detect and auto-heal cache/collection sync issues.
     # In multi-repo mode this can be expensive and may duplicate external init checks,
     # so default it OFF unless explicitly enabled.
@@ -219,7 +229,16 @@ def main() -> None:
         except Exception:
             pass
 
-        _start_pseudo_backfill_worker(client, default_collection, model_dim, vector_name)
+    # Start backfill worker even in multi-repo mode; it uses workspace mappings and
+    # will no-op if disabled. Only allow a single-repo fallback to the default
+    # collection when startup was explicitly permitted to touch that collection.
+    _start_pseudo_backfill_worker(
+        client,
+        default_collection,
+        model_dim,
+        vector_name,
+        allow_default_collection_fallback=ensure_default_collection,
+    )
 
     try:
         initialize_watcher_state(str(ROOT), multi_repo_enabled, default_collection)

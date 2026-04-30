@@ -26,6 +26,8 @@ def _start_pseudo_backfill_worker(
     default_collection: str,
     model_dim: int,
     vector_name: str,
+    *,
+    allow_default_collection_fallback: bool = True,
 ) -> Optional[threading.Event]:
     """Start a daemon thread that periodically backfills pseudo/tags.
     
@@ -33,7 +35,12 @@ def _start_pseudo_backfill_worker(
     or None if the worker was not started (disabled via env).
     """
     
-    if not get_boolean_env("PSEUDO_DEFER_TO_WORKER"):
+    # This worker is controlled by PSEUDO_BACKFILL_ENABLED (pseudo/tags) and/or
+    # GRAPH_EDGES_BACKFILL (graph edges). PSEUDO_DEFER_TO_WORKER only controls
+    # whether the foreground index path generates pseudo inline.
+    pseudo_backfill_enabled = get_boolean_env("PSEUDO_BACKFILL_ENABLED")
+    graph_backfill_enabled = get_boolean_env("GRAPH_EDGES_BACKFILL")
+    if not (pseudo_backfill_enabled or graph_backfill_enabled):
         return None
 
     try:
@@ -62,15 +69,22 @@ def _start_pseudo_backfill_worker(
     def _worker() -> None:
         while not shutdown_event.is_set():
             try:
-                graph_backfill_enabled = get_boolean_env("GRAPH_EDGES_BACKFILL")
+                pseudo_backfill_on = get_boolean_env("PSEUDO_BACKFILL_ENABLED")
+                graph_backfill_on = get_boolean_env("GRAPH_EDGES_BACKFILL")
                 try:
                     mappings = get_collection_mappings(search_root=str(watch_config.ROOT))
                 except Exception:
                     mappings = []
                 if not mappings:
-                    mappings = [
-                        {"repo_name": None, "collection_name": default_collection},
-                    ]
+                    # Do not fall back to the default collection unless startup explicitly
+                    # allowed the watcher to touch it. This keeps background backfill from
+                    # recreating collections that the caller intentionally left alone.
+                    if is_multi_repo_mode() or not allow_default_collection_fallback:
+                        mappings = []
+                    else:
+                        mappings = [
+                            {"repo_name": None, "collection_name": default_collection},
+                        ]
                 for mapping in mappings:
                     if shutdown_event.is_set():
                         break
@@ -85,23 +99,26 @@ def _start_pseudo_backfill_worker(
                             state_dir = _get_global_state_dir(str(watch_config.ROOT))
                         lock_path = state_dir / "pseudo.lock"
                         with _cross_process_lock(lock_path):
-                            processed = idx.pseudo_backfill_tick(
-                                client,
-                                coll,
-                                repo_name=repo_name,
-                                max_points=max_points,
-                                dim=model_dim,
-                                vector_name=vector_name,
-                            )
-                            if processed:
-                                logger.info(
-                                    "[pseudo_backfill] repo=%s collection=%s processed=%d",
-                                    repo_name or "default", coll, processed,
+                            if pseudo_backfill_on:
+                                processed = idx.pseudo_backfill_tick(
+                                    client,
+                                    coll,
+                                    repo_name=repo_name,
+                                    max_points=max_points,
+                                    dim=model_dim,
+                                    vector_name=vector_name,
                                 )
+                                if processed:
+                                    logger.info(
+                                        "[pseudo_backfill] repo=%s collection=%s processed=%d",
+                                        repo_name or "default",
+                                        coll,
+                                        processed,
+                                    )
                         # Optional: backfill graph edge collection from main points.
                         # Controlled separately because it may scan large collections over time.
                         # Run under its own lock to avoid blocking pseudo/tag backfill workers.
-                        if graph_backfill_enabled:
+                        if graph_backfill_on:
                             try:
                                 graph_lock_path = state_dir / "graph_edges.lock"
                                 with _cross_process_lock(graph_lock_path):

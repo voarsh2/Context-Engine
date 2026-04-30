@@ -235,6 +235,7 @@ def test_processor_delete_marks_journal_done(monkeypatch, tmp_path):
     monkeypatch.setattr(proc_mod.idx, "delete_points_by_path", delete_mock)
     monkeypatch.setattr(proc_mod.idx, "delete_graph_edges_by_path", graph_delete_mock)
     monkeypatch.setattr(proc_mod, "_verify_delete_committed", lambda *a, **k: True)
+    monkeypatch.setattr(proc_mod, "_verify_graph_delete_committed", lambda *a, **k: True)
     monkeypatch.setattr(proc_mod, "update_index_journal_entry_status", journal_mock)
 
     proc_mod._process_paths(
@@ -247,7 +248,9 @@ def test_processor_delete_marks_journal_done(monkeypatch, tmp_path):
     )
 
     delete_mock.assert_called_once()
-    graph_delete_mock.assert_called_once()
+    assert graph_delete_mock.call_count == 2
+    assert graph_delete_mock.call_args_list[0].kwargs["repo"] == "repo"
+    assert graph_delete_mock.call_args_list[1].kwargs["repo"] is None
     journal_mock.assert_called_once()
     assert journal_mock.call_args.kwargs["status"] == "done"
 
@@ -280,6 +283,7 @@ def test_processor_honors_delete_journal_for_existing_file(monkeypatch, tmp_path
     monkeypatch.setattr(proc_mod.idx, "delete_points_by_path", delete_mock)
     monkeypatch.setattr(proc_mod.idx, "delete_graph_edges_by_path", graph_delete_mock)
     monkeypatch.setattr(proc_mod, "_verify_delete_committed", lambda *a, **k: True)
+    monkeypatch.setattr(proc_mod, "_verify_graph_delete_committed", lambda *a, **k: True)
     monkeypatch.setattr(proc_mod, "update_index_journal_entry_status", journal_mock)
 
     proc_mod._process_paths(
@@ -292,7 +296,9 @@ def test_processor_honors_delete_journal_for_existing_file(monkeypatch, tmp_path
     )
 
     delete_mock.assert_called_once()
-    graph_delete_mock.assert_called_once()
+    assert graph_delete_mock.call_count == 2
+    assert graph_delete_mock.call_args_list[0].kwargs["repo"] == "repo"
+    assert graph_delete_mock.call_args_list[1].kwargs["repo"] is None
     journal_mock.assert_called_once()
     assert journal_mock.call_args.kwargs["status"] == "done"
 

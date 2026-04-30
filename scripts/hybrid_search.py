@@ -428,10 +428,14 @@ def _generate_code_query_variants(query: str) -> List[str]:
 def run_pure_dense_search(
     query: str,
     limit: int = 10,
+    per_path: int | None = 1,
     model: Any = None,
     collection: str | None = None,
     language: str | None = None,
     under: str | None = None,
+    kind: str | None = None,
+    symbol: str | None = None,
+    ext: str | None = None,
     repo: str | list[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """Pure dense search - single query embedding, single vector search.
@@ -441,10 +445,14 @@ def run_pure_dense_search(
     Args:
         query: Natural language query
         limit: Max results to return
+        per_path: Optional max results per file path; <= 0 disables the cap
         model: Embedding model (will load default if None)
         collection: Qdrant collection name
         language: Optional language filter
         under: Optional recursive workspace subtree filter
+        kind: Optional kind filter (exact match)
+        symbol: Optional symbol filter (exact match)
+        ext: Optional file extension filter (without dot)
         repo: Optional repo filter
 
     Returns:
@@ -478,6 +486,14 @@ def run_pure_dense_search(
             must.append(models.FieldCondition(key="metadata.repo", match=models.MatchAny(any=repo)))
         else:
             must.append(models.FieldCondition(key="metadata.repo", match=models.MatchValue(value=repo)))
+    if kind:
+        must.append(models.FieldCondition(key="metadata.kind", match=models.MatchValue(value=kind)))
+    if symbol:
+        must.append(models.FieldCondition(key="metadata.symbol", match=models.MatchValue(value=symbol)))
+    if ext:
+        ext_clean = str(ext).lower().lstrip(".")
+        if ext_clean:
+            must.append(models.FieldCondition(key="metadata.ext", match=models.MatchValue(value=ext_clean)))
     flt = models.Filter(must=must) if must else None
 
     # Single query embedding - no variants, no expansion
@@ -503,16 +519,18 @@ def run_pure_dense_search(
 
     try:
         # Single dense query - no pooling, no re-scoring.
-        # When `under` is set, we post-filter by path metadata. Over-fetch so we
-        # can still return up to `limit` in-scope results.
+        # When `under` or `per_path` is set, we may need to over-fetch so post-filters
+        # can still fill up to `limit` results.
         eff_under = _normalize_under_scope(under)
         fetch_limit = int(limit)
-        if eff_under:
+        eff_per_path = int(per_path or 0)
+        if eff_under or eff_per_path > 0:
             fetch_limit = min(max(fetch_limit * 4, fetch_limit + 16), 2000)
         ranked_points = dense_query(client, vec_name, vec_list, flt, fetch_limit, coll, query_text=query)
 
         # Build output
         results = []
+        path_counts: dict[str, int] = {}
         for p in ranked_points:
             payload = p.payload or {}
             md = payload.get("metadata") or {}
@@ -521,6 +539,10 @@ def run_pure_dense_search(
 
             # Prefer host_path when available (consistent with hybrid search)
             _path = md.get("host_path") or payload.get("path") or md.get("path") or ""
+            if eff_per_path > 0:
+                current = path_counts.get(_path, 0)
+                if current >= eff_per_path:
+                    continue
 
             results.append({
                 "score": float(getattr(p, "score", 0) or 0),
@@ -532,6 +554,8 @@ def run_pure_dense_search(
                 "doc_id": payload.get("code_id") or payload.get("_id") or "",
                 "payload": payload,
             })
+            if eff_per_path > 0:
+                path_counts[_path] = current + 1
             if len(results) >= int(limit):
                 break
 

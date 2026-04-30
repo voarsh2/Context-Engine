@@ -214,6 +214,40 @@ def test_run_indexing_strategy_skips_ensure_for_cached_hash_match(monkeypatch, t
     ensure_mock.assert_not_called()
 
 
+def test_run_indexing_strategy_force_upsert_bypasses_cached_hash_match(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    ensure_mock = MagicMock()
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", ensure_mock)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: "abc123")
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (False, "changed"))
+
+    index_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", index_mock)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+        force_upsert=True,
+    )
+
+    assert ok is True
+    ensure_mock.assert_called_once()
+    index_mock.assert_called_once()
+
+
 def test_run_indexing_strategy_skips_smart_path_for_markdown(monkeypatch, tmp_path):
     proc_mod = importlib.import_module("scripts.watch_index_core.processor")
 
@@ -249,6 +283,103 @@ def test_run_indexing_strategy_skips_smart_path_for_markdown(monkeypatch, tmp_pa
     assert ok is True
     smart_check.assert_not_called()
     assert captured["preloaded_language"] == "markdown"
+
+
+def test_run_indexing_strategy_force_upsert_missing_points_bypasses_smart(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (True, "smart_reindex"))
+    monkeypatch.setattr(proc_mod.idx, "get_indexed_file_hash", lambda *a, **k: "")
+    monkeypatch.setattr(proc_mod, "_path_has_indexed_points", lambda *a, **k: False)
+
+    smart_mock = MagicMock(return_value="skipped")
+    monkeypatch.setattr(proc_mod.idx, "process_file_with_smart_reindexing", smart_mock)
+
+    index_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", index_mock)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+        force_upsert=True,
+    )
+
+    assert ok is True
+    smart_mock.assert_not_called()
+    index_mock.assert_called_once()
+
+
+def test_run_indexing_strategy_sets_skip_verify_reason_for_file_lock(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (False, "changed"))
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", lambda *a, **k: False)
+    monkeypatch.setattr(proc_mod.idx, "is_file_locked", lambda *_: True)
+
+    verify_context = {}
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+        force_upsert=True,
+        verify_context=verify_context,
+    )
+
+    assert ok is False
+    assert verify_context.get("skip_verify_reason") == "file_locked"
+
+
+def test_finalize_journal_skips_force_upsert_verify_when_file_locked(monkeypatch):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    verify_mock = MagicMock()
+    done_mock = MagicMock()
+    failed_mock = MagicMock()
+    monkeypatch.setattr(proc_mod, "_verify_and_update_journal_for_upsert", verify_mock)
+    monkeypatch.setattr(proc_mod, "_mark_journal_done", done_mock)
+    monkeypatch.setattr(proc_mod, "_mark_journal_failed", failed_mock)
+
+    proc_mod._finalize_journal_after_index_attempt(
+        Path("/tmp/file.py"),
+        client=MagicMock(),
+        collection="coll",
+        repo_key="/tmp",
+        repo_name="repo",
+        force_upsert=True,
+        journal_content_hash="abc",
+        skip_verify_reason="file_locked",
+    )
+
+    verify_mock.assert_not_called()
+    done_mock.assert_not_called()
+    failed_mock.assert_not_called()
 
 
 def test_staging_requires_subprocess_only_for_active_dual_root_state(monkeypatch):

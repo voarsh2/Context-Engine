@@ -332,7 +332,11 @@ Deferred pseudo/tag generation runs asynchronously after initial indexing.
 | Name | Description | Default |
 |------|-------------|---------|
 | PSEUDO_BACKFILL_ENABLED | Enable async pseudo/tag backfill worker | 0 (disabled) |
-| PSEUDO_DEFER_TO_WORKER | Skip inline pseudo, defer to backfill worker | 0 (disabled) |
+| PSEUDO_DEFER_TO_WORKER | Foreground/background semantics: only disables inline pseudo when backfill worker is enabled | 0 (disabled) |
+
+Notes:
+- `PSEUDO_BACKFILL_ENABLED=0` is a hard disable for the worker.
+- `PSEUDO_DEFER_TO_WORKER=1` has no effect unless `PSEUDO_BACKFILL_ENABLED=1` (we keep inline pseudo enabled to avoid silently dropping pseudo/tags).
 
 ### Adaptive Span Sizing
 
@@ -577,4 +581,3 @@ docker compose run --rm indexer --root /work --no-default-excludes --exclude '/v
 | Large (1k+ files) | 120 (default) | 20 | 128+ |
 
 For large monorepos, set `INDEX_PROGRESS_EVERY=200` for visibility.
-

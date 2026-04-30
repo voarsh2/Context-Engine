@@ -1,8 +1,10 @@
 import importlib
+import asyncio
 import builtins
 import json
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,6 +176,45 @@ def test_dense_query_preserves_collection_on_filter_drop(monkeypatch):
 
 
 @pytest.mark.unit
+def test_run_pure_dense_search_honors_per_path_cap(monkeypatch):
+    hybrid_qdrant = importlib.import_module("scripts.hybrid_qdrant")
+
+    points = [
+        SimpleNamespace(
+            score=0.99,
+            payload={"metadata": {"path": "/work/repo/a.py", "start_line": 1, "end_line": 2}},
+        ),
+        SimpleNamespace(
+            score=0.98,
+            payload={"metadata": {"path": "/work/repo/a.py", "start_line": 10, "end_line": 11}},
+        ),
+        SimpleNamespace(
+            score=0.97,
+            payload={"metadata": {"path": "/work/repo/b.py", "start_line": 3, "end_line": 4}},
+        ),
+    ]
+
+    monkeypatch.setattr(hybrid_qdrant, "get_qdrant_client", lambda *a, **k: object())
+    monkeypatch.setattr(hybrid_qdrant, "return_qdrant_client", lambda *a, **k: None)
+    monkeypatch.setattr(hybrid_qdrant, "dense_query", lambda *a, **k: points)
+
+    class FakeEmbed:
+        def embed(self, texts):
+            for _ in texts:
+                yield SimpleNamespace(tolist=lambda: [0.1, 0.2, 0.3])
+
+    items = hyb.run_pure_dense_search(
+        query="foo",
+        limit=2,
+        per_path=1,
+        collection="test-coll",
+        model=FakeEmbed(),
+    )
+
+    assert [item["path"] for item in items] == ["/work/repo/a.py", "/work/repo/b.py"]
+
+
+@pytest.mark.unit
 def test_collection_prefers_env_over_state(monkeypatch, tmp_path):
     # State file should be ignored when COLLECTION_NAME env var is set
     state_dir = tmp_path / ".codebase"
@@ -232,9 +273,13 @@ def test_repo_search_snippet_strict_cap_after_highlight(monkeypatch):
     monkeypatch.setattr(builtins, "open", fake_open)
 
     # Execute
-    res = srv.asyncio.get_event_loop().run_until_complete(
+    res = asyncio.run(
         srv.repo_search(
-            query="foo", include_snippet=True, highlight_snippet=True, context_lines=0
+            query="foo",
+            mode="hybrid",
+            include_snippet=True,
+            highlight_snippet=True,
+            context_lines=0,
         )
     )
     snip = res["results"][0].get("snippet", "")

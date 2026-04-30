@@ -57,6 +57,10 @@ def _consistency_repair_max_ops() -> int:
         return 5000
 
 
+def _consistency_graph_audit_enabled() -> bool:
+    return get_boolean_env("WATCH_CONSISTENCY_AUDIT_GRAPH_ENABLED", default=True)
+
+
 def _empty_dir_sweep_enabled() -> bool:
     if "WATCH_EMPTY_DIR_SWEEP_ENABLED" in os.environ:
         return get_boolean_env("WATCH_EMPTY_DIR_SWEEP_ENABLED", default=True)
@@ -357,6 +361,43 @@ def _load_indexed_paths_for_collection(
     return paths, False
 
 
+def _load_graph_paths_for_collection(
+    client: QdrantClient,
+    collection: str,
+    workspace_path: str,
+    *,
+    max_paths: int,
+) -> Tuple[Set[str], bool]:
+    paths: Set[str] = set()
+    workspace_norm = _normalize_cache_key_path(workspace_path)
+    workspace_prefix = f"{workspace_norm.rstrip('/')}/"
+    graph_collection = f"{collection}_graph"
+    offset = None
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=graph_collection,
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+            offset=offset,
+        )
+        for pt in points or []:
+            payload = getattr(pt, "payload", {}) or {}
+            path = _normalize_cache_key_path(str(payload.get("caller_path") or ""))
+            if path:
+                if workspace_norm and not (
+                    path == workspace_norm or path.startswith(workspace_prefix)
+                ):
+                    continue
+                paths.add(path)
+                if max_paths > 0 and len(paths) >= max_paths:
+                    return paths, True
+        if next_offset is None:
+            break
+        offset = next_offset
+    return paths, False
+
+
 def _record_consistency_audit(
     workspace_path: str,
     repo_name: Optional[str],
@@ -553,13 +594,30 @@ def run_consistency_audit(client: QdrantClient, root: Path) -> None:
                 workspace_path,
                 max_paths=max_paths,
             )
+            graph_paths: Set[str] = set()
+            graph_truncated = False
+            graph_orphans: list[str] = []
+            if _consistency_graph_audit_enabled():
+                try:
+                    graph_paths, graph_truncated = _load_graph_paths_for_collection(
+                        client,
+                        collection,
+                        workspace_path,
+                        max_paths=max_paths,
+                    )
+                except Exception:
+                    graph_paths, graph_truncated = set(), False
             if fs_truncated or indexed_truncated:
                 stale = []
                 missing = []
                 enq_stale = 0
                 enq_missing = 0
             else:
-                stale = sorted(indexed_paths - fs_paths)
+                stale_set = set(indexed_paths - fs_paths)
+                if not graph_truncated:
+                    graph_orphans = sorted(graph_paths - indexed_paths)
+                    stale_set.update(graph_orphans)
+                stale = sorted(stale_set)
                 missing = sorted(fs_paths - indexed_paths)
                 enq_stale, enq_missing = _enqueue_consistency_repairs(
                     workspace_root,
@@ -573,26 +631,32 @@ def run_consistency_audit(client: QdrantClient, root: Path) -> None:
                 "fs_count": len(fs_paths),
                 "cache_count": len(cached_paths),
                 "qdrant_count": len(indexed_paths),
+                "graph_count": len(graph_paths),
                 "fs_scan_truncated": fs_truncated,
                 "qdrant_scan_truncated": indexed_truncated,
+                "graph_scan_truncated": graph_truncated,
                 "repair_skipped_due_to_truncation": bool(fs_truncated or indexed_truncated),
                 "stale_in_qdrant_count": len(stale),
                 "missing_in_qdrant_count": len(missing),
+                "orphan_graph_count": len(graph_orphans),
                 "repair_enqueued_stale_count": int(enq_stale),
                 "repair_enqueued_missing_count": int(enq_missing),
                 "sample_stale": stale[:20],
                 "sample_missing": missing[:20],
+                "sample_orphan_graph": graph_orphans[:20],
             }
             _record_consistency_audit(workspace_path, repo_name, summary)
             logger.info(
-                "[consistency_audit] repo=%s collection=%s fs=%d cache=%d qdrant=%d stale=%d missing=%d repair_stale=%d repair_missing=%d",
+                "[consistency_audit] repo=%s collection=%s fs=%d cache=%d qdrant=%d graph=%d stale=%d missing=%d graph_orphans=%d repair_stale=%d repair_missing=%d",
                 repo_name or "<none>",
                 collection,
                 len(fs_paths),
                 len(cached_paths),
                 len(indexed_paths),
+                len(graph_paths),
                 len(stale),
                 len(missing),
+                len(graph_orphans),
                 int(enq_stale),
                 int(enq_missing),
             )

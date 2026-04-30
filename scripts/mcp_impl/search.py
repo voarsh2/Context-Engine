@@ -346,7 +346,8 @@ async def _repo_search_impl(
     per_path = _to_int(per_path, 2)
     include_snippet = _to_bool(include_snippet, True)
     context_lines = _to_int(context_lines, 2)
-    # Reranker: default ON; can be disabled via env or client args
+    # Reranker defaults come from the environment, but an explicit request-level
+    # opt-in/opt-out should still be respected by MCP/API callers.
     rerank_env_default = str(
         os.environ.get("RERANKER_ENABLED", "1")
     ).strip().lower() in {"1", "true", "yes", "on"}
@@ -417,10 +418,13 @@ async def _repo_search_impl(
         except Exception:
             pass
 
-    # 3) Environment default (collection only for now)
+    # 3) Environment defaults (collection + mode)
     env_coll = (os.environ.get("DEFAULT_COLLECTION") or os.environ.get("COLLECTION_NAME") or "").strip()
     if (not coll_hint) and env_coll:
         coll_hint = env_coll
+    env_mode = (os.environ.get("REPO_SEARCH_DEFAULT_MODE") or "").strip()
+    if (not mode_hint) and env_mode:
+        mode_hint = env_mode
 
     # Final fallback
     env_fallback = (os.environ.get("DEFAULT_COLLECTION") or os.environ.get("COLLECTION_NAME") or "codebase").strip()
@@ -710,9 +714,17 @@ async def _repo_search_impl(
             lambda: run_pure_dense_search(
                 query=query_text,
                 limit=eff_limit,
+                per_path=(
+                    int(per_path)
+                    if (per_path is not None and str(per_path).strip() != "")
+                    else None
+                ),
                 collection=collection,
                 language=language or None,
                 under=under or None,
+                kind=kind or None,
+                symbol=symbol or None,
+                ext=ext or None,
                 repo=repo_filter,
             )
         )

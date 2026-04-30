@@ -30,6 +30,7 @@ __all__ = [
 import asyncio
 import logging
 import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -134,34 +135,30 @@ def _detect_current_repo() -> Optional[str]:
         if val:
             return val
 
-    # Try to detect from /work directory
+    # Try to detect from /work directory. Do not guess from invalid/internal
+    # metadata: a leaked /work/.git must not become repo "work".
     work_path = Path("/work")
     if work_path.exists():
         try:
-            # Check for .git in /work itself
             if (work_path / ".git").exists():
-                # Use git to get repo name from remote
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ["git", "-C", str(work_path), "config", "--get", "remote.origin.url"],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        url = result.stdout.strip()
-                        # Extract repo name from URL
-                        name = url.rstrip("/").rsplit("/", 1)[-1]
-                        if name.endswith(".git"):
-                            name = name[:-4]
-                        if name:
-                            return name
-                except Exception:
-                    pass
-                # Fallback to directory name
-                return work_path.name
+                result = subprocess.run(
+                    ["git", "-C", str(work_path), "config", "--get", "remote.origin.url"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    url = result.stdout.strip()
+                    name = url.rstrip("/").rsplit("/", 1)[-1]
+                    if name.endswith(".git"):
+                        name = name[:-4]
+                    if name:
+                        return name
 
-            # Check subdirectories for repos
+            internal_dirs = {".codebase", ".git", "__pycache__"}
             for subdir in work_path.iterdir():
+                if subdir.name in internal_dirs:
+                    continue
                 if subdir.is_dir() and (subdir / ".git").exists():
                     return subdir.name
         except Exception:

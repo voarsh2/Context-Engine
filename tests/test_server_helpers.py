@@ -2,8 +2,10 @@ import json
 import asyncio
 import types
 import importlib
+from pathlib import Path
 
 srv = importlib.import_module("scripts.mcp_indexer_server")
+admin_tools = importlib.import_module("scripts.mcp_impl.admin_tools")
 
 
 def test_tokens_from_queries_basic():
@@ -16,6 +18,30 @@ def test_highlight_snippet_simple():
     s = "hello foo bar"
     out = srv._highlight_snippet(s, ["foo", "bar"])
     assert "<<foo>>" in out and "<<bar>>" in out
+
+
+def test_detect_repo_from_work_path_ignores_invalid_root_git(tmp_path, monkeypatch):
+    """A metadata-only /work/.git must not be treated as repo name "work"."""
+    work = tmp_path / "work"
+    (work / ".git" / ".codebase").mkdir(parents=True)
+    monkeypatch.delenv("CURRENT_REPO", raising=False)
+    monkeypatch.delenv("REPO_NAME", raising=False)
+    monkeypatch.setattr(admin_tools, "Path", lambda value: work if value == "/work" else Path(value))
+
+    assert admin_tools._detect_current_repo() is None
+
+
+def test_detect_repo_from_work_path_skips_internal_dirs(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    (work / ".git").mkdir(parents=True)
+    (work / ".codebase" / ".git").mkdir(parents=True)
+    (work / "__pycache__" / ".git").mkdir(parents=True)
+    (work / "real-repo" / ".git").mkdir(parents=True)
+    monkeypatch.delenv("CURRENT_REPO", raising=False)
+    monkeypatch.delenv("REPO_NAME", raising=False)
+    monkeypatch.setattr(admin_tools, "Path", lambda value: work if value == "/work" else Path(value))
+
+    assert admin_tools._detect_current_repo() == "real-repo"
 
 
 def fake_async_run_factory(text):
@@ -58,6 +84,9 @@ def test_repo_search_arg_normalization(monkeypatch, tmp_path):
         _call_repo_search(
             queries=["FooBar"],
             limit="12",  # str on purpose to test coercion
+            # This test targets arg normalization + JSONL shaping from the non-dense path.
+            # Keep mode explicit so global dense defaults don't change behavior here.
+            mode="hybrid",
             per_path=None,
             language=None,
             under=None,

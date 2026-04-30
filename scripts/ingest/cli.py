@@ -16,6 +16,7 @@ from scripts.ingest.config import (
     is_multi_repo_mode,
     get_collection_name,
 )
+from scripts.pseudo_config import env_bool, effective_pseudo_mode
 from scripts.collection_health import clear_indexing_caches as _clear_indexing_caches_impl
 from scripts.ingest.pipeline import index_repo
 from scripts.ingest.pseudo import generate_pseudo_tags
@@ -270,7 +271,10 @@ def main():
                 args.recreate,
                 dedupe=(not args.no_dedupe),
                 skip_unchanged=(not args.no_skip_unchanged),
-                pseudo_mode="off" if (os.environ.get("PSEUDO_DEFER_TO_WORKER") or "").strip().lower() in {"1", "true", "yes", "on"} else "full",
+                pseudo_mode=effective_pseudo_mode(
+                    defer_to_worker=env_bool("PSEUDO_DEFER_TO_WORKER"),
+                    backfill_enabled=env_bool("PSEUDO_BACKFILL_ENABLED"),
+                ),
                 schema_mode=args.schema_mode,
             )
         return
@@ -287,8 +291,10 @@ def main():
             collection = os.environ.get("COLLECTION_NAME", "codebase")
         print(f"[single_repo] Single-repo mode enabled - using collection: {collection}")
 
-    flag = (os.environ.get("PSEUDO_DEFER_TO_WORKER") or "").strip().lower()
-    pseudo_mode = "off" if flag in {"1", "true", "yes", "on"} else "full"
+    pseudo_mode = effective_pseudo_mode(
+        defer_to_worker=env_bool("PSEUDO_DEFER_TO_WORKER"),
+        backfill_enabled=env_bool("PSEUDO_BACKFILL_ENABLED"),
+    )
 
     if args.clear_indexing_caches:
         _clear_indexing_caches(Path(args.root).resolve(), None)

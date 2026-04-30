@@ -19,6 +19,10 @@ from typing import Dict, List, Optional
 from qdrant_client import models
 
 import scripts.ingest_code as idx
+from scripts.pseudo_config import effective_pseudo_mode
+from scripts.ingest.graph_edges import (
+    normalize_caller_path as _normalize_graph_caller_path,
+)
 from scripts.workspace_state import (
     _normalize_cache_key_path,
     _extract_repo_name_from_path,
@@ -413,6 +417,59 @@ def _verify_delete_committed(client, collection: str, path: Path) -> bool:
     return has_points is False
 
 
+def _path_has_graph_edges(client, collection: str, path: Path) -> Optional[bool]:
+    graph_collection = f"{collection}_graph"
+    try:
+        # Graph edges normalize paths (Windows -> POSIX separators). Verification must
+        # query using the same normalization to avoid false "deleted" reports.
+        raw_path = str(path)
+        candidates: list[str] = []
+        try:
+            norm_path = str(_normalize_graph_caller_path(raw_path) or "").strip()
+            if norm_path:
+                candidates.append(norm_path)
+        except Exception:
+            pass
+        # Back-compat: also consider the raw string and a slash-normalized form in case
+        # older data was written without normalization.
+        raw_slash = raw_path.replace("\\", "/").strip()
+        for v in (raw_slash, raw_path.strip()):
+            if v and v not in candidates:
+                candidates.append(v)
+
+        match_obj = (
+            models.MatchAny(any=candidates)
+            if len(candidates) > 1
+            else models.MatchValue(value=(candidates[0] if candidates else raw_path))
+        )
+        filt = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="caller_path", match=match_obj
+                )
+            ]
+        )
+        points, _ = client.scroll(
+            collection_name=graph_collection,
+            scroll_filter=filt,
+            with_payload=False,
+            with_vectors=False,
+            limit=1,
+        )
+        return bool(points)
+    except Exception as e:
+        # Missing graph collection means there are no graph edges to verify.
+        err = str(e).lower()
+        if "404" in err or "not found" in err or "doesn't exist" in err:
+            return False
+        return None
+
+
+def _verify_graph_delete_committed(client, collection: str, path: Path) -> bool:
+    has_edges = _path_has_graph_edges(client, collection, path)
+    return has_edges is False
+
+
 def _verify_upsert_committed(
     client,
     collection: str,
@@ -490,8 +547,13 @@ def _finalize_journal_after_index_attempt(
     text: Optional[str] = None,
     file_hash: Optional[str] = None,
     default_error: Optional[str] = None,
+    skip_verify_reason: Optional[str] = None,
 ) -> None:
     if force_upsert and client is not None and collection is not None:
+        # If another worker currently owns this file lock, leave the journal entry
+        # pending for retry instead of recording a false verification failure.
+        if skip_verify_reason == "file_locked":
+            return
         _verify_and_update_journal_for_upsert(
             path,
             client,
@@ -831,6 +893,16 @@ def _process_paths(
                             caller_path=str(p),
                             repo=repo_name,
                         )
+                        # Repo tags can drift over time, so always follow a repo-scoped
+                        # delete with a path-only sweep to remove any stale rows left under
+                        # an older/default repo tag.
+                        if repo_name:
+                            idx.delete_graph_edges_by_path(
+                                client,
+                                collection,
+                                caller_path=str(p),
+                                repo=None,
+                            )
                     except Exception as graph_exc:
                         safe_print(f"[deleted:graph_failed] {p} -> {collection}: {graph_exc}")
                     safe_print(f"[deleted] {p} -> {collection}")
@@ -839,6 +911,10 @@ def _process_paths(
                     deleted_ok = False
             if deleted_ok and client is not None and collection is not None:
                 deleted_ok = _verify_delete_committed(client, collection, p)
+            if deleted_ok and client is not None and collection is not None:
+                verify_graph_delete = get_boolean_env("WATCH_VERIFY_GRAPH_DELETE", True)
+                if verify_graph_delete:
+                    deleted_ok = _verify_graph_delete_committed(client, collection, p)
             try:
                 if repo_name:
                     remove_cached_file(str(p), repo_name)
@@ -852,7 +928,7 @@ def _process_paths(
                     p,
                     repo_key,
                     repo_name,
-                    "delete_points_failed",
+                    "delete_points_or_graph_failed",
                 )
             _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
             continue
@@ -882,6 +958,7 @@ def _process_paths(
                     vector_name,
                     model_dim,
                     repo_name,
+                    force_upsert=force_upsert,
                     verify_context=verify_context if force_upsert else None,
                 )
             except _SkipUnchanged as exc:
@@ -933,6 +1010,7 @@ def _process_paths(
                     journal_content_hash=journal_content_hash,
                     text=verify_context.get("text"),
                     file_hash=verify_context.get("file_hash"),
+                    skip_verify_reason=verify_context.get("skip_verify_reason"),
                 )
             else:
                 _log_activity(
@@ -949,6 +1027,7 @@ def _process_paths(
                     text=verify_context.get("text"),
                     file_hash=verify_context.get("file_hash"),
                     default_error="no_change_or_error",
+                    skip_verify_reason=verify_context.get("skip_verify_reason"),
                 )
             _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
         else:
@@ -990,6 +1069,7 @@ def _run_indexing_strategy(
     vector_name: str,
     model_dim: int,
     repo_name: str | None,
+    force_upsert: bool = False,
     *,
     verify_context: Optional[Dict[str, Optional[str]]] = None,
 ) -> bool:
@@ -1000,6 +1080,7 @@ def _run_indexing_strategy(
     if verify_context is not None:
         verify_context["text"] = text
         verify_context["file_hash"] = file_hash
+        verify_context["skip_verify_reason"] = None
     ok = False
     if text is not None:
         try:
@@ -1015,9 +1096,26 @@ def _run_indexing_strategy(
                 cached_hash = get_cached_file_hash(str(path), repo_name) if repo_name else None
             except Exception:
                 cached_hash = None
-            if cached_hash and cached_hash == file_hash:
+            if cached_hash and cached_hash == file_hash and not force_upsert:
                 ok = True
                 raise _SkipUnchanged(text=text, file_hash=file_hash)
+
+            # Repair upserts must materialize points when a path is missing in Qdrant.
+            # Smart reindex can return "skipped" for unchanged symbols, which is valid
+            # only when points already exist.
+            force_full_reindex = False
+            if force_upsert and client is not None:
+                try:
+                    existing_hash = str(
+                        idx.get_indexed_file_hash(client, collection, str(path)) or ""
+                    ).strip()
+                except Exception:
+                    existing_hash = ""
+                if not existing_hash:
+                    has_points = _path_has_indexed_points(client, collection, path)
+                    if has_points is not True:
+                        force_full_reindex = True
+
             if not is_text_like:
                 try:
                     use_smart, smart_reason = idx.should_use_smart_reindexing(str(path), file_hash)
@@ -1025,7 +1123,7 @@ def _run_indexing_strategy(
                     use_smart, smart_reason = False, "smart_check_failed"
                 # Bootstrap: if we have no symbol cache yet, still run smart path once
                 bootstrap = smart_reason == "no_cached_symbols"
-                if use_smart or bootstrap:
+                if (use_smart or bootstrap) and not force_full_reindex:
                     msg_kind = (
                         "smart reindexing"
                         if use_smart
@@ -1053,6 +1151,11 @@ def _run_indexing_strategy(
                         )
                         ok = False
                 else:
+                    if force_full_reindex:
+                        safe_print(
+                            f"[SMART_REINDEX][watcher] Forcing full reindex for {path} "
+                            "(force_upsert_missing_points)"
+                        )
                     safe_print(
                         f"[SMART_REINDEX][watcher] Using full reindexing for {path} ({smart_reason})"
                     )
@@ -1065,7 +1168,12 @@ def _run_indexing_strategy(
             )
         except Exception:
             pass
-        pseudo_mode = "off" if get_boolean_env("PSEUDO_DEFER_TO_WORKER") else "full"
+        # PSEUDO_DEFER_TO_WORKER is a foreground/background semantics knob; it should
+        # only disable inline pseudo/tags generation when the backfill worker is enabled.
+        pseudo_mode = effective_pseudo_mode(
+            defer_to_worker=get_boolean_env("PSEUDO_DEFER_TO_WORKER"),
+            backfill_enabled=get_boolean_env("PSEUDO_BACKFILL_ENABLED"),
+        )
         ok = idx.index_single_file(
             client,
             model,
@@ -1080,6 +1188,12 @@ def _run_indexing_strategy(
             preloaded_file_hash=file_hash,
             preloaded_language=language if text is not None else None,
         )
+        if force_upsert and not ok and verify_context is not None:
+            try:
+                if idx.is_file_locked(str(path)):
+                    verify_context["skip_verify_reason"] = "file_locked"
+            except Exception:
+                pass
     return ok
 
 

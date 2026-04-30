@@ -1416,6 +1416,7 @@ async def symbol_graph(
     limit: Any = None,
     language: Any = None,
     under: Any = None,
+    collection: Any = None,
     session: Any = None,
     output_format: Any = None,
     ctx: Context = None,
@@ -1433,6 +1434,7 @@ async def symbol_graph(
     - limit: int (default 20). Maximum results to return.
     - language: str (optional). Filter by programming language.
     - under: str (optional). Filter by recursive workspace subtree (e.g., "scripts" -> scripts/**).
+    - collection: str (optional). Target collection; defaults to env/WS collection.
     - output_format: "json" (default) or "toon" for token-efficient format.
 
     Returns:
@@ -1455,6 +1457,7 @@ async def symbol_graph(
         limit=_limit,
         language=str(language).strip() if language else None,
         under=str(under).strip() if under else None,
+        collection=str(collection).strip() if collection else None,
         session=str(session).strip() if session else None,
         ctx=ctx,
     )
@@ -1722,6 +1725,7 @@ async def info_request(
     session: str = None,
     # Optional filters (pass-through to repo_search)
     limit: int = None,
+    collection: Any = None,
     language: str = None,
     under: str = None,
     repo: Any = None,
@@ -1746,6 +1750,7 @@ async def info_request(
     - include_explanation: bool (default false). Add summary, primary_locations, related_concepts.
     - include_relationships: bool (default false). Add imports_from, calls, related_paths to results.
     - limit: int (default 10). Maximum results to return.
+    - collection: str (optional). Target collection; defaults to env/WS collection.
     - language: str. Filter by programming language.
     - under: str. Limit search to a recursive workspace subtree.
     - repo: str or list[str]. Filter by repository name(s).
@@ -1801,6 +1806,7 @@ async def info_request(
         limit=eff_limit,
         per_path=3,  # Better default for info requests
         session=session,
+        collection=collection,
         include_snippet=eff_snippet,
         context_lines=eff_context,
         language=language,

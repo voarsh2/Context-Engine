@@ -54,6 +54,8 @@ async def test_rerank_inproc_changes_order(monkeypatch):
     # Force in-process hybrid + in-process rerank paths
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "1")
+    # Rerank verification suite explicitly exercises non-dense plumbing.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     # Baseline hybrid results (JSON structured items); A before B
     def fake_run_hybrid_search(**kwargs):
@@ -120,6 +122,8 @@ async def test_rerank_inproc_dense_respects_collection_argument(monkeypatch):
     # Drive the in-process dense rerank fallback path by returning no hybrid candidates.
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "1")
+    # Explicit non-dense mode for rerank-path contract checks.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     def fake_run_hybrid_search(**kwargs):
         return []
@@ -158,6 +162,8 @@ async def test_rerank_inproc_dense_respects_collection_argument(monkeypatch):
 async def test_rerank_inproc_dense_respects_path_filters(monkeypatch):
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "1")
+    # Explicit non-dense mode for rerank-path contract checks.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     def fake_run_hybrid_search(**kwargs):
         return []
@@ -222,6 +228,8 @@ async def test_rerank_subprocess_timeout_fallback(monkeypatch):
     # Force hybrid via subprocess output (doesn't matter which) and disable inproc rerank
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "0")
+    # Explicit non-dense mode for rerank-path contract checks.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     def fake_run_hybrid_search(**kwargs):
         return [

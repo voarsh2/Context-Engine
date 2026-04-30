@@ -53,6 +53,16 @@ def _normalize_path(path: str) -> str:
     return normalized.replace("\\", "/")
 
 
+def normalize_caller_path(path: str) -> str:
+    """Normalize a caller path exactly as graph edge payloads do.
+
+    This is used by both the writer (upsert/delete) and any readers/verifiers so
+    cross-platform path separators (Windows vs POSIX) do not cause mismatches.
+    """
+
+    return _normalize_path(path)
+
+
 def get_graph_collection_name(base_collection: str) -> str:
     return f"{base_collection}{GRAPH_COLLECTION_SUFFIX}"
 
@@ -269,11 +279,47 @@ def delete_edges_by_path(
             must.append(
                 qmodels.FieldCondition(key="repo", match=qmodels.MatchValue(value=r))
             )
+    flt = qmodels.Filter(must=must)
+
+    # Probe first so callers can distinguish "no matching rows" (0) from a real delete.
+    # This is important for fallback logic (e.g., retry path-only delete when repo tag drifted).
+    try:
+        existing, _ = client.scroll(
+            collection_name=graph_coll,
+            scroll_filter=flt,
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        if not existing:
+            return 0
+    except UnexpectedResponse as e:
+        if getattr(e, "status_code", None) == 404:
+            _MISSING_GRAPH_COLLECTIONS.add(graph_coll)
+            return 0
+        logger.debug(
+            "Graph edge probe failed for %s in %s (status=%s): %s",
+            norm_path,
+            graph_coll,
+            getattr(e, "status_code", None),
+            e,
+            exc_info=True,
+        )
+        return 0
+    except Exception as e:
+        logger.debug(
+            "Graph edge probe failed for %s in %s: %s",
+            norm_path,
+            graph_coll,
+            e,
+            exc_info=True,
+        )
+        return 0
 
     try:
         resp = client.delete(
             collection_name=graph_coll,
-            points_selector=qmodels.FilterSelector(filter=qmodels.Filter(must=must)),
+            points_selector=qmodels.FilterSelector(filter=flt),
         )
         result_status = getattr(getattr(resp, "result", None), "status", None)
         if result_status is None:

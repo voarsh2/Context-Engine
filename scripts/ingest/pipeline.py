@@ -88,7 +88,11 @@ def _detect_repo_name_from_path(path: Path) -> str:
     """Wrapper function to use workspace_state repository detection."""
     try:
         from scripts.workspace_state import _extract_repo_name_from_path as _ws_detect
-        return _ws_detect(str(path))
+        # `_extract_repo_name_from_path` expects a workspace/repo path shape, not a file path.
+        # Always normalize file inputs to their parent directory to avoid falling back to
+        # file basenames (which can poison metadata.repo and graph edge repo tags).
+        candidate = path if path.is_dir() else path.parent
+        return _ws_detect(str(candidate))
     except ImportError:
         return path.name if path.is_dir() else path.parent.name
 
