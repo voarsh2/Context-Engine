@@ -21,7 +21,6 @@ Complete environment variable reference for Context Engine.
 - [Lexical Vector Settings](#lexical-vector-settings)
 - [Ports](#ports)
 - [Search & Expansion](#search--expansion)
-- [info_request Tool](#info_request-tool)
 - [Memory Blending](#memory-blending)
 
 ---
@@ -509,15 +508,6 @@ The search engine can boost files whose paths match query terms—production-gra
 - Total: 4.2 × 0.15 = 0.63 boost
 
 Set `FNAME_BOOST=0` to disable, or increase (e.g., `0.25`) for stronger path weighting.
-
-## info_request Tool
-
-Simplified codebase retrieval with optional explanation mode.
-
-| Name | Description | Default |
-|------|-------------|---------|
-| INFO_REQUEST_LIMIT | Default result limit for info_request queries | 10 |
-| INFO_REQUEST_CONTEXT_LINES | Context lines in snippets (richer than repo_search) | 5 |
 
 ## Output Formatting
 

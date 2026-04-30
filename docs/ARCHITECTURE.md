@@ -233,12 +233,6 @@ Worker logs show training progress:
 - **Continuous Improvement**: Rankings improve over time
 - **Offline Capable**: Teacher runs locally, no external API calls
 
-#### MCP Router (`scripts/mcp_router.py`)
-- **Intent Classification**: Determines which MCP tool to call based on query
-- **Tool Orchestration**: Routes to search, answer, memory, or index tools
-- **HTTP Execution**: Executes tools via RMCP/HTTP without extra dependencies
-- **Plan Mode**: Preview tool selection without execution
-
 ## Data Flow Architecture
 
 ### Search Request Flow

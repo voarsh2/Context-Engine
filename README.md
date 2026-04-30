@@ -144,10 +144,9 @@ See [docs/vscode-extension.md](docs/vscode-extension.md) for full documentation.
 ## MCP Tools
 
 **Search** (Indexer MCP):
-- `repo_search` — Hybrid code search with filters
+- `repo_search` — Code search with filters and optional profiles
 - `context_search` — Blend code + memory results
 - `context_answer` — LLM-generated answers with citations
-- `search_tests_for`, `search_config_for`, `search_callers_for`
 
 **Memory** (Memory MCP):
 - `store` — Save knowledge with metadata

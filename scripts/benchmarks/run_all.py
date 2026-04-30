@@ -102,15 +102,6 @@ async def run_all_benchmarks(components: List[str]) -> Dict[str, Any]:
         except Exception as e:
             print(f"  Expansion benchmark failed: {e}")
 
-    if "router" in components or "all" in components:
-        try:
-            from scripts.benchmarks.router_bench import run_router_benchmark
-            print("\n▶ Running Router Benchmark...")
-            report = await run_router_benchmark(name="router")
-            results["components"]["router"] = report.to_dict()
-        except Exception as e:
-            print(f"  Router benchmark failed: {e}")
-
     if "rrf" in components or "all" in components:
         try:
             from scripts.benchmarks.rrf_quality import run_rrf_benchmark

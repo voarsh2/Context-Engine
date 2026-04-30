@@ -136,3 +136,51 @@ def test_repo_search_dense_default_forwards_per_path(monkeypatch):
 
     assert calls["dense"] == 1
     assert calls.get("dense_kwargs", {}).get("per_path") == 1
+
+
+@pytest.mark.service
+def test_repo_search_profile_tests_adds_material_globs(monkeypatch):
+    calls = {"dense": 0, "hybrid": 0}
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "dense")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: object())
+    monkeypatch.setitem(sys.modules, "scripts.hybrid_search", _make_hybrid_module_stub(calls))
+
+    res = asyncio.run(
+        srv.repo_search(
+            query="q",
+            profile="tests",
+            limit=1,
+            compact=False,
+            rerank_enabled=False,
+        )
+    )
+
+    args = res.get("args") or {}
+    assert args.get("profile") == "tests"
+    assert "tests/**" in args.get("path_glob", [])
+    assert "**/*_test.*" in args.get("path_glob", [])
+
+
+@pytest.mark.service
+def test_repo_search_profile_preserves_user_globs(monkeypatch):
+    calls = {"dense": 0, "hybrid": 0}
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "dense")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: object())
+    monkeypatch.setitem(sys.modules, "scripts.hybrid_search", _make_hybrid_module_stub(calls))
+
+    res = asyncio.run(
+        srv.repo_search(
+            query="q",
+            profile="config",
+            path_glob=["custom/**"],
+            limit=1,
+            compact=False,
+            rerank_enabled=False,
+        )
+    )
+
+    globs = (res.get("args") or {}).get("path_glob", [])
+    assert globs[0] == "custom/**"
+    assert "**/*.yaml" in globs

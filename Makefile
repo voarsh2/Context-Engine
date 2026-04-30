@@ -8,8 +8,6 @@ export DOCKER_HOST =
 .PHONY: venv venv-install dev-remote-up dev-remote-down dev-remote-logs dev-remote-restart dev-remote-bootstrap dev-remote-test dev-remote-client dev-remote-clean
 .PHONY: rerank-eval rerank-eval-ablations rerank-benchmark
 
-.PHONY: qdrant-status qdrant-list qdrant-prune qdrant-index-root
-
 venv: ## create local virtualenv .venv
 	python3 -m venv .venv && . .venv/bin/activate && pip install -U pip
 
@@ -294,56 +292,6 @@ dev-remote-clean: ## clean up dev-remote volumes and containers
 	docker compose -f docker-compose.yml down -v
 	docker volume rm context-engine_shared_workspace context-engine_shared_codebase context-engine_upload_temp context-engine_qdrant_storage_dev_remote 2>/dev/null || true
 	rm -rf dev-workspace
-
-
-# Router helpers
-Q ?= what is hybrid search?
-route-plan: ## plan-only route for a query: make route-plan Q="your question"
-	python3 scripts/mcp_router.py --plan "$(Q)"
-
-route-run: ## execute routed tool(s) over HTTP: make route-run Q="your question"
-	python3 scripts/mcp_router.py --run "$(Q)"
-router-eval: ## run the mock-based router eval harness
-	python3 scripts/router_eval.py
-
-
-# Live orchestration smoke test (no CI): bring up stack, reindex, run router
-router-smoke: ## spin up compose, reindex, store a memory via router, then answer; exits nonzero on failure
-	set -e; \
-	docker compose down || true; \
-	docker compose up -d qdrant; \
-	./scripts/wait-for-qdrant.sh; \
-	$(MAKE) llama-model; \
-	docker compose up -d mcp_http mcp_indexer_http llamacpp; \
-	echo "Waiting for MCP HTTP health..."; \
-	for i in $$(seq 1 30); do \
-	  code1=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$${FASTMCP_HTTP_HEALTH_PORT:-18002}/readyz || true); \
-	  code2=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$${FASTMCP_INDEXER_HTTP_HEALTH_PORT:-18003}/readyz || true); \
-	  if [ "$$code1" = "200" ] && [ "$$code2" = "200" ]; then echo "MCP HTTP ready"; break; fi; \
-	  sleep 1; \
-	  if [ $$i -eq 30 ]; then echo "MCP HTTP health timeout"; exit 1; fi; \
-	done; \
-	$(MAKE) reindex; \
-	echo "Storing a smoke memory via router..."; \
-	python3 scripts/mcp_router.py --run "remember this: router smoke memory"; \
-	echo "Running a router answer..."; \
-	python3 scripts/mcp_router.py --run "recap our architecture decisions for the indexer"; \
-	echo "router-smoke: PASS"
-
-
-
-# Qdrant via MCP router convenience targets
-qdrant-status:
-	python3 scripts/mcp_router.py --run "status"
-
-qdrant-list:
-	python3 scripts/mcp_router.py --run "list collections"
-
-qdrant-prune:
-	python3 scripts/mcp_router.py --run "prune"
-
-qdrant-index-root:
-	python3 scripts/mcp_router.py --run "reindex repo"
 
 
 # --- ctx CLI helper ---

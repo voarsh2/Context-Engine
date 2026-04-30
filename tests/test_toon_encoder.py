@@ -476,7 +476,7 @@ class TestDynamicFieldInclusion:
         assert "def main()" in output
 
     def test_encode_with_information_field(self):
-        """Test that info_request's information field is included."""
+        """Test that the information field is included."""
         results = [
             {"path": "/src/auth.py", "start_line": 1, "end_line": 50,
              "score": 0.9, "information": "Authentication handler at /src/auth.py:1-50",

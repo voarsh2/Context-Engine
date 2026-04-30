@@ -292,7 +292,7 @@ scripts/remote_upload_client.py --server http://context.yourcompany.com:9090 --p
 
 After configuring, you should see tools from both servers:
 - `store`, `find` (Memory)
-- `repo_search`, `code_search`, `context_search`, `context_answer` (Indexer)
+- `repo_search`, `context_search`, `context_answer` (Indexer)
 - `qdrant_list`, `qdrant_index`, `qdrant_prune`, `qdrant_status` (Indexer)
 
 Test connectivity:

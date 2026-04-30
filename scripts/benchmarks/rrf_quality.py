@@ -161,7 +161,7 @@ GROUND_TRUTH_QUERIES = [
     },
     {
         "query": "MCP tool registration fastmcp",
-        "expected_files": ["mcp_indexer_server.py", "mcp_router/__init__.py"],
+        "expected_files": ["mcp_indexer_server.py", "mcp_impl/search.py"],
     },
     {
         "query": "memory store find operations",

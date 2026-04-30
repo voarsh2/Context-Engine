@@ -151,5 +151,4 @@ docker-compose restart
 1. Check this troubleshooting guide
 2. Review logs: `docker compose logs mcp_indexer`
 3. Verify health: `make health`
-4. Check Qdrant status: `make qdrant-status`
-
+4. Check indexer health: `curl http://localhost:${FASTMCP_INDEXER_HTTP_HEALTH_PORT:-18003}/readyz`; use the `qdrant_status` MCP tool for collection details

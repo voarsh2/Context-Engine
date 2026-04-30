@@ -442,11 +442,7 @@ export function maybeRemapToolResult(name, result, workspaceRoot) {
     const shouldMap = (
       lower === "repo_search" ||
       lower === "context_search" ||
-      lower === "context_answer" ||
-      lower.endsWith("search_tests_for") ||
-      lower.endsWith("search_config_for") ||
-      lower.endsWith("search_callers_for") ||
-      lower.endsWith("search_importers_for")
+      lower === "context_answer"
     );
     if (!shouldMap) {
       return result;

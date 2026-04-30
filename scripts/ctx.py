@@ -96,9 +96,9 @@ def _load_env_file():
 _load_env_file()
 
 try:
-    from scripts.mcp_router import call_tool_http  # type: ignore
+    from scripts.mcp_http_client import call_tool_http  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - local execution fallback
-    from mcp_router import call_tool_http  # type: ignore
+    from mcp_http_client import call_tool_http  # type: ignore
 
 # Configuration from environment
 MCP_URL = os.environ.get("MCP_INDEXER_URL", "http://localhost:8003/mcp")
@@ -250,6 +250,12 @@ def parse_mcp_response(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # FastMCP typically wraps results in a content array
     res = result.get("result", {})
+    structured = res.get("structuredContent") if isinstance(res, dict) else None
+    if isinstance(structured, dict):
+        structured_result = structured.get("result")
+        if isinstance(structured_result, dict):
+            return structured_result
+
     content = res.get("content", [])
 
     # Some servers may return a dict directly (no content array)
@@ -271,7 +277,10 @@ def parse_mcp_response(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict):
+            return parsed["result"]
+        return parsed
     except json.JSONDecodeError:
         return {"raw": text}
 
@@ -736,19 +745,14 @@ def _generate_plan(enhanced_prompt: str, context: str, note: str) -> str:
             from refrag_glm import GLMRefragClient  # type: ignore
 
             client = GLMRefragClient()
-            response = client.client.chat.completions.create(
-                model=os.environ.get("GLM_MODEL", "glm-4.6"),
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
+            plan = client.generate_with_soft_embeddings(
+                f"{system_msg}\n\n{user_msg}",
                 max_tokens=200,
+                model=os.environ.get("GLM_MODEL", "glm-4.6"),
                 temperature=0.3,
                 stream=False,
-            )
-            plan = (
-                (response.choices[0].message.content if response and response.choices else "")
-                or ""
+                no_thinking=os.environ.get("CTX_GLM_DISABLE_THINKING", "1").strip().lower()
+                not in {"0", "false", "no", "off"},
             ).strip()
             if not plan:
                 # Fall through to llama.cpp path
@@ -1030,6 +1034,7 @@ def fetch_context(query: str, **filters) -> Tuple[str, str]:
     params = {
         "query": query,
         "limit": filters.get("limit", DEFAULT_LIMIT),
+        "per_path": filters.get("per_path", DEFAULT_PER_PATH),
         "include_snippet": with_snippets,
         "context_lines": filters.get("context_lines", DEFAULT_CONTEXT_LINES),
         "collection": collection_name,
@@ -1244,32 +1249,15 @@ def rewrite_prompt(original_prompt: str, context: str, note: str, max_tokens: Op
                 "For questions: expand into related conceptual questions. For commands/instructions: provide general guidance about the task. "
             )
 
-        # GLM API call
-        response = client.client.chat.completions.create(
-            model=os.environ.get("GLM_MODEL", "glm-4.6"),
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
-            ],
+        enhanced = client.generate_with_soft_embeddings(
+            f"{system_msg}\n\n{user_msg}",
             max_tokens=int(max_tokens or DEFAULT_REWRITE_TOKENS),
+            model=os.environ.get("GLM_MODEL", "glm-4.6"),
             temperature=0.45,
-            stream=stream
+            stream=stream,
+            no_thinking=os.environ.get("CTX_GLM_DISABLE_THINKING", "1").strip().lower()
+            not in {"0", "false", "no", "off"},
         )
-
-        enhanced = ""
-        if stream:
-            # Streaming mode for GLM
-            for chunk in response:
-                if chunk.choices[0].delta.content:
-                    token = chunk.choices[0].delta.content
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
-                    enhanced += token
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        else:
-            # Non-streaming mode for GLM
-            enhanced = response.choices[0].message.content
 
     else:
         # Use local decoder (llama.cpp by default; Ollama supported when DECODER_URL points to /api/chat)
@@ -1586,6 +1574,8 @@ Examples:
             else:
                 rewritten = rewrite_prompt(args.query, context_text, context_note, max_tokens=args.rewrite_max_tokens)
                 output = sanitize_citations(rewritten.strip(), allowed_paths)
+            if args.with_context and context_text.strip():
+                output = output.rstrip() + "\n\n---\nSupporting context:\n" + context_text.strip()
 
         if args.cmd:
             subprocess.run(args.cmd, input=output.encode("utf-8"), shell=True, check=False)

@@ -97,7 +97,6 @@ Context-Engine/
 ├── scripts/                    # Core application code
 │   ├── mcp_memory_server.py   # Memory MCP server implementation
 │   ├── mcp_indexer_server.py  # Indexer MCP server implementation
-│   ├── mcp_router.py          # Intent-based tool routing
 │   ├── hybrid_search.py       # Search algorithm implementation
 │   ├── ctx.py                 # CLI prompt enhancer
 │   ├── cache_manager.py       # Unified caching system

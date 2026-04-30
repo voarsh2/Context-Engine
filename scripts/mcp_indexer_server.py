@@ -163,20 +163,7 @@ from scripts.mcp_toon import (
 from scripts.mcp_impl.context_search import _context_search_impl
 from scripts.mcp_impl.query_expand import _expand_query_impl
 from scripts.mcp_impl.search import _repo_search_impl
-from scripts.mcp_impl.info_request import (
-    _extract_symbols_from_query,
-    _extract_related_concepts,
-    _format_information_field,
-    _extract_relationships,
-    _calculate_confidence,
-)
 from scripts.mcp_impl.admin_tools import _collection_map_impl
-from scripts.mcp_impl.search_specialized import (
-    _search_tests_for_impl,
-    _search_config_for_impl,
-    _search_callers_for_impl,
-    _search_importers_for_impl,
-)
 from scripts.mcp_impl.search_history import (
     _search_commits_for_impl,
     _change_history_for_path_impl,
@@ -538,7 +525,6 @@ from scripts.mcp_admin_tools import (
     _EMBED_MODEL_LOCKS,
     _run_async,
     _get_embedding_model,
-    _invalidate_router_scratchpad,
     _detect_current_repo,
 )
 
@@ -623,12 +609,6 @@ async def qdrant_index_root(
 
     res = await _run_async(cmd, env=env)
     ret = {"args": {"root": "/work", "collection": coll, "recreate": recreate}, **res}
-    try:
-        if ret.get("ok") and int(ret.get("code", 1)) == 0:
-            if _invalidate_router_scratchpad("/work"):
-                ret["invalidated_router_scratchpad"] = True
-    except Exception:
-        pass
     return ret
 
 
@@ -949,12 +929,6 @@ async def qdrant_index(
 
     res = await _run_async(cmd, env=env)
     ret = {"args": {"root": root, "collection": coll, "recreate": recreate}, **res}
-    try:
-        if ret.get("ok") and int(ret.get("code", 1)) == 0:
-            if _invalidate_router_scratchpad("/work"):
-                ret["invalidated_router_scratchpad"] = True
-    except Exception:
-        pass
     return ret
 
 
@@ -1085,6 +1059,7 @@ async def repo_search(
     collection: Any = None,
     workspace_path: Any = None,
     mode: Any = None,
+    profile: Any = None,
     session: Any = None,
     ctx: Context = None,
     language: Any = None,
@@ -1116,6 +1091,7 @@ async def repo_search(
     - per_path: int (default 2). Max results per file.
     - include_snippet/context_lines: return inline snippets near hits when true.
     - rerank_*: ONNX reranker is ON by default for best relevance; timeouts fall back to hybrid.
+    - profile: Optional useful path profile: tests, config, or code.
     - debug: bool (default false). Include verbose internal fields (components, rerank_counters, etc).
     - output_format: "json" (default) or "toon" for token-efficient TOON format.
     - collection: str. Target collection; defaults to workspace state or env COLLECTION_NAME.
@@ -1139,6 +1115,7 @@ async def repo_search(
         collection=collection,
         workspace_path=workspace_path,
         mode=mode,
+        profile=profile,
         session=session,
         ctx=ctx,
         language=language,
@@ -1277,138 +1254,8 @@ async def context_answer_compat(arguments: Any = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Specialized search tools - thin wrappers delegating to extracted impls
+# symbol_graph - graph query tool
 # ---------------------------------------------------------------------------
-@mcp.tool()
-async def search_tests_for(
-    query: Any = None,
-    limit: Any = None,
-    include_snippet: Any = None,
-    context_lines: Any = None,
-    under: Any = None,
-    language: Any = None,
-    session: Any = None,
-    compact: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Find test files related to a query.
-
-    What it does:
-    - Presets common test file globs and forwards to repo_search
-    - Accepts extra filters via kwargs (e.g., language, under, case)
-
-    Parameters:
-    - query: str or list[str]; limit; include_snippet/context_lines; under; language; compact
-
-    Returns: repo_search result shape.
-    """
-    return await _search_tests_for_impl(
-        query=query,
-        limit=limit,
-        include_snippet=include_snippet,
-        context_lines=context_lines,
-        under=under,
-        language=language,
-        session=session,
-        compact=compact,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
-@mcp.tool()
-async def search_config_for(
-    query: Any = None,
-    limit: Any = None,
-    include_snippet: Any = None,
-    context_lines: Any = None,
-    under: Any = None,
-    session: Any = None,
-    compact: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Find likely configuration files for a service/query.
-
-    What it does:
-    - Presets config file globs (yaml/json/toml/etc.) and forwards to repo_search
-    - Accepts extra filters via kwargs
-
-    Returns: repo_search result shape.
-    """
-    return await _search_config_for_impl(
-        query=query,
-        limit=limit,
-        include_snippet=include_snippet,
-        context_lines=context_lines,
-        under=under,
-        session=session,
-        compact=compact,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
-@mcp.tool()
-async def search_callers_for(
-    query: Any = None,
-    limit: Any = None,
-    language: Any = None,
-    session: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Heuristic search for callers/usages of a symbol.
-
-    When to use:
-    - You want files that reference/invoke a function/class
-
-    Notes:
-    - Thin wrapper over repo_search today; pass language or path_glob to narrow
-    - Returns repo_search result shape
-    """
-    return await _search_callers_for_impl(
-        query=query,
-        limit=limit,
-        language=language,
-        session=session,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
-@mcp.tool()
-async def search_importers_for(
-    query: Any = None,
-    limit: Any = None,
-    language: Any = None,
-    session: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Find files likely importing or referencing a module/symbol.
-
-    What it does:
-    - Presets code globs across common languages; forwards to repo_search
-    - Accepts additional filters via kwargs (e.g., under, case)
-
-    Returns: repo_search result shape.
-    """
-    return await _search_importers_for_impl(
-        query=query,
-        limit=limit,
-        language=language,
-        session=session,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
 @mcp.tool()
 async def symbol_graph(
     symbol: str = None,
@@ -1641,284 +1488,6 @@ async def context_answer(
         prepare_filters_and_retrieve_fn=_ca_prepare_filters_and_retrieve,
     )
  
-@mcp.tool()
-async def code_search(
-    query: Any = None,
-    limit: Any = None,
-    per_path: Any = None,
-    include_snippet: Any = None,
-    context_lines: Any = None,
-    rerank_enabled: Any = None,
-    rerank_top_n: Any = None,
-    rerank_return_m: Any = None,
-    rerank_timeout_ms: Any = None,
-    highlight_snippet: Any = None,
-    collection: Any = None,
-    language: Any = None,
-    under: Any = None,
-    kind: Any = None,
-    symbol: Any = None,
-    path_regex: Any = None,
-    path_glob: Any = None,
-    not_glob: Any = None,
-    ext: Any = None,
-    not_: Any = None,
-    case: Any = None,
-    session: Any = None,
-    compact: Any = None,
-    debug: Any = None,
-    output_format: Any = None,
-    repo: Any = None,
-    kwargs: Any = None,
-) -> Dict[str, Any]:
-    """Exact alias of repo_search (hybrid code search with reranking enabled by default).
-
-    Prefer repo_search; this name exists for discoverability in some IDEs/agents.
-    Same parameters and return shape as repo_search.
-    Reranking (rerank_enabled=true) is ON by default for optimal result quality.
-    """
-    return await repo_search(
-        query=query,
-        limit=limit,
-        per_path=per_path,
-        include_snippet=include_snippet,
-        context_lines=context_lines,
-        rerank_enabled=rerank_enabled,
-        rerank_top_n=rerank_top_n,
-        rerank_return_m=rerank_return_m,
-        rerank_timeout_ms=rerank_timeout_ms,
-        highlight_snippet=highlight_snippet,
-        collection=collection,
-        language=language,
-        under=under,
-        kind=kind,
-        symbol=symbol,
-        path_regex=path_regex,
-        path_glob=path_glob,
-        not_glob=not_glob,
-        ext=ext,
-        not_=not_,
-        case=case,
-        session=session,
-        compact=compact,
-        debug=debug,
-        output_format=output_format,
-        repo=repo,
-        kwargs=kwargs,
-    )
-
-
-# ---------------------------------------------------------------------------
-# info_request: Simplified codebase retrieval with explanation mode
-# (helpers imported from scripts.mcp_impl.info_request)
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def info_request(
-    # Primary parameter
-    info_request: str = None,
-    information_request: str = None,  # Alias
-    # Explanation mode
-    include_explanation: bool = None,
-    # Relationship mapping
-    include_relationships: bool = None,
-    # Auth/session (passed through to repo_search)
-    session: str = None,
-    # Optional filters (pass-through to repo_search)
-    limit: int = None,
-    collection: Any = None,
-    language: str = None,
-    under: str = None,
-    repo: Any = None,
-    path_glob: Any = None,
-    # Additional options
-    include_snippet: bool = None,
-    context_lines: int = None,
-    # Output format
-    output_format: Any = None,  # "json" (default) or "toon" for token-efficient format
-    kwargs: Any = None,
-) -> Dict[str, Any]:
-    """Simplified codebase retrieval with optional explanation mode.
-
-    When to use:
-    - Simple, single-parameter code search with human-readable descriptions
-    - When you want optional explanation mode for richer context
-    - Drop-in replacement for basic codebase retrieval tools
-
-    Key parameters:
-    - info_request: str. Natural language description of the code you're looking for.
-    - information_request: str. Alias for info_request.
-    - include_explanation: bool (default false). Add summary, primary_locations, related_concepts.
-    - include_relationships: bool (default false). Add imports_from, calls, related_paths to results.
-    - limit: int (default 10). Maximum results to return.
-    - collection: str (optional). Target collection; defaults to env/WS collection.
-    - language: str. Filter by programming language.
-    - under: str. Limit search to a recursive workspace subtree.
-    - repo: str or list[str]. Filter by repository name(s).
-    - output_format: "json" (default) or "toon" for token-efficient TOON format.
-
-    Returns:
-    - Compact mode (default): results with information field and relevance_score alias
-    - Explanation mode: adds summary, primary_locations, related_concepts, query_understanding
-
-    Example:
-    - {"info_request": "database connection pooling"}
-    - {"info_request": "authentication middleware", "include_explanation": true}
-    """
-    # Resolve query from either parameter
-    query = info_request or information_request
-    if not query or not str(query).strip():
-        return {"ok": False, "error": "info_request parameter is required", "results": []}
-    query = str(query).strip()
-
-    # Resolve defaults from env
-    _default_limit = safe_int(
-        os.environ.get("INFO_REQUEST_LIMIT", "10"), default=10, logger=logger
-    )
-    _default_context = safe_int(
-        os.environ.get("INFO_REQUEST_CONTEXT_LINES", "5"), default=5, logger=logger
-    )
-    _default_explain = str(
-        os.environ.get("INFO_REQUEST_EXPLAIN_DEFAULT", "0")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    _default_relationships = str(
-        os.environ.get("INFO_REQUEST_RELATIONSHIPS", "0")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-
-    # Apply defaults
-    eff_limit = limit if limit is not None else _default_limit
-    eff_context = context_lines if context_lines is not None else _default_context
-    eff_snippet = include_snippet if include_snippet is not None else True
-    eff_explain = include_explanation if include_explanation is not None else _default_explain
-    eff_relationships = include_relationships if include_relationships is not None else _default_relationships
-
-    # Smart limits based on query characteristics (only if user didn't override)
-    if limit is None:
-        query_words = len(query.split())
-        query_lower = query.lower()
-        if query_words <= 2:  # Short query like "auth handler"
-            eff_limit = 15  # More results for broad queries
-        elif "how does" in query_lower or "what is" in query_lower:
-            eff_limit = 8   # Questions need focused results
-
-    # Call repo_search (always JSON - we format TOON ourselves after enhancement)
-    search_result = await repo_search(
-        query=query,
-        limit=eff_limit,
-        per_path=3,  # Better default for info requests
-        session=session,
-        collection=collection,
-        include_snippet=eff_snippet,
-        context_lines=eff_context,
-        language=language,
-        under=under,
-        repo=repo,
-        path_glob=path_glob,
-        output_format="json",  # Always get JSON to iterate results
-        kwargs=kwargs,
-    )
-
-    # Extract results
-    results = search_result.get("results", [])
-    total = search_result.get("total", len(results))
-    used_rerank = search_result.get("used_rerank", False)
-
-    # Enhance each result with information field and optional relationships
-    enhanced_results = []
-    for r in results:
-        enhanced = dict(r)
-        enhanced["information"] = _format_information_field(r)
-        enhanced["relevance_score"] = r.get("score", 0.0)  # Alias
-        # Add relationships if requested
-        if eff_relationships:
-            enhanced["relationships"] = _extract_relationships(r)
-        enhanced_results.append(enhanced)
-
-    # Build better search strategy string
-    strategy_parts = ["hybrid"]
-    if used_rerank:
-        strategy_parts.append("rerank")
-    if repo:
-        strategy_parts.append("repo_filtered")
-    if language:
-        strategy_parts.append(f"lang:{language}")
-    if under:
-        strategy_parts.append("path_filtered")
-    search_strategy = "+".join(strategy_parts)
-
-    # Build response
-    response: Dict[str, Any] = {
-        "ok": True,
-        "results": enhanced_results,
-        "total": total,
-        "search_strategy": search_strategy,
-    }
-
-    # Add explanation if requested
-    if eff_explain:
-        # Primary locations: unique file paths
-        seen_paths = set()
-        primary_locations = []
-        for r in results:
-            p = r.get("path", "")
-            if p and p not in seen_paths:
-                seen_paths.add(p)
-                primary_locations.append(p)
-                if len(primary_locations) >= 5:
-                    break
-
-        # Related concepts
-        related_concepts = _extract_related_concepts(query, results)
-
-        # Detected symbols from query
-        detected_symbols = _extract_symbols_from_query(query)
-
-        # Summary
-        n_files = len(seen_paths)
-        summary = f"Found {total} results related to '{query}' across {n_files} file{'s' if n_files != 1 else ''}"
-
-        # Group results by file
-        files_map: Dict[str, list] = {}
-        for r in enhanced_results:
-            p = r.get("path", "")
-            if p not in files_map:
-                files_map[p] = []
-            files_map[p].append({
-                "symbol": r.get("symbol", ""),
-                "line": r.get("start_line", 0),
-                "score": r.get("score", 0.0),
-            })
-
-        grouped_results = {
-            "by_file": {
-                path: {
-                    "count": len(items),
-                    "top_symbols": [i["symbol"] for i in sorted(items, key=lambda x: -x["score"])[:3] if i["symbol"]],
-                }
-                for path, items in files_map.items()
-            }
-        }
-
-        # Calculate confidence
-        confidence = _calculate_confidence(query, enhanced_results)
-
-        response["summary"] = summary
-        response["primary_locations"] = primary_locations
-        response["related_concepts"] = related_concepts
-        response["grouped_results"] = grouped_results
-        response["confidence"] = confidence
-        response["query_understanding"] = {
-            "intent": "search_for_code",
-            "detected_language": language or None,
-            "detected_symbols": detected_symbols,
-            "search_strategy": search_strategy,
-        }
-
-    # Apply TOON formatting if requested or enabled globally
-    if _should_use_toon(output_format):
-        return _format_results_as_toon(response, compact=False)  # Keep info_request fields
-    return response
-
-
 # ---------------------------------------------------------------------------
 # context_search - thin wrapper delegating to _context_search_impl
 # ---------------------------------------------------------------------------

@@ -6,7 +6,6 @@ Extracted from mcp_indexer_server.py for better modularity.
 Contains:
 - Subprocess runner (_run_async)
 - Embedding model cache (_get_embedding_model)
-- Router cache invalidation (_invalidate_router_scratchpad)
 - Repo detection (_detect_current_repo)
 
 Note: The @mcp.tool() decorated functions remain in mcp_indexer_server.py
@@ -22,7 +21,6 @@ __all__ = [
     # Functions
     "_run_async",
     "_get_embedding_model",
-    "_invalidate_router_scratchpad",
     "_detect_current_repo",
     "_collection_map_impl",
 ]
@@ -98,21 +96,6 @@ async def _run_async(
 
     return await run_subprocess_async(cmd, timeout=timeout, env=env)
 
-
-# ---------------------------------------------------------------------------
-# Router cache invalidation
-# ---------------------------------------------------------------------------
-def _invalidate_router_scratchpad(workspace_path: str) -> bool:
-    """Invalidate any cached router scratchpad for the workspace.
-
-    This is called after indexing operations to ensure the router
-    picks up new/changed code. Returns True if invalidation occurred.
-    """
-    try:
-        # Clear any in-memory caches that might be stale
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------

@@ -208,19 +208,6 @@ TUNABLE_KNOBS = {
         "impacts": ["token_usage", "recall"],
         "category": "limits",
     },
-    "INFO_REQUEST_LIMIT": {
-        "description": "Default limit for info_request tool",
-        "default": 10, "type": "int", "range": (3, 20),
-        "impacts": ["token_usage"],
-        "category": "limits",
-    },
-    "INFO_REQUEST_CONTEXT_LINES": {
-        "description": "Context lines for info_request",
-        "default": 5, "type": "int", "range": (0, 15),
-        "impacts": ["context_density"],
-        "category": "limits",
-    },
-    
     # === Lexical Search ===
     "LEX_MULTI_HASH": {
         "description": "Multi-hash buckets per token (reduces collisions)",

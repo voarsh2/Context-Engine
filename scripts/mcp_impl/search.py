@@ -41,6 +41,7 @@ from scripts.mcp_impl.utils import (
 )
 from scripts.mcp_impl.workspace import _default_collection, _work_script
 from scripts.mcp_impl.admin_tools import _detect_current_repo, _run_async
+from scripts.mcp_impl.search_profiles import append_profile_globs, normalize_profile
 from scripts.mcp_toon import _should_use_toon, _format_results_as_toon
 from scripts.mcp_auth import require_collection_access as _require_collection_access
 from scripts.path_scope import (
@@ -114,6 +115,7 @@ async def _repo_search_impl(
     collection: Any = None,
     workspace_path: Any = None,
     mode: Any = None,
+    profile: Any = None,
     session: Any = None,
     ctx: Any = None,  # MCP Context (passed from wrapper)
     # Structured filters (optional; mirrors hybrid_search flags)
@@ -161,6 +163,7 @@ async def _repo_search_impl(
     - repo: str or list[str]. Filter by repo name(s). Use "*" to search all repos (disable auto-filter).
       By default, auto-detects current repo from CURRENT_REPO env and filters to it.
       Use repo=["frontend","backend"] to search related repos together.
+    - profile: optional search profile ("tests", "config", "code") that applies useful path constraints.
     - Filters (optional): language, under (recursive workspace subtree), kind, symbol, ext, path_regex,
       path_glob (str or list[str]), not_glob (str or list[str]), not_ (negative text), case.
     - debug: bool (default false). When true, includes verbose internal fields like
@@ -176,6 +179,8 @@ async def _repo_search_impl(
 
     Examples:
     - path_glob=["scripts/**","**/*.py"], language="python"
+    - profile="tests"  # constrain to test files
+    - profile="config"  # constrain to config files
     - symbol="context_answer", under="scripts"
     - debug=true  # Include internal scoring details for query tuning
     """
@@ -308,6 +313,11 @@ async def _repo_search_impl(
                 mode is None or (isinstance(mode, str) and str(mode).strip() == "")
             ) and _extra.get("mode") is not None:
                 mode = _extra.get("mode")
+            if (
+                profile is None
+                or (isinstance(profile, str) and str(profile).strip() == "")
+            ) and _extra.get("profile") is not None:
+                profile = _extra.get("profile")
     except Exception:
         pass
 
@@ -469,9 +479,12 @@ async def _repo_search_impl(
 
     path_globs = _to_str_list(path_glob)
     not_globs = _to_str_list(not_glob)
+    profile = normalize_profile(profile)
     ext = _to_str(ext, "").strip()
     not_ = _to_str(not_, "").strip()
     case = _to_str(case, "").strip()
+    if profile:
+        path_globs = append_profile_globs(path_globs, profile)
 
     # Normalize repo filter: str, list[str], or "*" (search all)
     # Default: auto-detect current repo unless REPO_AUTO_FILTER=0
@@ -1659,6 +1672,7 @@ async def _repo_search_impl(
             "rerank_return_m": int(rerank_return_m),
             "rerank_timeout_ms": int(rerank_timeout_ms),
             "collection": collection,
+            "profile": profile,
             "language": language,
             "under": under,
             "kind": kind,

@@ -27,9 +27,8 @@ from scripts.mcp_impl import context_answer
 from scripts.mcp_impl import context_search
 from scripts.mcp_impl import query_expand
 from scripts.mcp_impl import search
-from scripts.mcp_impl import info_request
 from scripts.mcp_impl import memory
-from scripts.mcp_impl import search_specialized
+from scripts.mcp_impl import search_profiles
 from scripts.mcp_impl import search_history
 
 __all__ = [
@@ -42,9 +41,7 @@ __all__ = [
     "context_search",
     "query_expand",
     "search",
-    "info_request",
     "memory",
-    "search_specialized",
+    "search_profiles",
     "search_history",
 ]
-
