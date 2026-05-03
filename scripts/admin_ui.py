@@ -25,8 +25,9 @@ def render_admin_login(
     status_code: int = 200,
 ) -> Any:
     return _templates.TemplateResponse(
-        "admin/login.html",
-        {"request": request, "title": "CTXCE Admin Login", "error": error},
+        request=request,
+        name="admin/login.html",
+        context={"title": "CTXCE Admin Login", "error": error},
         status_code=status_code,
     )
 
@@ -37,8 +38,9 @@ def render_admin_bootstrap(
     status_code: int = 200,
 ) -> Any:
     return _templates.TemplateResponse(
-        "admin/bootstrap.html",
-        {"request": request, "title": "CTXCE Admin Bootstrap", "error": error},
+        request=request,
+        name="admin/bootstrap.html",
+        context={"title": "CTXCE Admin Bootstrap", "error": error},
         status_code=status_code,
     )
 
@@ -54,9 +56,9 @@ def render_admin_acl(
     status_code: int = 200,
 ) -> Any:
     return _templates.TemplateResponse(
-        "admin/acl.html",
-        {
-            "request": request,
+        request=request,
+        name="admin/acl.html",
+        context={
             "title": "CTXCE Admin ACL",
             "users": users,
             "collections": collections,
@@ -78,9 +80,9 @@ def render_admin_error(
     status_code: int = 400,
 ) -> Any:
     return _templates.TemplateResponse(
-        "admin/error.html",
-        {
-            "request": request,
+        request=request,
+        name="admin/error.html",
+        context={
             "title": title,
             "message": message,
             "back_href": back_href,
