@@ -7,7 +7,6 @@ OUT_DIR="$SCRIPT_DIR/../out"
 SRC_SCRIPT="$SCRIPT_DIR/../../scripts/standalone_upload_client.py"
 CLIENT="standalone_upload_client.py"
 STAGE_DIR="$OUT_DIR/extension-stage"
-BUNDLE_DEPS="${1:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 HOOK_SRC="$SCRIPT_DIR/../../ctx-hook-simple.sh"
 CTX_SRC="$SCRIPT_DIR/../../scripts/ctx.py"
@@ -60,16 +59,16 @@ if [[ -f "$ENV_EXAMPLE_SRC" ]]; then
     cp "$ENV_EXAMPLE_SRC" "$STAGE_DIR/env.example"
 fi
 
-# Optional: bundle Python deps into the staged extension when requested
-if [[ "$BUNDLE_DEPS" == "--bundle-deps" ]]; then
-    echo "Bundling Python dependencies into staged extension using $PYTHON_BIN..."
-    # On macOS, urllib3 v2 + system LibreSSL emits NotOpenSSLWarning; pin <2 there.
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "Detected macOS; pinning urllib3<2 to avoid LibreSSL/OpenSSL warning."
-        "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" "urllib3<2" requests charset_normalizer "openai>=1.0" watchdog
-    else
-        "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" requests urllib3 charset_normalizer "openai>=1.0" watchdog
-    fi
+# Bundle Python deps into the staged extension. Runtime assumes bundled
+# python_libs are present and only requires an installed Python interpreter.
+echo "Bundling Python dependencies into staged extension using $PYTHON_BIN..."
+rm -rf "$STAGE_DIR/python_libs"
+# On macOS, urllib3 v2 + system LibreSSL emits NotOpenSSLWarning; pin <2 there.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "Detected macOS; pinning urllib3<2 to avoid LibreSSL/OpenSSL warning."
+    "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" "urllib3<2" requests charset_normalizer "openai>=1.0" watchdog
+else
+    "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" requests urllib3 charset_normalizer "openai>=1.0" watchdog
 fi
 
 # Bundle MCP bridge npm package into the staged extension
@@ -91,10 +90,12 @@ if [[ -d "$BRIDGE_SRC" && -f "$BRIDGE_SRC/package.json" ]]; then
     fi
     cp "$BRIDGE_SRC/package.json" "$STAGE_DIR/$BRIDGE_DIR/"
 
-    if [[ -d "$BRIDGE_SRC/node_modules" ]]; then
-        cp -a "$BRIDGE_SRC/node_modules" "$STAGE_DIR/$BRIDGE_DIR/"
+    echo "Installing MCP bridge production dependencies into staged extension..."
+    if [[ -f "$BRIDGE_SRC/package-lock.json" ]]; then
+        cp "$BRIDGE_SRC/package-lock.json" "$STAGE_DIR/$BRIDGE_DIR/"
+        (cd "$STAGE_DIR/$BRIDGE_DIR" && npm ci --omit=dev)
     else
-        echo "Warning: Bridge node_modules not found. Run 'npm install' in ctx-mcp-bridge first."
+        (cd "$STAGE_DIR/$BRIDGE_DIR" && npm install --omit=dev)
     fi
     echo "MCP bridge bundled successfully."
 else

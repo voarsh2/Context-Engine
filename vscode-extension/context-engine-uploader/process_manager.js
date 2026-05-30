@@ -64,8 +64,11 @@ function createProcessManager(deps) {
             env.CONTAINER_ROOT = options.containerRoot;
         }
         try {
-            const libsPath = path.join(options.workingDirectory, 'python_libs');
-            if (fs.existsSync(libsPath)) {
+            const libsPath = [
+                path.join(options.workingDirectory, 'python_libs'),
+                path.join(getExtensionRoot(), 'python_libs')
+            ].find(p => p && fs.existsSync(p));
+            if (libsPath) {
                 const existing = env.PYTHONPATH || '';
                 env.PYTHONPATH = existing ? `${libsPath}${path.delimiter}${existing}` : libsPath;
                 if (!_hasLoggedPythonPath) {

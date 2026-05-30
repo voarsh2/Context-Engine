@@ -9,7 +9,7 @@ function createCtxConfigManager(deps) {
   const extensionRoot = deps.extensionRoot;
   const getEffectiveConfig = deps.getEffectiveConfig;
   const resolveOptions = deps.resolveOptions;
-  const ensurePythonDependencies = deps.ensurePythonDependencies;
+  const ensurePythonReady = deps.ensurePythonReady;
   const buildChildEnv = deps.buildChildEnv;
   const resolveBridgeHttpUrl = deps.resolveBridgeHttpUrl;
 
@@ -29,12 +29,8 @@ function createCtxConfigManager(deps) {
     if (!options) {
       return;
     }
-    const depsOk = await ensurePythonDependencies(
-      options.pythonPath,
-      options.workingDirectory,
-      options.pythonPathSource
-    );
-    if (!depsOk) {
+    const pythonReady = await ensurePythonReady(options.pythonPath);
+    if (!pythonReady) {
       return;
     }
     options = resolveOptions() || options;

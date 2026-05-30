@@ -193,10 +193,8 @@ function createConfigResolver(deps) {
 
         const configuredPython = (config.get('pythonPath') || '').trim();
         let pythonPath = configuredPython || 'python3';
-        let pythonPathSource = configuredPython ? 'configured' : 'default';
         if (pythonOverridePath && fs.existsSync(pythonOverridePath)) {
             pythonPath = pythonOverridePath;
-            pythonPathSource = 'override';
         }
         const endpoint = (config.get('endpoint') || '').trim();
         const targetPath = getTargetPath(config);
@@ -263,7 +261,6 @@ function createConfigResolver(deps) {
 
         return {
             pythonPath,
-            pythonPathSource,
             workingDirectory,
             scriptPath,
             targetPath,

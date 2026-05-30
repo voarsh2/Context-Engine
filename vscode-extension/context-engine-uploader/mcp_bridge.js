@@ -11,11 +11,24 @@ function createBridgeManager(deps) {
   const attachOutput = deps.attachOutput;
   const terminateProcess = deps.terminateProcess;
   const scheduleMcpConfigRefreshAfterBridge = deps.scheduleMcpConfigRefreshAfterBridge;
+  const cancelPendingBridgeConfigRefresh = deps.cancelPendingBridgeConfigRefresh;
 
   let httpBridgeProcess;
   let httpBridgePort;
   let httpBridgeWorkspace;
   let stopInFlight;
+
+  function clearBridgeState(child) {
+    if (httpBridgeProcess !== child) {
+      return;
+    }
+    httpBridgeProcess = undefined;
+    httpBridgePort = undefined;
+    httpBridgeWorkspace = undefined;
+    if (typeof cancelPendingBridgeConfigRefresh === 'function') {
+      cancelPendingBridgeConfigRefresh();
+    }
+  }
 
   function normalizeBridgeUrl(url) {
     if (!url || typeof url !== 'string') {
@@ -65,11 +78,7 @@ function createBridgeManager(deps) {
     // First check for bundled bridge if mode is 'bundled'
     const mode = getBridgeMode();
     if (mode === 'bundled') {
-      const bundledBin = findBundledBridgeBin();
-      if (bundledBin) {
-        return bundledBin;
-      }
-      log('Bundled bridge requested but not found; falling back to external resolution');
+      return findBundledBridgeBin();
     }
 
     // External mode logic (existing behavior)
@@ -109,6 +118,9 @@ function createBridgeManager(deps) {
         args: [binPath],
         kind: resolvedKind
       };
+    }
+    if (getBridgeMode() === 'bundled') {
+      return undefined;
     }
     const isWindows = process.platform === 'win32';
     if (isWindows) {
@@ -238,21 +250,12 @@ function createBridgeManager(deps) {
     attachOutput(child, 'mcp-http');
     child.on('exit', (code, signal) => {
       log(`HTTP MCP bridge exited with code ${code} signal ${signal || ''}`.trim());
-      if (httpBridgeProcess === child) {
-        httpBridgeProcess = undefined;
-        httpBridgePort = undefined;
-        httpBridgeWorkspace = undefined;
-      }
+      clearBridgeState(child);
     });
     child.on('error', error => {
       log(`HTTP MCP bridge process error: ${error instanceof Error ? error.message : String(error)}`);
-      if (httpBridgeProcess === child) {
-        httpBridgeProcess = undefined;
-        httpBridgePort = undefined;
-        httpBridgeWorkspace = undefined;
-      }
+      clearBridgeState(child);
     });
-    vscode.window.showInformationMessage(`Context Engine HTTP MCP bridge listening on http://127.0.0.1:${options.port}/mcp`);
     if (typeof scheduleMcpConfigRefreshAfterBridge === 'function') {
       scheduleMcpConfigRefreshAfterBridge();
     }
