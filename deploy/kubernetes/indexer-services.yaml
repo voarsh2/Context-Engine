@@ -53,8 +53,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/watch_index.py
-        workingDir: /work
+        - -m
+        - scripts.watch_index
+        workingDir: /app
         env:
         - name: QDRANT_URL
           valueFrom:
@@ -191,8 +192,11 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/ingest_code.py
-        workingDir: /work
+        - -m
+        - scripts.ingest_code
+        - --root
+        - /work
+        workingDir: /app
         env:
         - name: QDRANT_URL
           valueFrom:
@@ -299,8 +303,8 @@ spec:
         command:
         - /bin/sh
         - -c
-        - PYTHONPATH=/app python /app/scripts/run_init_maintenance.py
-        workingDir: /work
+        - python -m scripts.run_init_maintenance
+        workingDir: /app
         env:
         - name: QDRANT_URL
           valueFrom:

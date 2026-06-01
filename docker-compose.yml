@@ -88,11 +88,11 @@ services:
       dockerfile: Dockerfile.mcp-indexer
     container_name: mcp-indexer-dev-remote
     user: "1000:1000"
-    # In K8s, scripts would be accessed directly at /app/scripts/ or via proper initContainer
+    # In K8s, scripts run as package modules from /app or via proper initContainer
     # For Docker Compose dev-remote simulation, create symlink so /work/scripts/ works
     # Use /tmp/huggingface for cache to avoid permission issues (universally writable)
     # Set CORRECT environment variables for HuggingFace and FastEmbed
-    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/mcp_indexer_server.py"]
+    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.mcp_indexer_server"]
     depends_on:
       - qdrant
     env_file:
@@ -177,7 +177,7 @@ services:
       dockerfile: Dockerfile.mcp-indexer
     container_name: learning-worker-dev-remote
     user: "1000:1000"
-    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/learning_reranker_worker.py --daemon"]
+    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.learning_reranker_worker --daemon"]
     depends_on:
       - qdrant
       - mcp_indexer
@@ -289,11 +289,11 @@ services:
       dockerfile: Dockerfile.mcp-indexer
     container_name: mcp-indexer-http-dev-remote
     user: "1000:1000"
-    # In K8s, scripts would be accessed directly at /app/scripts/ or via proper initContainer
+    # In K8s, scripts run as package modules from /app or via proper initContainer
     # For Docker Compose dev-remote simulation, create symlink so /work/scripts/ works
     # Use /tmp/huggingface for cache to avoid permission issues (universally writable)
     # Set CORRECT environment variables for HuggingFace and FastEmbed
-    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/mcp_indexer_server.py"]
+    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.mcp_indexer_server"]
     depends_on:
       - qdrant
     env_file:
@@ -436,7 +436,7 @@ services:
     volumes:
       - workspace_pvc:/work:rw
       - codebase_pvc:/work/.codebase:rw
-    entrypoint: ["sh", "-c", "mkdir -p /tmp/logs /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && /app/scripts/wait-for-qdrant.sh && cd /app && python /app/scripts/ingest_code.py --root /work"]
+    entrypoint: ["sh", "-c", "mkdir -p /tmp/logs /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && /app/scripts/wait-for-qdrant.sh && cd /app && python -m scripts.ingest_code --root /work"]
     restart: "no"  # Run once on startup, do not restart after completion
     cpus: 2.0
     networks:
@@ -496,7 +496,7 @@ services:
     volumes:
       - workspace_pvc:/work:rw
       - codebase_pvc:/work/.codebase:rw
-    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/watch_index.py"]
+    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.watch_index"]
     cpus: 2
     networks:
       - dev-remote-network
@@ -535,7 +535,7 @@ services:
     command: [
       "sh",
       "-c",
-      "mkdir -p /tmp/logs /work/.codebase && (chgrp -R 1000 /work/.codebase 2>/dev/null || true) && (chmod -R g+rwX /work/.codebase 2>/dev/null || true) && (find /work/.codebase -type d -exec chmod g+s {} + 2>/dev/null || true) && echo 'Starting initialization sequence...' && PYTHONPATH=/app python /app/scripts/run_init_maintenance.py && echo 'Initialization completed successfully!'"
+      "mkdir -p /tmp/logs /work/.codebase && (chgrp -R 1000 /work/.codebase 2>/dev/null || true) && (chmod -R g+rwX /work/.codebase 2>/dev/null || true) && (find /work/.codebase -type d -exec chmod g+s {} + 2>/dev/null || true) && echo 'Starting initialization sequence...' && cd /app && python -m scripts.run_init_maintenance && echo 'Initialization completed successfully!'"
     ]
     restart: "no"  # Run once on startup
     networks:
@@ -616,7 +616,7 @@ services:
     command: [
       "sh",
       "-c",
-      "mkdir -p /work/.codebase && (chgrp -R 1000 /work/.codebase 2>/dev/null || true) && (chmod -R g+rwX /work/.codebase 2>/dev/null || true) && (find /work/.codebase -type d -exec chmod g+s {} + 2>/dev/null || true) && exec python scripts/upload_service.py"
+      "mkdir -p /work/.codebase && (chgrp -R 1000 /work/.codebase 2>/dev/null || true) && (chmod -R g+rwX /work/.codebase 2>/dev/null || true) && (find /work/.codebase -type d -exec chmod g+s {} + 2>/dev/null || true) && cd /app && exec python -m scripts.upload_service"
     ]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]

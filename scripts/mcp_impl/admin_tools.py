@@ -44,39 +44,10 @@ _EMBED_MODEL_LOCKS: Dict[str, threading.Lock] = {}
 
 
 def _get_embedding_model(model_name: str):
-    """Get cached embedding model with optional Qwen3 support.
+    """Get cached embedding model via the centralized embedder factory."""
+    from scripts.embedder import get_embedding_model
 
-    Uses the centralized embedder factory if available, with fallback
-    to direct fastembed initialization for backwards compatibility.
-    """
-    # Try centralized embedder factory first (supports Qwen3 feature flag)
-    try:
-        from scripts.embedder import get_embedding_model
-        return get_embedding_model(model_name)
-    except ImportError:
-        pass
-
-    # Fallback to original implementation
-    try:
-        from fastembed import TextEmbedding  # type: ignore
-    except Exception:
-        raise
-
-    m = _EMBED_MODEL_CACHE.get(model_name)
-    if m is None:
-        # Double-checked locking to avoid duplicate inits under concurrency
-        lock = _EMBED_MODEL_LOCKS.setdefault(model_name, threading.Lock())
-        with lock:
-            m = _EMBED_MODEL_CACHE.get(model_name)
-            if m is None:
-                m = TextEmbedding(model_name=model_name)
-                try:
-                    # Warmup with common patterns to optimize internal caches
-                    _ = list(m.embed(["function", "class", "import", "def", "const"]))
-                except Exception:
-                    pass
-                _EMBED_MODEL_CACHE[model_name] = m
-    return m
+    return get_embedding_model(model_name)
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +78,7 @@ def _detect_current_repo() -> Optional[str]:
     Priority:
     1. CURRENT_REPO env var (explicitly set)
     2. REPO_NAME env var
-    3. Detect from /work directory structure (first subdirectory with .git)
-    4. Git remote origin name
+    3. Bindmount git detection when CTXCE_BINDMOUNT_REPO_DETECTION=1
 
     Returns: repo name or None if detection fails
     """
@@ -118,7 +88,17 @@ def _detect_current_repo() -> Optional[str]:
         if val:
             return val
 
-    # Try to detect from /work directory. Do not guess from invalid/internal
+    try:
+        from scripts.workspace_state import bindmount_repo_detection_enabled
+
+        allow_git_detection = bindmount_repo_detection_enabled()
+    except Exception:
+        allow_git_detection = False
+
+    if not allow_git_detection:
+        return None
+
+    # Bindmount detection from /work. Do not guess from invalid/internal
     # metadata: a leaked /work/.git must not become repo "work".
     work_path = Path("/work")
     if work_path.exists():

@@ -164,13 +164,13 @@ The Learning Reranker is an **optional** self-improving ranking system that lear
 
 #### Components
 
-**TinyScorer** (`scripts/rerank_recursive.py`)
+**TinyScorer** (`scripts/rerank_recursive/recursive.py`)
 - 2-layer MLP neural network (~3MB per collection)
 - Scores query-document pairs based on learned patterns
 - Hot-reloads weights every 60 seconds from disk
 - Per-collection weights (each repo learns independently)
 
-**Event Logger** (`scripts/rerank_events.py`)
+**Event Logger** (`scripts/rerank_tools/events.py`)
 - Logs every search to NDJSON files at `/tmp/rerank_events/`
 - Records: query, candidates, initial scores, timestamps
 - Hourly file rotation with configurable retention

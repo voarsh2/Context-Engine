@@ -360,7 +360,7 @@ rerank_return_m=10  # Rerank and return top 10
 The reranker (ONNX cross-encoder) scores `(query, document)` pairs. The document text is constructed from:
 
 ```python
-# From scripts/rerank_local.py:prepare_pairs()
+# From scripts/rerank_tools/local.py:prepare_pairs()
 header = f"[{language}/{kind}] {symbol_path} — {path}"
 doc = header + "\n" + metadata.code[:600]
 ```
@@ -379,7 +379,7 @@ doc = header + "\n" + metadata.code[:600]
 To debug what the reranker sees:
 
 ```python
-from scripts.rerank_local import prepare_pairs
+from scripts.rerank_tools.local import prepare_pairs
 from qdrant_client import QdrantClient
 
 client = QdrantClient()

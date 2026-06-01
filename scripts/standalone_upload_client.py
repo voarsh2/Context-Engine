@@ -39,11 +39,7 @@ try:
 except ImportError:
     WATCHDOG_AVAILABLE = False
 
-try:
-    from upload_auth_utils import get_auth_session  # type: ignore[import]
-except ImportError:
-    def get_auth_session(upload_endpoint: str) -> str:
-        return ""
+from scripts.upload_auth_utils import get_auth_session
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

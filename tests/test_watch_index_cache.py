@@ -587,7 +587,7 @@ def test_runtime_root_override_updates_internal_path_checks(monkeypatch, tmp_pat
     monkeypatch.setattr(watch_index, "run_empty_dir_sweep_maintenance", lambda *a, **k: None)
     monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", lambda *a, **k: [])
     monkeypatch.setattr(watch_index, "get_boolean_env", lambda *a, **k: False)
-    monkeypatch.setattr(watch_index.time, "sleep", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(watch_index, "_sleep", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     try:
         watch_index.main()
@@ -614,6 +614,7 @@ def test_main_throttles_periodic_maintenance(monkeypatch, tmp_path):
     original_watch_root = watch_index.ROOT
     monkeypatch.setenv("WATCH_ROOT", str(runtime_root))
     monkeypatch.setenv("WATCH_MAINTENANCE_INTERVAL_SECS", "300")
+    monkeypatch.setenv("WATCH_INIT_MAINTENANCE_ENABLED", "0")
     monkeypatch.setattr(watch_index, "initialize_watcher_state", lambda *a, **k: {"repo_name": None})
     monkeypatch.setattr(watch_index, "get_indexing_config_snapshot", lambda repo_name=None: {})
     monkeypatch.setattr(watch_index, "compute_indexing_config_hash", lambda snapshot: "hash")
@@ -662,7 +663,7 @@ def test_main_throttles_periodic_maintenance(monkeypatch, tmp_path):
         if sleep_calls["count"] >= 4:
             raise KeyboardInterrupt()
 
-    monkeypatch.setattr(watch_index.time, "sleep", _sleep)
+    monkeypatch.setattr(watch_index, "_sleep", _sleep)
 
     try:
         watch_index.main()

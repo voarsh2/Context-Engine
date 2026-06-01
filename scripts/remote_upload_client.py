@@ -573,14 +573,11 @@ class RemoteUploadClient:
         self.temp_dir = None
         self.logical_repo_id = logical_repo_id
 
-        # Get repo name for cache operations
-        try:
-            from scripts.workspace_state import _extract_repo_name_from_path
-            self.repo_name = _extract_repo_name_from_path(workspace_path)
-            # Fallback to directory name if repo detection fails (for non-git repos)
-            if not self.repo_name:
-                self.repo_name = Path(workspace_path).name
-        except ImportError:
+        from scripts.workspace_state import _extract_repo_name_from_path
+
+        self.repo_name = _extract_repo_name_from_path(workspace_path)
+        # Fallback to directory name if repo detection fails (for non-git repos)
+        if not self.repo_name:
             self.repo_name = Path(workspace_path).name
 
         # In-memory stat cache to avoid rehashing unchanged files on every watch iteration

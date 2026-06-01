@@ -23,6 +23,8 @@ import math
 import logging
 from typing import List, Dict, Any, Tuple
 
+from qdrant_client import QdrantClient, models
+
 logger = logging.getLogger("hybrid_ranking")
 
 # ---------------------------------------------------------------------------
@@ -81,11 +83,8 @@ def _get_micro_defaults() -> Tuple[int, int, int, int]:
     Budget tokens floor is 5000 to ensure context_answer has enough context for quality answers.
     """
     micro_enabled = os.environ.get("INDEX_MICRO_CHUNKS", "1").strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    from scripts.refrag_glm import detect_glm_runtime
+    is_glm = detect_glm_runtime()
     if is_glm:
         if micro_enabled:
             return (24, 6, 8192, 32)
@@ -657,12 +656,6 @@ def _get_symbol_extent(
     cache_key = (collection, path, symbol)
     if cache_key in _SYMBOL_EXTENT_CACHE:
         return _SYMBOL_EXTENT_CACHE[cache_key]
-
-    # Lazy import to avoid circular dependencies
-    try:
-        from qdrant_client import QdrantClient, models
-    except ImportError:
-        return (0, 0)
 
     if not collection:
         collection = os.environ.get("COLLECTION_NAME", "")

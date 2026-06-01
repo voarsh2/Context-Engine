@@ -26,19 +26,13 @@ Usage:
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Add project root to path
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from scripts.rerank_events import (
+from scripts.rerank_tools.events import (
     RERANK_EVENTS_DIR,
     RERANK_EVENTS_RETENTION_DAYS,
     read_events,
@@ -540,7 +534,7 @@ class CollectionLearner:
     def _maybe_fill_teacher_scores(self, events: List[Dict[str, Any]]):
         """Compute teacher scores for events that don't already have them."""
         try:
-            from scripts.rerank_local import rerank_local
+            from scripts.rerank_tools.local import rerank_local
         except Exception:
             rerank_local = None
 

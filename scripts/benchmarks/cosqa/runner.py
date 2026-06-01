@@ -61,12 +61,6 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dotenv import load_dotenv
-
-# Load .env immediately to ensure all subsequent imports (like scripts.ingest.config)
-# see the correct environment variables.
-load_dotenv(override=True)
-
 from scripts.benchmarks.qdrant_utils import (
     get_qdrant_client, 
     probe_pseudo_tags, 
@@ -76,9 +70,6 @@ from scripts.benchmarks.qdrant_utils import (
 # Force-disable OpenLit/OTel for benchmarks so they never try to talk to openlit-dashboard
 os.environ["OPENLIT_ENABLED"] = "0"
 os.environ["OTEL_SDK_DISABLED"] = "true"
-
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 # NOTE: .env loading moved to _load_benchmark_env() to avoid polluting
 # environment when this module is imported (e.g., by tests or __init__.py).

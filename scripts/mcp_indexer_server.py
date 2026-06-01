@@ -29,19 +29,8 @@ from __future__ import annotations
 # CRITICAL: OpenLit must be initialized BEFORE any qdrant_client imports
 # to properly instrument vector DB calls. This import must come first!
 # ---------------------------------------------------------------------------
-import os as _os
-import sys as _sys
-_roots_env = _os.environ.get("WORK_ROOTS", "")
-_roots = [p.strip() for p in _roots_env.split(",") if p.strip()] or ["/work", "/app"]
-for _root in _roots:
-    if _root and _root not in _sys.path:
-        _sys.path.insert(0, _root)
+from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
 
-# Now import OpenLit init (before any other scripts imports)
-try:
-    from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
-except ImportError:
-    pass  # OpenLit not available
 import json
 import asyncio
 import re
@@ -68,31 +57,13 @@ import time
 from typing import Any, Dict, Optional, List, Tuple
 
 from pathlib import Path
-import sys
 
-# Import structured logging and error handling (after sys.path setup)
-# Will be imported after sys.path is configured below
-
-import contextlib
-
-# Ensure code roots are on sys.path so absolute imports like 'from scripts.x import y' work
-# when this file is executed directly (sys.path[0] may be /work/scripts).
-# Supports multiple roots via WORK_ROOTS env (comma-separated), defaults to /work and /app.
-_roots_env = os.environ.get("WORK_ROOTS", "")
-_roots = [p.strip() for p in _roots_env.split(",") if p.strip()] or ["/work", "/app"]
-try:
-    for _root in _roots:
-        if _root and _root not in sys.path:
-            sys.path.insert(0, _root)
-except Exception:
-    pass
+import qdrant_client
 
 # Note: OpenLit initialization is handled by early import of scripts.openlit_init
 # at the top of this file (before any qdrant_client imports)
 
-# Session state imported from mcp_workspace shim (-> scripts.mcp.workspace)
-# Must be after sys.path setup
-from scripts.mcp_workspace import (
+from scripts.mcp_impl.workspace import (
     _MEM_COLL_CACHE,
     SESSION_DEFAULTS,
     SESSION_DEFAULTS_BY_SESSION,
@@ -100,31 +71,20 @@ from scripts.mcp_workspace import (
     _SESSION_CTX_LOCK,
 )
 
-# Import structured logging and error handling (after sys.path setup)
-try:
-    from scripts.logger import (
-        get_logger,
-        ContextLogger,
-        RetrievalError,
-        IndexingError,
-        DecoderError,
-        ValidationError,
-        ConfigurationError,
-        safe_int,
-        safe_float,
-        safe_bool,
-    )
+from scripts.logger import (
+    get_logger,
+    ContextLogger,
+    RetrievalError,
+    IndexingError,
+    DecoderError,
+    ValidationError,
+    ConfigurationError,
+    safe_int,
+    safe_float,
+    safe_bool,
+)
 
-    logger = get_logger(__name__)
-except ImportError:
-    # Fallback if logger module not available
-    import logging
-
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
-
-    # Import safe conversion functions from utils (single source of truth)
-    from scripts.mcp_impl.utils import safe_int, safe_float, safe_bool
+logger = get_logger(__name__)
 
 
 from scripts.mcp_auth import (
@@ -135,7 +95,7 @@ from scripts.mcp_auth import (
 # ---------------------------------------------------------------------------
 # Re-exports from extracted modules (backwards compatibility)
 # ---------------------------------------------------------------------------
-from scripts.mcp_utils import (
+from scripts.mcp_impl.utils import (
     _coerce_bool,
     _coerce_int,
     _coerce_str,
@@ -152,7 +112,7 @@ from scripts.mcp_utils import (
     _primary_identifier_from_queries,
 )
 
-from scripts.mcp_toon import (
+from scripts.mcp_impl.toon import (
     _is_toon_output_enabled,
     _should_use_toon,
     _format_results_as_toon,
@@ -178,25 +138,13 @@ from scripts.mcp_impl.pattern_search import _pattern_search_impl
 _ENV_LOCK = threading.Lock()
 
 # Shared utilities (lex hashing, snippet highlighter)
-try:
-    from scripts.utils import highlight_snippet as _do_highlight_snippet
-except Exception as e:
-    logger.warning(f"Failed to import rich for syntax highlighting: {e}")
-    _do_highlight_snippet = None  # fallback guarded at call site
+from scripts.utils import highlight_snippet as _do_highlight_snippet
 
 
 # Back-compat shim for tests expecting _highlight_snippet in this module
 # Delegates to scripts.utils.highlight_snippet when available
-try:
-
-    def _highlight_snippet(snippet, tokens):  # type: ignore
-        return (
-            _do_highlight_snippet(snippet, tokens) if _do_highlight_snippet else snippet
-        )
-except Exception:
-
-    def _highlight_snippet(snippet, tokens):  # type: ignore
-        return snippet
+def _highlight_snippet(snippet, tokens):  # type: ignore
+    return _do_highlight_snippet(snippet, tokens)
 
 
 try:
@@ -268,15 +216,14 @@ os.environ.setdefault(
 )  # Disable strict identifier requirement
 
 
-# --- TOON functions imported from scripts.mcp_toon ---
+# --- TOON functions imported from scripts.mcp_impl.toon ---
 # (see imports at top of file for backwards compatibility re-exports)
 
-# --- Workspace state functions imported from mcp_workspace shim ---
-from scripts.mcp_workspace import (
+# --- Workspace state functions imported from workspace helper module ---
+from scripts.mcp_impl.workspace import (
     _state_file_path,
     _read_ws_state,
     _default_collection,
-    _work_script,
 )
 
 # Disable DNS rebinding protection - breaks Docker internal networking (Host: mcp:8000)
@@ -445,82 +392,11 @@ def _start_readyz_server():
         return False
 
 
-# Import the new subprocess manager
-try:
-    from scripts.subprocess_manager import run_subprocess_async
-except ImportError:
-    # Fallback if subprocess_manager not available
-    logger.warning("subprocess_manager not available, using fallback implementation")
-
-    async def run_subprocess_async(
-        cmd: List[str],
-        timeout: Optional[float] = None,
-        env: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        """Fallback subprocess runner if subprocess_manager is not available."""
-        proc: Optional[asyncio.subprocess.Process] = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            # Default timeout from env if not provided by caller
-            if timeout is None:
-                timeout = MCP_TOOL_TIMEOUT_SECS
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
-                code = proc.returncode
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return {
-                    "ok": False,
-                    "code": -1,
-                    "stdout": "",
-                    "stderr": f"Command timed out after {timeout}s",
-                }
-            stdout = (stdout_b or b"").decode("utf-8", errors="ignore")
-            stderr = (stderr_b or b"").decode("utf-8", errors="ignore")
-
-            def _cap_tail(s: str) -> str:
-                if not s:
-                    return s
-                return (
-                    s
-                    if len(s) <= MAX_LOG_TAIL
-                    else ("...[tail truncated]\n" + s[-MAX_LOG_TAIL:])
-                )
-
-            return {
-                "ok": code == 0,
-                "code": code,
-                "stdout": _cap_tail(stdout),
-                "stderr": _cap_tail(stderr),
-            }
-        except Exception as e:
-            return {"ok": False, "code": -2, "stdout": "", "stderr": str(e)}
-        finally:
-            try:
-                if proc is not None:
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-                    if proc.stderr is not None:
-                        proc.stderr.close()
-                    # Ensure the process is reaped
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
-            except Exception:
-                pass
+from scripts.subprocess_manager import run_subprocess_async
 
 
-# --- Admin tool helpers imported from mcp_admin_tools shim ---
-from scripts.mcp_admin_tools import (
+# --- Admin tool helpers imported from admin helper module ---
+from scripts.mcp_impl.admin_tools import (
     _EMBED_MODEL_CACHE,
     _EMBED_MODEL_LOCKS,
     _run_async,
@@ -529,13 +405,13 @@ from scripts.mcp_admin_tools import (
 )
 
 # Lenient argument normalization to tolerate buggy clients (e.g., JSON-in-kwargs, booleans where strings expected)
-# Note: _maybe_parse_jsonish and other parsing helpers are now imported from scripts.mcp_utils
+# Note: _maybe_parse_jsonish and other parsing helpers are now imported from scripts.mcp_impl.utils
 from typing import Any as _Any, Dict as _Dict
 
 # Extra parsing helpers for quirky clients that send stringified kwargs
 import urllib.parse as _urlparse, ast as _ast
 
-# --- Utility functions imported from scripts.mcp_utils ---
+# --- Utility functions imported from scripts.mcp_impl.utils ---
 # (see imports at top of file for backwards compatibility re-exports:
 #  _parse_kv_string, _coerce_value_string, _to_str_list_relaxed,
 #  _extract_kwargs_payload, _looks_jsonish_string, _coerce_bool,
@@ -591,7 +467,7 @@ async def qdrant_index_root(
             )  # type: ignore
 
             if _ws_is_multi_repo_mode():
-                coll = _ws_get_collection_name("/work") or _default_collection()
+                coll = _default_collection()
             else:
                 coll = _ws_get_collection_name(None) or _default_collection()
         except Exception:
@@ -603,7 +479,7 @@ async def qdrant_index_root(
     env["QDRANT_URL"] = QDRANT_URL
     env["COLLECTION_NAME"] = coll
 
-    cmd = ["python", _work_script("ingest_code.py"), "--root", "/work"]
+    cmd = ["python", "-m", "scripts.ingest_code", "--root", "/work"]
     if recreate:
         cmd.append("--recreate")
 
@@ -627,17 +503,13 @@ async def qdrant_list(kwargs: Any = None) -> Dict[str, Any]:
     - {"collections": [str, ...]} or {"error": "..."}
     """
     try:
-        from qdrant_client import QdrantClient
-
-        client = QdrantClient(
+        client = qdrant_client.QdrantClient(
             url=QDRANT_URL,
             api_key=os.environ.get("QDRANT_API_KEY"),
             timeout=float(os.environ.get("QDRANT_TIMEOUT", "20") or 20),
         )
         cols_info = await asyncio.to_thread(client.get_collections)
         return {"collections": [c.name for c in cols_info.collections]}
-    except ImportError:
-        return {"error": "qdrant_client is not installed in this container"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -756,10 +628,9 @@ async def qdrant_status(
         pass
     coll = collection or _default_collection()
     try:
-        from qdrant_client import QdrantClient
         import datetime as _dt
 
-        client = QdrantClient(
+        client = qdrant_client.QdrantClient(
             url=QDRANT_URL,
             api_key=os.environ.get("QDRANT_API_KEY"),
             timeout=float(os.environ.get("QDRANT_TIMEOUT", "20") or 20),
@@ -906,7 +777,7 @@ async def qdrant_index(
             )  # type: ignore
 
             if _ws_is_multi_repo_mode():
-                coll = _ws_get_collection_name(root) or _default_collection()
+                coll = _default_collection()
             else:
                 coll = _ws_get_collection_name(None) or _default_collection()
         except Exception:
@@ -920,7 +791,8 @@ async def qdrant_index(
 
     cmd = [
         "python",
-        _work_script("ingest_code.py"),
+        "-m",
+        "scripts.ingest_code",
         "--root",
         root,
     ]
@@ -1019,7 +891,7 @@ async def qdrant_prune(kwargs: Any = None, **ignored: Any) -> Dict[str, Any]:
     env = os.environ.copy()
     env["PRUNE_ROOT"] = "/work"
 
-    cmd = ["python", _work_script("prune.py")]
+    cmd = ["python", "-m", "scripts.prune"]
     res = await _run_async(cmd, env=env)
     return res
 
@@ -1027,7 +899,7 @@ async def qdrant_prune(kwargs: Any = None, **ignored: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Code signal detection imported from mcp_code_signals shim
 # ---------------------------------------------------------------------------
-from scripts.mcp_code_signals import (
+from scripts.mcp_impl.code_signals import (
     _CODE_INTENT_CACHE,
     _CODE_INTENT_LOCK,
     _CODE_QUERY_ARCHETYPES,
@@ -1381,8 +1253,8 @@ async def change_history_for_path(
         search_commits_fn=search_commits_for,
     )
 
-# --- context_answer helpers imported from mcp_context_answer shim ---
-from scripts.mcp_context_answer import (
+# --- context_answer helpers imported from context_answer helper module ---
+from scripts.mcp_impl.context_answer import (
     _cleanup_answer,
     _answer_style_guidance,
     _strip_preamble_labels,
@@ -1755,7 +1627,7 @@ if __name__ == "__main__":
                 "on",
             }:
                 try:
-                    from scripts.rerank_local import _get_rerank_session  # type: ignore
+                    from scripts.rerank_tools.local import _get_rerank_session  # type: ignore
 
                     _ = _get_rerank_session()
                 except Exception:
@@ -1767,7 +1639,8 @@ if __name__ == "__main__":
                 _env["COLLECTION_NAME"] = _default_collection()
                 _cmd = [
                     "python",
-                    "/work/scripts/rerank_local.py",
+                    "-m",
+                    "scripts.rerank_tools.local",
                     "--query",
                     "warmup",
                     "--topk",

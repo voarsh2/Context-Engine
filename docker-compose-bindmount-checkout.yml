@@ -211,7 +211,7 @@ services:
       - ${HOST_INDEX_PATH:-.}:/work:ro
       - ${HOST_INDEX_PATH:-.}/.codebase:/work/.codebase:rw
 
-    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/ingest_code.py"]
+    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.ingest_code --root /work"]
 
   watcher:
     build:
@@ -245,7 +245,7 @@ services:
     volumes:
       - ${HOST_INDEX_PATH:-.}:/work:ro
       - ${HOST_INDEX_PATH:-.}/.codebase:/work/.codebase:rw
-    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/watch_index.py"]
+    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.watch_index"]
 
 
   upload_service:
@@ -300,7 +300,7 @@ services:
       - ${HOST_INDEX_PATH:-.}:/work:ro
       - ${HOST_INDEX_PATH:-.}/.codebase:/work/.codebase:rw
 
-    entrypoint: ["python", "/app/scripts/create_indexes.py"]
+    entrypoint: ["python", "-m", "scripts.create_indexes"]
 
 volumes:
   qdrant_storage:

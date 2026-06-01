@@ -4,12 +4,12 @@ hybrid_search.py - Façade module for hybrid code search.
 
 This is the stable public entrypoint for the hybrid search subsystem.
 All internal logic has been refactored into smaller, focused modules:
-- hybrid_config.py: Environment-based configuration and constants
-- hybrid_qdrant.py: Qdrant client management, queries, and vector functions
-- hybrid_embed.py: Embedding model factory and cached embedding
-- hybrid_filters.py: File classification and query DSL parsing
-- hybrid_ranking.py: RRF, scoring, diversification, and micro-span budgeting
-- hybrid_expand.py: Query expansion (synonyms, semantic, LLM-assisted)
+- hybrid/config.py: Environment-based configuration and constants
+- hybrid/qdrant.py: Qdrant client management, queries, and vector functions
+- hybrid/embed.py: Embedding model factory and cached embedding
+- hybrid/filters.py: File classification and query DSL parsing
+- hybrid/ranking.py: RRF, scoring, diversification, and micro-span budgeting
+- hybrid/expand.py: Query expansion (synonyms, semantic, LLM-assisted)
 
 This façade:
 1. Re-exports all public APIs for backwards compatibility
@@ -19,22 +19,15 @@ This façade:
 from __future__ import annotations
 
 import os
-import sys
 import argparse
 import re
 import json
 import math
 import logging
 import threading
-from pathlib import Path
 from typing import List, Dict, Any, Tuple, TYPE_CHECKING
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
-
-# Ensure /work or repo root is in sys.path for scripts imports
-_ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(_ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(_ROOT_DIR))
 
 # ---------------------------------------------------------------------------
 # Core Qdrant imports
@@ -44,7 +37,7 @@ from qdrant_client import QdrantClient, models
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_config
 # ---------------------------------------------------------------------------
-from scripts.hybrid_config import (
+from scripts.hybrid.config import (
     # Helper functions
     _safe_int,
     _safe_float,
@@ -109,7 +102,7 @@ from scripts.hybrid_config import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_qdrant
 # ---------------------------------------------------------------------------
-from scripts.hybrid_qdrant import (
+from scripts.hybrid.qdrant import (
     # Pool availability
     _POOL_AVAILABLE,
     # Connection pooling
@@ -142,7 +135,7 @@ from scripts.hybrid_qdrant import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_embed
 # ---------------------------------------------------------------------------
-from scripts.hybrid_embed import (
+from scripts.hybrid.embed import (
     # Embedder factory
     _EMBEDDER_FACTORY,
     EmbeddingModel,
@@ -156,34 +149,21 @@ from scripts.hybrid_embed import (
     UNIFIED_CACHE_AVAILABLE,
 )
 
-# Import unified cache objects from cache_manager when available
-if UNIFIED_CACHE_AVAILABLE:
-    try:
-        from scripts.cache_manager import get_search_cache, get_embedding_cache, get_expansion_cache
-        _EMBED_CACHE = get_embedding_cache()
-        _RESULTS_CACHE = get_search_cache()
-        _EXPANSION_CACHE = get_expansion_cache()
-    except ImportError:
-        _EMBED_CACHE = None
-        _RESULTS_CACHE = {}
-        _EXPANSION_CACHE = None
-else:
-    _EMBED_CACHE = None
-    _RESULTS_CACHE = {}
-    _EXPANSION_CACHE = None
+from scripts.cache_manager import get_search_cache, get_embedding_cache, get_expansion_cache
 
-# Lightweight local fallback cache for deterministic test hits
-try:
-    from collections import OrderedDict as _OD
-except Exception:
-    _OD = dict  # pragma: no cover
+_EMBED_CACHE = get_embedding_cache()
+_RESULTS_CACHE = get_search_cache()
+_EXPANSION_CACHE = get_expansion_cache()
+
+from collections import OrderedDict as _OD
+
 _RESULTS_CACHE_OD = _OD()
 _RESULTS_LOCK = threading.RLock()
 
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_filters
 # ---------------------------------------------------------------------------
-from scripts.hybrid_filters import (
+from scripts.hybrid.filters import (
     # File patterns
     CORE_FILE_PATTERNS,
     NON_CORE_PATTERNS,
@@ -206,7 +186,7 @@ from scripts.hybrid_filters import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_ranking
 # ---------------------------------------------------------------------------
-from scripts.hybrid_ranking import (
+from scripts.hybrid.ranking import (
     # RRF
     rrf,
     _scale_rrf_k,
@@ -238,7 +218,7 @@ from scripts.hybrid_ranking import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_expand
 # ---------------------------------------------------------------------------
-from scripts.hybrid_expand import (
+from scripts.hybrid.expand import (
     # Synonyms
     CODE_SYNONYMS,
     # Expansion functions
@@ -253,7 +233,7 @@ from scripts.hybrid_expand import (
 
 # Conditionally re-export semantic expansion functions
 if SEMANTIC_EXPANSION_AVAILABLE:
-    from scripts.hybrid_expand import (
+    from scripts.hybrid.expand import (
         expand_queries_semantically,
         expand_queries_with_prf,
         get_expansion_stats,
@@ -273,24 +253,17 @@ try:
 except ImportError:
     TextEmbedding = None  # type: ignore
 
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-except ImportError:
-    _get_embedding_model = None
+from scripts.embedder import get_embedding_model as _get_embedding_model
 
 # Import request deduplication system
-try:
-    from scripts.deduplication import get_deduplicator, is_duplicate_request
-    DEDUPLICATION_AVAILABLE = True
-except ImportError:
-    DEDUPLICATION_AVAILABLE = False
+from scripts.deduplication import get_deduplicator, is_duplicate_request
+
+DEDUPLICATION_AVAILABLE = True
 
 # Import query optimizer for dynamic EF tuning
-try:
-    from scripts.query_optimizer import get_query_optimizer, optimize_query
-    QUERY_OPTIMIZER_AVAILABLE = True
-except ImportError:
-    QUERY_OPTIMIZER_AVAILABLE = False
+from scripts.query_optimizer import get_query_optimizer, optimize_query
+
+QUERY_OPTIMIZER_AVAILABLE = True
 
 # Import ingest helpers
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
@@ -458,19 +431,15 @@ def run_pure_dense_search(
     Returns:
         List of search results with raw cosine similarity scores
     """
-    from scripts.hybrid_qdrant import get_qdrant_client, return_qdrant_client, dense_query
+    from scripts.hybrid.qdrant import get_qdrant_client, return_qdrant_client, dense_query
     from scripts.utils import sanitize_vector_name
     from qdrant_client import models
 
     # Get model
     if model is None:
         model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
-        try:
-            from scripts.embedder import get_embedding_model
-            model = get_embedding_model(model_name)
-        except ImportError:
-            from fastembed import TextEmbedding
-            model = TextEmbedding(model_name=model_name)
+        from scripts.embedder import get_embedding_model
+        model = get_embedding_model(model_name)
     else:
         model_name = getattr(model, "model_name", os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"))
 
@@ -568,7 +537,7 @@ def run_pure_dense_search(
 # ---------------------------------------------------------------------------
 # Backward compatibility: _embed_queries_cached alias
 # ---------------------------------------------------------------------------
-# The function is now in hybrid_embed.py as embed_queries_cached
+# The function is now in hybrid/embed.py as embed_queries_cached
 # Keep the underscore-prefixed alias for any legacy callers
 
 

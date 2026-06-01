@@ -50,7 +50,8 @@ from scripts.mcp_impl.utils import (
     _primary_identifier_from_queries,
 )
 from scripts.mcp_impl.workspace import _default_collection
-from scripts.logger import safe_int, ValidationError
+from scripts.logger import safe_bool, safe_float, safe_int, ValidationError
+from scripts.refrag_glm import detect_glm_runtime, get_glm_model_name, get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +115,7 @@ def _cleanup_answer(text: str, max_chars: int | None = None) -> str:
 
 def _answer_style_guidance() -> str:
     """Compact instruction to keep answers direct and grounded."""
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    is_glm = detect_glm_runtime()
     
     if is_glm:
         sentence_guidance = "Write a clear, comprehensive answer in 4-8 sentences."
@@ -233,11 +230,7 @@ def _answer_style_guidance() -> str:
     GLM models get more generous guidance (4-8 sentences) since they handle
     longer outputs better than Granite-4.0-Micro which needs strict 2-4 sentence limits.
     """
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    is_glm = detect_glm_runtime()
     
     if is_glm:
         # GLM models can handle longer, more detailed answers
@@ -1534,11 +1527,7 @@ def _ca_fallback_and_budget(
                 "on",
             }:
                 # GLM models have much larger context windows - use higher budgets
-                try:
-                    from scripts.refrag_glm import detect_glm_runtime
-                    is_glm = detect_glm_runtime()
-                except ImportError:
-                    is_glm = False
+                is_glm = detect_glm_runtime()
                 
                 if is_glm:
                     # GLM: 200K context allows much more code context
@@ -2055,11 +2044,7 @@ def _ca_decoder_params(max_tokens: Any) -> tuple[int, float, int, float, list[st
     
     # Granite/llamacpp: use env var or 2000 default
     # GLM: dynamically use model's max_output_tokens from config
-    try:
-        from scripts.refrag_glm import detect_glm_runtime, get_glm_model_name, get_model_config
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    is_glm = detect_glm_runtime()
     
     if is_glm:
         # Pull dynamic limit from GLM model config (imports already succeeded above)
@@ -2501,22 +2486,6 @@ async def _context_answer_impl(
     """
     import time
     import asyncio
-
-    # Import logger utilities
-    try:
-        from scripts.logger import safe_bool, safe_float
-    except ImportError:
-        def safe_bool(val, default=False, **kw):
-            if val is None:
-                return default
-            if isinstance(val, bool):
-                return val
-            return str(val).strip().lower() in {"1", "true", "yes", "on"}
-        def safe_float(val, default=0.0, **kw):
-            try:
-                return float(val) if val is not None else default
-            except Exception:
-                return default
 
     # Get embedding model function
     if get_embedding_model_fn is None:

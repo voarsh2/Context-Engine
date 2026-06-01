@@ -7,13 +7,9 @@ with meaningful weights instead of random noise.
 """
 import os
 import sys
-from pathlib import Path
 from typing import List, Dict, Any
 
 import numpy as np
-
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 
 def compute_pca_init_for_collection(
@@ -141,4 +137,3 @@ if __name__ == "__main__":
     )
     
     sys.exit(0 if success else 1)
-

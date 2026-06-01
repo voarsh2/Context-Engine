@@ -9,8 +9,6 @@ from typing import List, Dict, Any
 import re
 import time
 import json
-import sys
-from pathlib import Path
 
 from qdrant_client import QdrantClient, models
 
@@ -20,19 +18,7 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 API_KEY = os.environ.get("QDRANT_API_KEY")
 REPO_NAME = os.environ.get("REPO_NAME", "workspace")
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-# Import TextEmbedding for type hints and fallback
-from fastembed import TextEmbedding
-
-# Use embedder factory for Qwen3 support; fallback to direct fastembed
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
+from scripts.embedder import get_embedding_model as _get_embedding_model
 
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
 
@@ -622,11 +608,7 @@ def main():
     )
     args = ap.parse_args()
 
-    # Use embedder factory for Qwen3 support
-    if _EMBEDDER_FACTORY:
-        model = _get_embedding_model(MODEL_NAME)
-    else:
-        model = TextEmbedding(model_name=MODEL_NAME)
+    model = _get_embedding_model(MODEL_NAME)
     vec_name = _sanitize_vector_name(MODEL_NAME)
     client = QdrantClient(url=QDRANT_URL, api_key=API_KEY or None)
 

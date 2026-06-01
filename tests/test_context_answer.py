@@ -65,6 +65,11 @@ def test_context_answer_happy_path(monkeypatch):
 def test_context_answer_decoder_disabled(monkeypatch):
     # Mock embedding model to avoid loading real model
     monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: None)
+    monkeypatch.setenv("REFRAG_MODE", "0")
+    monkeypatch.setenv("REFRAG_GATE_FIRST", "0")
+    monkeypatch.setenv("REFRAG_RUNTIME", "llamacpp")
+    monkeypatch.setenv("CTX_CLIENT_DEADLINE_SEC", "178")
+    monkeypatch.setenv("CTX_DEADLINE_MARGIN_SEC", "6")
 
     import scripts.hybrid_search as hs
 

@@ -10,6 +10,8 @@ import scripts.mcp_indexer_server as srv
 async def test_repo_search_concurrent(monkeypatch):
     # In-process, fast stubbed hybrid search and model
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
+    monkeypatch.setenv("RERANKER_ENABLED", "0")
     monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: object())
 
     import scripts.hybrid_search as hy

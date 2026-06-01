@@ -173,8 +173,6 @@ def trigger_indexing(
     # Build Python command to call qdrant_index via MCP server
     # Use qdrant_index with subdir parameter to index specific repo
     python_cmd = f"""
-import sys
-sys.path.insert(0, '/app')
 from scripts.mcp_indexer_server import qdrant_index
 import asyncio
 import json
@@ -309,4 +307,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

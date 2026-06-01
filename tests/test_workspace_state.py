@@ -142,6 +142,39 @@ class TestCollectionNameResolution:
 
         assert ws.get_collection_name(None) == "codebase"
 
+    def test_multi_repo_workspace_root_path_uses_configured_collection(self, ws_module, monkeypatch, tmp_path):
+        """The multi-repo workspace root is not a repository identity."""
+        ws_root = tmp_path / "work"
+        ws_root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.setenv("COLLECTION_NAME", "context-engine")
+        ws = importlib.reload(ws_module)
+
+        assert ws.get_collection_name(str(ws_root)) == "context-engine"
+        assert ws.get_collection_name(str(ws_root)) != "global-collection"
+
+    def test_multi_repo_upload_managed_detection_does_not_probe_git(self, ws_module, monkeypatch, tmp_path):
+        """Upload-managed multi-repo identity comes from workspace path, not git metadata."""
+        ws_root = tmp_path / "work"
+        repo_root = ws_root / "repo-a"
+        (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.delenv("CTXCE_BINDMOUNT_REPO_DETECTION", raising=False)
+        ws = importlib.reload(ws_module)
+
+        monkeypatch.setattr(
+            ws,
+            "_git_remote_repo_name",
+            lambda *_: pytest.fail("git inference should be disabled for upload-managed mode"),
+        )
+
+        assert ws._extract_repo_name_from_path(str(repo_root)) == "repo-a"
+        assert ws._extract_repo_name_from_path(str(ws_root)) == ""
+
 
 # ============================================================================
 # Tests: Environment Variable Helpers

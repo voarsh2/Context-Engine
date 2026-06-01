@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 import os
 import argparse
-import sys
 import threading
-from pathlib import Path as _P
 from typing import List, Dict, Any, TYPE_CHECKING
-
-# Ensure project root is on sys.path when run as a script (so 'scripts' package imports work)
-_ROOT = _P(__file__).resolve().parent.parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
 
 from qdrant_client import QdrantClient, models
 
@@ -17,27 +10,18 @@ from qdrant_client import QdrantClient, models
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
-# Use embedder factory for Qwen3 support; fallback to direct fastembed
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
-    from fastembed import TextEmbedding
+from scripts.embedder import get_embedding_model as _get_embedding_model
+
+_EMBEDDER_FACTORY = True
 
 # Use centralized reranker factory (supports FastEmbed + ONNX backends)
-try:
-    from scripts.reranker import (
-        get_reranker_model as _get_reranker_model,
-        rerank_pairs as _rerank_pairs,
-        is_reranker_available as _is_reranker_available,
-    )
-    _RERANKER_FACTORY = True
-except ImportError:
-    _RERANKER_FACTORY = False
-    _get_reranker_model = None
-    _rerank_pairs = None
-    _is_reranker_available = None
+from scripts.reranker import (
+    get_reranker_model as _get_reranker_model,
+    rerank_pairs as _rerank_pairs,
+    is_reranker_available as _is_reranker_available,
+)
+
+_RERANKER_FACTORY = True
 
 # Legacy ONNX imports (fallback when factory unavailable)
 try:

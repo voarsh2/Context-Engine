@@ -12,22 +12,11 @@ logger = logging.getLogger(__name__)
 
 from scripts.auth_backend import mark_collection_deleted
 
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client import models as qmodels
-except Exception:
-    QdrantClient = None  # type: ignore
-    qmodels = None  # type: ignore
+from qdrant_client import QdrantClient
+from qdrant_client import models as qmodels
 
-try:
-    from scripts.qdrant_client_manager import pooled_qdrant_client
-except Exception:
-    pooled_qdrant_client = None
-
-try:
-    from scripts.workspace_state import get_collection_mappings
-except Exception:
-    get_collection_mappings = None
+from scripts.qdrant_client_manager import pooled_qdrant_client
+from scripts.workspace_state import get_collection_mappings
 
 
 _SLUGGED_REPO_RE = re.compile(r"^.+-[0-9a-f]{16}(?:_old)?$")
@@ -345,8 +334,6 @@ def copy_collection_qdrant(
     copied = False
 
     def _manual_copy_points() -> None:
-        if QdrantClient is None or qmodels is None:
-            raise RuntimeError("QdrantClient unavailable for manual collection copy")
         cli = QdrantClient(url=base_url, api_key=api_key or None, timeout=_copy_client_timeout_seconds())
         try:
             if overwrite:
@@ -453,8 +440,6 @@ def copy_collection_qdrant(
                 pass
 
     def _count_points(name: str) -> Optional[int]:
-        if QdrantClient is None:
-            return None
         cli = QdrantClient(url=base_url, api_key=api_key or None, timeout=_copy_client_timeout_seconds())
         try:
             res = cli.count(collection_name=name, exact=True)

@@ -109,7 +109,6 @@ Indexing:
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -134,9 +133,6 @@ os.environ["INDEX_MICRO_CHUNKS"] = "0"
 
 # Silence tokenizers parallelism warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 import argparse
 import asyncio

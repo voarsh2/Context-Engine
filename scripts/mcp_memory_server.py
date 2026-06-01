@@ -3,20 +3,8 @@
 # to properly instrument vector DB calls.
 # ---------------------------------------------------------------------------
 import os
-import sys as _sys
 
-# Ensure repo roots are importable so 'scripts' resolves inside container
-_roots_env = os.environ.get("WORK_ROOTS", "")
-_roots = [p.strip() for p in _roots_env.split(",") if p.strip()] or ["/work", "/app"]
-for _root in _roots:
-    if _root and _root not in _sys.path:
-        _sys.path.insert(0, _root)
-
-# Now import OpenLit init (before any other scripts imports that may use qdrant)
-try:
-    from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
-except ImportError:
-    pass  # OpenLit not available
+from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
 
 import json
 import threading
@@ -41,16 +29,10 @@ from scripts.mcp_auth import (
 
 from qdrant_client import QdrantClient, models
 
-# Import connection pooling for proper resource management
-try:
-    from scripts.qdrant_client_manager import (
-        get_qdrant_client,
-        return_qdrant_client,
-        pooled_qdrant_client,
-    )
-    _POOL_AVAILABLE = True
-except ImportError:
-    _POOL_AVAILABLE = False
+from scripts.qdrant_client_manager import (
+    get_qdrant_client,
+    return_qdrant_client,
+)
 
 # Env
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -90,15 +72,8 @@ except Exception:
 # Use the centralized embedder from scripts.embedder for consistent caching.
 # This eliminates duplicate model loading and ensures consistent behavior.
 
-# Reference to the centralized embedder for cold-skip detection
-try:
-    from scripts.embedder import get_embedding_model as _centralized_get_embedding_model
-    from scripts.embedder import is_model_cached as _is_model_cached
-    _EMBEDDER_AVAILABLE = True
-except ImportError:
-    _EMBEDDER_AVAILABLE = False
-    def _is_model_cached(model_name: str = "") -> bool:  # type: ignore[misc]
-        return False  # Fallback: assume not cached
+from scripts.embedder import get_embedding_model as _centralized_get_embedding_model
+from scripts.embedder import is_model_cached as _is_model_cached
 
 def _get_embedding_model():
     """Get the embedding model using the centralized embedder.
@@ -108,12 +83,7 @@ def _get_embedding_model():
     - Qwen3 model support with feature flags
     - Automatic cache invalidation on corrupted downloads
     """
-    if _EMBEDDER_AVAILABLE:
-        return _centralized_get_embedding_model(EMBEDDING_MODEL)
-
-    # Fallback for environments without centralized embedder (rare)
-    from fastembed import TextEmbedding
-    return TextEmbedding(model_name=EMBEDDING_MODEL)
+    return _centralized_get_embedding_model(EMBEDDING_MODEL)
 
 # Track ensured collections to reduce redundant ensure calls.
 # RATIONALE: Avoid repeated Qdrant network calls for the same collection.
@@ -270,31 +240,19 @@ def _start_readyz_server():
 # ---------------------------------------------------------------------------
 # Qdrant Client Management
 # ---------------------------------------------------------------------------
-# Use connection pooling when available, fallback to creating clients on-demand.
-# This prevents socket exhaustion under load and improves connection reuse.
-
 def _get_qdrant_client() -> QdrantClient:
-    """Get a Qdrant client from pool or create one."""
-    if _POOL_AVAILABLE:
-        return get_qdrant_client(
-            url=QDRANT_URL,
-            api_key=os.environ.get("QDRANT_API_KEY")
-        )
-    return QdrantClient(url=QDRANT_URL, api_key=os.environ.get("QDRANT_API_KEY"))
+    """Get a Qdrant client from the shared pool."""
+    return get_qdrant_client(
+        url=QDRANT_URL,
+        api_key=os.environ.get("QDRANT_API_KEY")
+    )
 
 
 def _return_qdrant_client(client: QdrantClient):
     """Return a client to the pool, or close it if pooling unavailable."""
     if client is None:
         return
-    if _POOL_AVAILABLE:
-        return_qdrant_client(client)
-    else:
-        # Fallback path: close client to avoid socket leak
-        try:
-            client.close()
-        except Exception:
-            pass  # Best effort cleanup
+    return_qdrant_client(client)
 
 
 # Ensure collection exists with dual vectors

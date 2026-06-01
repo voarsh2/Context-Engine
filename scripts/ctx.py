@@ -95,10 +95,7 @@ def _load_env_file():
 
 _load_env_file()
 
-try:
-    from scripts.mcp_http_client import call_tool_http  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - local execution fallback
-    from mcp_http_client import call_tool_http  # type: ignore
+from scripts.mcp_http_client import call_tool_http
 
 # Configuration from environment
 MCP_URL = os.environ.get("MCP_INDEXER_URL", "http://localhost:8003/mcp")

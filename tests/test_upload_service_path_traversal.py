@@ -7,6 +7,13 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _disable_ambient_staging(monkeypatch):
+    import scripts.upload_delta_bundle as us
+
+    monkeypatch.setattr(us, "is_staging_enabled", lambda: False)
+
+
 def _write_bundle(tmp_path: Path, operations: list[dict]) -> Path:
     bundle_path = tmp_path / "bundle.tar.gz"
     payload = json.dumps({"operations": operations}).encode("utf-8")

@@ -40,8 +40,10 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/learning_reranker_worker.py
+        - -m
+        - scripts.learning_reranker_worker
         - --daemon
+        workingDir: /app
         resources:
           requests:
             memory: 512Mi

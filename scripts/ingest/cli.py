@@ -279,14 +279,6 @@ def main():
             )
         return
     else:
-        if get_collection_name:
-            try:
-                resolved = get_collection_name(str(Path(args.root).resolve()))
-                placeholders = {"", "default-collection", "my-collection", "codebase"}
-                if resolved and collection in placeholders and not force_collection:
-                    collection = resolved
-            except Exception:
-                pass
         if not collection:
             collection = os.environ.get("COLLECTION_NAME", "codebase")
         print(f"[single_repo] Single-repo mode enabled - using collection: {collection}")

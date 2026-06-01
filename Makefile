@@ -71,7 +71,7 @@ index-path: ## index an arbitrary repo: make index-path REPO_PATH=/abs/path [REC
 	@NAME=$${REPO_NAME:-$$(basename "$(REPO_PATH)")}; \
 	COLL=$${COLLECTION:-$$NAME}; \
 	HOST_INDEX_PATH="$(REPO_PATH)" COLLECTION_NAME="$$COLL" REPO_NAME="$$NAME" \
-	docker compose run --rm -v "$$PWD":/app:ro --entrypoint python indexer /app/scripts/ingest_code.py --root /work $${RECREATE:+--recreate}
+		docker compose run --rm -v "$$PWD":/app:ro --workdir /app --entrypoint python indexer -m scripts.ingest_code --root /work $${RECREATE:+--recreate}
 
 # Index the current working directory quickly
 index-here: ## index the current directory: make index-here [RECREATE=1] [REPO_NAME=name] [COLLECTION=name]
@@ -83,7 +83,7 @@ index-here: ## index the current directory: make index-here [RECREATE=1] [REPO_N
 
 
 watch: ## watch mode: reindex changed files on save (Ctrl+C to stop)
-	docker compose run --rm --entrypoint python indexer /work/scripts/watch_index.py
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.watch_index
 
 watch-remote: ## remote watch mode: upload delta bundles to remote server (Ctrl+C to stop)
 	@echo "Starting remote watch mode..."
@@ -95,24 +95,24 @@ watch-remote: ## remote watch mode: upload delta bundles to remote server (Ctrl+
 	@echo "Remote upload endpoint: $(REMOTE_UPLOAD_ENDPOINT)"
 	@echo "Max retries: $${REMOTE_UPLOAD_MAX_RETRIES:-3}"
 	@echo "Timeout: $${REMOTE_UPLOAD_TIMEOUT:-30} seconds"
-	docker compose run --rm --entrypoint python \
+		docker compose run --rm --workdir /app --entrypoint python \
 		-e REMOTE_UPLOAD_ENABLED=1 \
 		-e REMOTE_UPLOAD_ENDPOINT=$(REMOTE_UPLOAD_ENDPOINT) \
 		-e REMOTE_UPLOAD_MAX_RETRIES=$${REMOTE_UPLOAD_MAX_RETRIES:-3} \
 		-e REMOTE_UPLOAD_TIMEOUT=$${REMOTE_UPLOAD_TIMEOUT:-30} \
-		indexer /work/scripts/watch_index.py
+		indexer -m scripts.watch_index
 
 rerank: ## multi-query re-ranker helper example
-	docker compose run --rm --entrypoint python indexer /work/scripts/rerank_query.py \
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.rerank_tools.query \
 	  --query "chunk code by lines with overlap for indexing" \
 	  --query "function to split code into overlapping line chunks" \
 	  --language python --under /work/scripts --limit 5
 
 warm: ## prime ANN/search caches with a few queries
-	docker compose run --rm --entrypoint python indexer /work/scripts/warm_start.py --ef 256 --limit 3
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.warm_start --ef 256 --limit 3
 
 health: ## run health checks for collection/model settings
-	docker compose run --rm --entrypoint python indexer /work/scripts/health_check.py
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.health_check
 
 
 # Check llama.cpp decoder health on localhost:8080 (200 OK expected)
@@ -126,7 +126,7 @@ env: ## create .env from example if missing
 	[ -f .env ] || cp .env.example .env
 
 hybrid: ## hybrid search: dense + lexical RRF fuse (respects --language/--under/--kind)
-	docker compose run --rm --entrypoint python indexer /work/scripts/hybrid_search.py \
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.hybrid_search \
 	  --query "chunk code by lines" --query "overlapping line chunks" --limit 8
 
 bootstrap: env up ## one-shot: up -> wait -> index -> warm -> health
@@ -136,20 +136,20 @@ bootstrap: env up ## one-shot: up -> wait -> index -> warm -> health
 	$(MAKE) health
 
 history: ## ingest Git history (messages + file lists)
-	docker compose run --rm --entrypoint python indexer /work/scripts/ingest_history.py --max-commits 200
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.ingest_history --max-commits 200
 
 prune-path: ## prune a repo by path: make prune-path REPO_PATH=/abs/path
 	@if [ -z "$(REPO_PATH)" ]; then \
 		echo "Usage: make prune-path REPO_PATH=/abs/path"; exit 1; \
 	fi
 	HOST_INDEX_PATH="$(REPO_PATH)" PRUNE_ROOT=/work \
-	docker compose run --rm --entrypoint python indexer /work/scripts/prune.py
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.prune
 
 rerank-local: ## local cross-encoder reranker (requires RERANKER_ONNX_PATH, RERANKER_TOKENIZER_PATH)
 	@if [ -z "$(RERANKER_ONNX_PATH)" ] || [ -z "$(RERANKER_TOKENIZER_PATH)" ]; then \
 		echo "RERANKER_ONNX_PATH and RERANKER_TOKENIZER_PATH must be set in .env"; exit 1; \
 	fi
-	docker compose run --rm --entrypoint python indexer /work/scripts/rerank_local.py --query "search symbols" --topk 50 --limit 12
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.rerank_tools.local --query "search symbols" --topk 50 --limit 12
 
 setup-reranker: ## download ONNX reranker + tokenizer, update .env, then smoke-test
 	@if [ -z "$(ONNX_URL)" ] || [ -z "$(TOKENIZER_URL)" ]; then \
@@ -161,7 +161,7 @@ setup-reranker: ## download ONNX reranker + tokenizer, update .env, then smoke-t
 	$(MAKE) rerank-local
 
 prune: ## remove points for missing files or mismatched file_hash
-	docker compose run --rm --entrypoint python indexer /work/scripts/prune.py
+	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.prune
 
 
 

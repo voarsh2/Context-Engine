@@ -39,10 +39,10 @@ from scripts.mcp_impl.utils import (
     _tokens_from_queries,
     safe_int,
 )
-from scripts.mcp_impl.workspace import _default_collection, _work_script
+from scripts.mcp_impl.workspace import _default_collection
 from scripts.mcp_impl.admin_tools import _detect_current_repo, _run_async
 from scripts.mcp_impl.search_profiles import append_profile_globs, normalize_profile
-from scripts.mcp_toon import _should_use_toon, _format_results_as_toon
+from scripts.mcp_impl.toon import _should_use_toon, _format_results_as_toon
 from scripts.mcp_auth import require_collection_access as _require_collection_access
 from scripts.path_scope import (
     normalize_under as _normalize_under_scope,
@@ -846,7 +846,8 @@ async def _repo_search_impl(
                     eff_limit = rt
             cmd = [
                 "python",
-                _work_script("hybrid_search.py"),
+                "-m",
+                "scripts.hybrid_search",
                 "--limit",
                 str(eff_limit),
                 "--json",
@@ -1017,7 +1018,7 @@ async def _repo_search_impl(
         if use_rerank_inproc and not used_rerank:
             try:
                 if json_lines:
-                    from scripts.rerank_local import rerank_local as _rr_local  # type: ignore
+                    from scripts.rerank_tools.local import rerank_local as _rr_local  # type: ignore
                     import concurrent.futures as _fut
 
                     rq = queries[0] if queries else ""
@@ -1215,7 +1216,7 @@ async def _repo_search_impl(
         if not used_rerank:
             if use_rerank_inproc:
                 try:
-                    from scripts.rerank_local import rerank_in_process  # type: ignore
+                    from scripts.rerank_tools.local import rerank_in_process  # type: ignore
 
                     model_name = os.environ.get(
                         "EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"
@@ -1242,7 +1243,8 @@ async def _repo_search_impl(
                     rq = queries[0] if queries else ""
                     rcmd = [
                         "python",
-                        _work_script("rerank_local.py"),
+                        "-m",
+                        "scripts.rerank_tools.local",
                         "--query",
                         rq,
                         "--topk",

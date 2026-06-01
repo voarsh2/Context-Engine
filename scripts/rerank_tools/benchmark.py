@@ -9,20 +9,15 @@ Tests against the actual indexed Context Engine codebase:
 4. Uses ground truth from ONNX reranker as reference
 
 Usage:
-    python scripts/rerank_real_benchmark.py
+    python -m scripts.rerank_tools.benchmark
 """
 
 import os
-import sys
 import time
 import json
 import numpy as np
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Real queries based on actual Context Engine functionality
 REAL_QUERIES = [
@@ -118,10 +113,7 @@ def benchmark_baseline(query: str, candidates: List[Dict[str, Any]]) -> RealBenc
 
 def benchmark_recursive(query: str, candidates: List[Dict[str, Any]], n_iters: int = 3) -> RealBenchmarkResult:
     """Benchmark recursive reranker."""
-    try:
-        from scripts.rerank_recursive import RecursiveReranker
-    except ImportError:
-        from rerank_recursive import RecursiveReranker
+    from scripts.rerank_recursive import RecursiveReranker
 
     reranker = RecursiveReranker(n_iterations=n_iters, dim=256)
     initial_scores = [c.get("score", 0) for c in candidates]
@@ -143,10 +135,7 @@ def benchmark_recursive(query: str, candidates: List[Dict[str, Any]], n_iters: i
 def benchmark_onnx(query: str, candidates: List[Dict[str, Any]]) -> Optional[RealBenchmarkResult]:
     """Benchmark ONNX cross-encoder reranker on pre-fetched candidates."""
     try:
-        try:
-            from scripts.rerank_local import rerank_local
-        except ImportError:
-            from rerank_local import rerank_local
+        from scripts.rerank_tools.local import rerank_local
 
         # Prepare pairs for ONNX reranker
         pairs = []
@@ -178,10 +167,7 @@ def benchmark_onnx(query: str, candidates: List[Dict[str, Any]]) -> Optional[Rea
 
 def benchmark_session_aware(query: str, candidates: List[Dict[str, Any]], session_id: str) -> RealBenchmarkResult:
     """Benchmark session-aware recursive reranker."""
-    try:
-        from scripts.rerank_recursive import SessionAwareReranker
-    except ImportError:
-        from rerank_recursive import SessionAwareReranker
+    from scripts.rerank_recursive import SessionAwareReranker
 
     reranker = SessionAwareReranker(n_iterations=3, dim=256)
     initial_scores = [c.get("score", 0) for c in candidates]
@@ -208,10 +194,7 @@ def get_learning_reranker():
     """Get or create the learning-enabled reranker."""
     global _LEARNING_RERANKER
     if _LEARNING_RERANKER is None:
-        try:
-            from scripts.rerank_recursive import RecursiveReranker
-        except ImportError:
-            from rerank_recursive import RecursiveReranker
+        from scripts.rerank_recursive import RecursiveReranker
         _LEARNING_RERANKER = RecursiveReranker(n_iterations=3, dim=256)
     return _LEARNING_RERANKER
 
@@ -361,10 +344,7 @@ def run_real_benchmark():
             print(f"  ONNX: {onnx_result.latency_ms:.2f}ms")
             teacher_scores = onnx_result.top_5_scores  # Use full scores
             # Get full ONNX scores for learning
-            try:
-                from scripts.rerank_local import rerank_local
-            except ImportError:
-                from rerank_local import rerank_local
+            from scripts.rerank_tools.local import rerank_local
             pairs = [(query, c.get("code", "") or c.get("snippet", "")) for c in candidates]
             teacher_scores = rerank_local(pairs)
 
@@ -502,4 +482,3 @@ def run_real_benchmark():
 
 if __name__ == "__main__":
     run_real_benchmark()
-

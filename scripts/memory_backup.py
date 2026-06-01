@@ -19,17 +19,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
-# Add project root to path for imports
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
-except ImportError:
-    print("ERROR: qdrant-client not installed. Install with: pip install qdrant-client")
-    sys.exit(1)
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 
 def get_qdrant_client() -> QdrantClient:

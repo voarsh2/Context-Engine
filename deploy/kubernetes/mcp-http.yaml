@@ -40,7 +40,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/mcp_memory_server.py
+        - -m
+        - scripts.mcp_memory_server
+        workingDir: /app
         ports:
         - name: http
           containerPort: 8000
@@ -227,7 +229,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/mcp_indexer_server.py
+        - -m
+        - scripts.mcp_indexer_server
+        workingDir: /app
         ports:
         - name: http
           containerPort: 8001

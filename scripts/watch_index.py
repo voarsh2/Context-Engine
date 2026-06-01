@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -10,27 +9,23 @@ from typing import Optional
 from qdrant_client import QdrantClient
 from watchdog.observers import Observer
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from scripts.watch_index_core import config as watch_config  # noqa: E402
-from scripts.watch_index_core.config import LOGGER, MODEL, QDRANT_URL, default_collection_name  # noqa: E402
+from scripts.watch_index_core import config as watch_config
+from scripts.watch_index_core.config import LOGGER, MODEL, QDRANT_URL, default_collection_name
 from scripts.watch_index_core.utils import (
     get_boolean_env,
     resolve_vector_name_config,
     create_observer,
 )
-from scripts.watch_index_core.handler import IndexHandler  # noqa: E402
-from scripts.watch_index_core.init_maintenance import start_init_maintenance_worker  # noqa: E402
-from scripts.watch_index_core.pseudo import _start_pseudo_backfill_worker  # noqa: E402
-from scripts.watch_index_core.processor import _process_paths  # noqa: E402
-from scripts.watch_index_core.queue import ChangeQueue  # noqa: E402
-from scripts.watch_index_core.consistency import (  # noqa: E402
+from scripts.watch_index_core.handler import IndexHandler
+from scripts.watch_index_core.init_maintenance import start_init_maintenance_worker
+from scripts.watch_index_core.pseudo import _start_pseudo_backfill_worker
+from scripts.watch_index_core.processor import _process_paths
+from scripts.watch_index_core.queue import ChangeQueue
+from scripts.watch_index_core.consistency import (
     run_consistency_audit,
     run_empty_dir_sweep_maintenance,
 )
-from scripts.workspace_state import (  # noqa: E402
+from scripts.workspace_state import (
     compute_indexing_config_hash,
     get_indexing_config_snapshot,
     list_pending_index_journal_entries,
@@ -40,7 +35,9 @@ from scripts.workspace_state import (  # noqa: E402
     initialize_watcher_state,
 )
 
-import scripts.ingest_code as idx  # noqa: E402
+_sleep = time.sleep
+
+import scripts.ingest_code as idx
 
 logger = LOGGER
 ROOT = watch_config.ROOT
@@ -201,18 +198,10 @@ def main() -> None:
         url=QDRANT_URL, timeout=int(os.environ.get("QDRANT_TIMEOUT", "20") or 20)
     )
 
-    # Use centralized embedder factory if available (supports Qwen3 feature flag)
-    try:
-        from scripts.embedder import get_embedding_model, get_model_dimension
+    from scripts.embedder import get_embedding_model, get_model_dimension
 
-        model = get_embedding_model(MODEL)
-        model_dim = get_model_dimension(MODEL)
-    except ImportError:
-        # Fallback to direct fastembed initialization
-        from fastembed import TextEmbedding
-
-        model = TextEmbedding(model_name=MODEL)
-        model_dim = len(next(model.embed(["dimension probe"])))
+    model = get_embedding_model(MODEL)
+    model_dim = get_model_dimension(MODEL)
 
     vector_name = resolve_vector_name_config(client, default_collection, model_dim, MODEL)
 
@@ -272,7 +261,7 @@ def main() -> None:
             if last_maintenance is None or (now - last_maintenance) >= maintenance_interval:
                 _run_periodic_maintenance(client)
                 last_maintenance = now
-            time.sleep(1.0)
+            _sleep(1.0)
     except KeyboardInterrupt:
         pass
     finally:

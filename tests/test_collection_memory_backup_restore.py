@@ -78,14 +78,14 @@ def test_memory_backup_restore_happy_path(qdrant_container, monkeypatch):
     - The collection should be updated (if possible) without recreation.
     - Existing points should remain intact.
     """
-    os.environ["QDRANT_URL"] = qdrant_container
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
     collection = f"test-mem-{uuid.uuid4().hex[:8]}"
 
     client = _create_collection_with_memory(qdrant_container, collection, dim=8)
 
     # Force ReFRAG on so ensure_collection tries to add MINI_VECTOR_NAME
-    os.environ["REFRAG_MODE"] = "1"
-    os.environ.pop("STRICT_MEMORY_RESTORE", None)
+    monkeypatch.setenv("REFRAG_MODE", "1")
+    monkeypatch.delenv("STRICT_MEMORY_RESTORE", raising=False)
 
     # Run ensure_collection: this should trigger backup + recreate + restore
     ing.ensure_collection(client, collection, dim=8, vector_name="code")
@@ -107,13 +107,13 @@ def test_memory_backup_restore_happy_path(qdrant_container, monkeypatch):
 
 def test_memory_restore_strict_mode_no_recreate(qdrant_container, monkeypatch):
     """STRICT_MEMORY_RESTORE should not trigger errors when no recreate occurs."""
-    os.environ["QDRANT_URL"] = qdrant_container
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
     collection = f"test-mem-strict-{uuid.uuid4().hex[:8]}"
 
     client = _create_collection_with_memory(qdrant_container, collection, dim=8)
 
-    os.environ["REFRAG_MODE"] = "1"
-    os.environ["STRICT_MEMORY_RESTORE"] = "1"
+    monkeypatch.setenv("REFRAG_MODE", "1")
+    monkeypatch.setenv("STRICT_MEMORY_RESTORE", "1")
 
     # Patch subprocess.run to:
     # - allow the real memory_backup.py to run
@@ -141,13 +141,13 @@ def test_memory_backup_failure_tolerant_mode_no_recreate(qdrant_container, monke
     """If backup fails but STRICT_MEMORY_RESTORE is not set, ensure_collection
     should still proceed without destructive recreation.
     """
-    os.environ["QDRANT_URL"] = qdrant_container
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
     collection = f"test-mem-backup-fail-{uuid.uuid4().hex[:8]}"
 
     client = _create_collection_with_memory(qdrant_container, collection, dim=8)
 
-    os.environ["REFRAG_MODE"] = "1"
-    os.environ.pop("STRICT_MEMORY_RESTORE", None)
+    monkeypatch.setenv("REFRAG_MODE", "1")
+    monkeypatch.delenv("STRICT_MEMORY_RESTORE", raising=False)
 
     # Patch subprocess.run so memory_backup.py fails, but everything else runs normally
     orig_run = subprocess.run
@@ -176,14 +176,14 @@ def test_memory_backup_failure_tolerant_mode_no_recreate(qdrant_container, monke
     assert "2" in ids
 
 
-def test_memory_backup_and_restore_scripts_roundtrip(qdrant_container, tmp_path):
+def test_memory_backup_and_restore_scripts_roundtrip(qdrant_container, tmp_path, monkeypatch):
     """Directly exercise memory_backup.export_memories and
     memory_restore.restore_memories without going through ensure_collection.
 
     This confirms that the backup file contains the expected memory and that
     restore_memories can recreate it in a fresh collection.
     """
-    os.environ["QDRANT_URL"] = qdrant_container
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
     collection = f"test-mem-scripts-{uuid.uuid4().hex[:8]}"
 
     client = _create_collection_with_memory(qdrant_container, collection, dim=8)

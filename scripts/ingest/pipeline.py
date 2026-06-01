@@ -86,15 +86,13 @@ if TYPE_CHECKING:
 
 def _detect_repo_name_from_path(path: Path) -> str:
     """Wrapper function to use workspace_state repository detection."""
-    try:
-        from scripts.workspace_state import _extract_repo_name_from_path as _ws_detect
-        # `_extract_repo_name_from_path` expects a workspace/repo path shape, not a file path.
-        # Always normalize file inputs to their parent directory to avoid falling back to
-        # file basenames (which can poison metadata.repo and graph edge repo tags).
-        candidate = path if path.is_dir() else path.parent
-        return _ws_detect(str(candidate))
-    except ImportError:
-        return path.name if path.is_dir() else path.parent.name
+    from scripts.workspace_state import _extract_repo_name_from_path as _ws_detect
+
+    # `_extract_repo_name_from_path` expects a workspace/repo path shape, not a file path.
+    # Always normalize file inputs to their parent directory to avoid falling back to
+    # file basenames (which can poison metadata.repo and graph edge repo tags).
+    candidate = path if path.is_dir() else path.parent
+    return _ws_detect(str(candidate))
 
 
 def detect_language(path: Path) -> str:
@@ -850,14 +848,10 @@ def index_repo(
         except Exception:
             pass
 
-    try:
-        from scripts.embedder import get_embedding_model, get_model_dimension
-        model = get_embedding_model(model_name)
-        dim = get_model_dimension(model_name)
-    except ImportError:
-        from fastembed import TextEmbedding
-        model = TextEmbedding(model_name=model_name)
-        dim = len(next(model.embed(["dimension probe"])))
+    from scripts.embedder import get_embedding_model, get_model_dimension
+
+    model = get_embedding_model(model_name)
+    dim = get_model_dimension(model_name)
 
     client = QdrantClient(
         url=qdrant_url,

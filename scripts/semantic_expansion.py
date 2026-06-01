@@ -15,38 +15,17 @@ import logging
 
 logger = logging.getLogger("semantic_expansion")
 
-# Import embedding functionality (prefer embedder factory for Qwen3 support)
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-    FASTEMBED_AVAILABLE = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
-    try:
-        from fastembed import TextEmbedding
-        FASTEMBED_AVAILABLE = True
-    except ImportError:
-        FASTEMBED_AVAILABLE = False
-        TextEmbedding = None
+from qdrant_client import QdrantClient, models
 
-# Import Qdrant client for vector operations
-try:
-    from qdrant_client import QdrantClient, models
-    QDRANT_AVAILABLE = True
-except ImportError:
-    QDRANT_AVAILABLE = False
-    QdrantClient = None
-    models = None
+from scripts.embedder import get_embedding_model as _get_embedding_model
+from scripts.utils import (
+    lex_hash_vector_queries as _lex_hash_vector_queries,
+    sanitize_vector_name as _sanitize_vector_name,
+)
 
-# Import local utilities
-try:
-    from scripts.utils import (
-        lex_hash_vector_queries as _lex_hash_vector_queries,
-        sanitize_vector_name as _sanitize_vector_name,
-    )
-except ImportError:
-    _lex_hash_vector_queries = None
-    _sanitize_vector_name = None
+_EMBEDDER_FACTORY = True
+FASTEMBED_AVAILABLE = True
+QDRANT_AVAILABLE = True
 
 # Configuration defaults
 # NOTE: SEMANTIC_EXPANSION_ENABLED is intentionally *not* a module-level constant.
@@ -62,18 +41,15 @@ SEMANTIC_EXPANSION_CACHE_SIZE = int(os.environ.get("SEMANTIC_EXPANSION_CACHE_SIZ
 SEMANTIC_EXPANSION_CACHE_TTL = float(os.environ.get("SEMANTIC_EXPANSION_CACHE_TTL", "3600") or "3600")
 
 # Use UnifiedCache for proper LRU eviction instead of simple FIFO
-try:
-    from scripts.cache_manager import UnifiedCache, EvictionPolicy
-    _expansion_cache = UnifiedCache(
-        name="semantic_expansion",
-        max_size=SEMANTIC_EXPANSION_CACHE_SIZE,
-        eviction_policy=EvictionPolicy.LRU,
-        default_ttl=SEMANTIC_EXPANSION_CACHE_TTL,
-    )
-    _UNIFIED_CACHE = True
-except ImportError:
-    _expansion_cache: Dict[str, List[str]] = {}  # type: ignore
-    _UNIFIED_CACHE = False
+from scripts.cache_manager import UnifiedCache, EvictionPolicy
+
+_expansion_cache = UnifiedCache(
+    name="semantic_expansion",
+    max_size=SEMANTIC_EXPANSION_CACHE_SIZE,
+    eviction_policy=EvictionPolicy.LRU,
+    default_ttl=SEMANTIC_EXPANSION_CACHE_TTL,
+)
+_UNIFIED_CACHE = True
 
 _cache_hits = 0
 _cache_misses = 0

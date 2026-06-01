@@ -26,7 +26,6 @@ __all__ = [
     "_state_file_path",
     "_read_ws_state",
     "_default_collection",
-    "_work_script",
 ]
 
 import json
@@ -98,23 +97,3 @@ def _default_collection() -> str:
         if isinstance(coll, str) and coll.strip():
             return coll.strip()
     return DEFAULT_COLLECTION
-
-
-def _work_script(name: str) -> str:
-    """Return path to script respecting bind mounts first, then /app, then local fallback."""
-    try:
-        work_path = os.path.join("/work", "scripts", name)
-        if os.path.exists(work_path):
-            return work_path
-    except Exception:
-        pass
-
-    try:
-        app_path = os.path.join("/app", "scripts", name)
-        if os.path.exists(app_path):
-            return app_path
-    except Exception:
-        pass
-
-    return os.path.join(os.getcwd(), "scripts", name)
-

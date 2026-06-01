@@ -24,17 +24,11 @@ This façade:
 from __future__ import annotations
 
 import os
-import sys
 import hashlib
 import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
-
-# Ensure project root is on sys.path when run as a script
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from qdrant_client import QdrantClient, models
 
@@ -217,22 +211,11 @@ from scripts.ingest.pipeline import (
 # ---------------------------------------------------------------------------
 # Graph edges (optional accelerator)
 # ---------------------------------------------------------------------------
-try:
-    from scripts.ingest.graph_edges import (
-        graph_edges_backfill_tick,
-        delete_edges_by_path as delete_graph_edges_by_path,
-        upsert_file_edges as upsert_graph_edges_for_file,
-    )
-except ImportError:
-    # graph_edges_backfill_tick is optional and intentionally left as None to
-    # force callers to explicitly guard long-running backfill behavior.
-    graph_edges_backfill_tick = None  # type: ignore[assignment]
-
-    def delete_graph_edges_by_path(*_args, **_kwargs) -> int:
-        return 0
-
-    def upsert_graph_edges_for_file(*_args, **_kwargs) -> int:
-        return 0
+from scripts.ingest.graph_edges import (
+    graph_edges_backfill_tick,
+    delete_edges_by_path as delete_graph_edges_by_path,
+    upsert_file_edges as upsert_graph_edges_for_file,
+)
 # ---------------------------------------------------------------------------
 # Re-exports from ingest/cli.py
 # ---------------------------------------------------------------------------
@@ -243,11 +226,9 @@ from scripts.ingest.cli import (
 # ---------------------------------------------------------------------------
 # Additional imports for backward compatibility
 # ---------------------------------------------------------------------------
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
+from scripts.embedder import get_embedding_model as _get_embedding_model
+
+_EMBEDDER_FACTORY = True
 
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
@@ -261,11 +242,9 @@ from scripts.utils import sanitize_vector_name as _sanitize_vector_name
 from scripts.utils import lex_hash_vector_text as _lex_hash_vector_text
 from scripts.utils import lex_sparse_vector_text as _lex_sparse_vector_text
 
-try:
-    from scripts.ast_analyzer import get_ast_analyzer, chunk_code_semantically
-    _AST_ANALYZER_AVAILABLE = True
-except ImportError:
-    _AST_ANALYZER_AVAILABLE = False
+from scripts.ast_analyzer import get_ast_analyzer, chunk_code_semantically
+
+_AST_ANALYZER_AVAILABLE = True
 
 try:
     from tqdm import tqdm

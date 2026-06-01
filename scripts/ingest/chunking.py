@@ -14,12 +14,9 @@ from typing import List, Dict, Any
 from scripts.ingest.config import ROOT_DIR
 from scripts.ingest.tree_sitter import _use_tree_sitter, _TS_LANGUAGES
 
-# Import AST analyzer for enhanced semantic chunking
-try:
-    from scripts.ast_analyzer import get_ast_analyzer, chunk_code_semantically
-    _AST_ANALYZER_AVAILABLE = True
-except ImportError:
-    _AST_ANALYZER_AVAILABLE = False
+from scripts.ast_analyzer import get_ast_analyzer, chunk_code_semantically
+
+_AST_ANALYZER_AVAILABLE = True
 
 
 # Cache tokenizers loaded from TOKENIZER_JSON (or default) to avoid repeatedly
@@ -57,10 +54,6 @@ def chunk_semantic(
     _ast_supported = False
     if use_enhanced and _AST_ANALYZER_AVAILABLE:
         try:
-            # ast_analyzer internally respects USE_TREE_SITTER when constructing the analyzer
-            # (see scripts/ast_analyzer.py:get_ast_analyzer).
-            from scripts.ast_analyzer import get_ast_analyzer  # type: ignore
-
             analyzer = get_ast_analyzer()
             lang_key = str(language or "").strip().lower()
             # Supported either via builtin ast (python) or via tree-sitter when enabled.

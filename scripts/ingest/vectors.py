@@ -107,12 +107,10 @@ def _get_pattern_tools():
     """Lazy load pattern extraction tools."""
     global _PATTERN_EXTRACTOR, _PATTERN_ENCODER
     if _PATTERN_EXTRACTOR is None:
-        try:
-            from scripts.pattern_detection import PatternExtractor, PatternEncoder
-            _PATTERN_EXTRACTOR = PatternExtractor()
-            _PATTERN_ENCODER = PatternEncoder()
-        except ImportError:
-            pass
+        from scripts.pattern_detection import PatternExtractor, PatternEncoder
+
+        _PATTERN_EXTRACTOR = PatternExtractor()
+        _PATTERN_ENCODER = PatternEncoder()
     return _PATTERN_EXTRACTOR, _PATTERN_ENCODER
 
 

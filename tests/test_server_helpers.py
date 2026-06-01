@@ -39,9 +39,21 @@ def test_detect_repo_from_work_path_skips_internal_dirs(tmp_path, monkeypatch):
     (work / "real-repo" / ".git").mkdir(parents=True)
     monkeypatch.delenv("CURRENT_REPO", raising=False)
     monkeypatch.delenv("REPO_NAME", raising=False)
+    monkeypatch.setenv("CTXCE_BINDMOUNT_REPO_DETECTION", "1")
     monkeypatch.setattr(admin_tools, "Path", lambda value: work if value == "/work" else Path(value))
 
     assert admin_tools._detect_current_repo() == "real-repo"
+
+
+def test_detect_repo_from_work_path_skips_git_without_bindmount_mode(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    (work / "real-repo" / ".git").mkdir(parents=True)
+    monkeypatch.delenv("CURRENT_REPO", raising=False)
+    monkeypatch.delenv("REPO_NAME", raising=False)
+    monkeypatch.delenv("CTXCE_BINDMOUNT_REPO_DETECTION", raising=False)
+    monkeypatch.setattr(admin_tools, "Path", lambda value: work if value == "/work" else Path(value))
+
+    assert admin_tools._detect_current_repo() is None
 
 
 def fake_async_run_factory(text):

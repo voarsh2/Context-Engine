@@ -6,8 +6,8 @@ Runs fixed-query evaluation for reranker quality with MRR/Recall/latency metrics
 Designed for CI/regression testing - deterministic, no sampling.
 
 Usage:
-    python scripts/rerank_eval.py [--queries QUERIES_FILE] [--output OUTPUT_FILE]
-    python scripts/rerank_eval.py --ablations  # Run all ablation modes
+    python scripts/rerank_tools/eval.py [--queries QUERIES_FILE] [--output OUTPUT_FILE]
+    python scripts/rerank_tools/eval.py --ablations  # Run all ablation modes
 
 Metrics reported:
     - MRR@k (Mean Reciprocal Rank)
@@ -19,16 +19,12 @@ import argparse
 import copy
 import json
 import os
-import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Fixed evaluation queries (deterministic, no sampling)
 DEFAULT_EVAL_QUERIES = [
@@ -108,7 +104,7 @@ def get_candidates(query: str, limit: int = 30) -> List[Dict[str, Any]]:
 def get_onnx_scores(query: str, candidates: List[Dict[str, Any]]) -> Optional[List[float]]:
     """Get ONNX reranker scores (ground truth)."""
     try:
-        from scripts.rerank_local import rerank_local
+        from scripts.rerank_tools.local import rerank_local
         pairs = []
         for c in candidates:
             doc_parts = []
@@ -406,4 +402,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

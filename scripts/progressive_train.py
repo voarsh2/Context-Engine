@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Progressive training evaluation - measures quality at checkpoints."""
-import sys, os
-sys.path.insert(0, '.')
+import os
 
-from scripts.rerank_eval import get_candidates, rerank_learning, rerank_onnx, DEFAULT_EVAL_QUERIES
+from scripts.rerank_tools.eval import get_candidates, rerank_learning, rerank_onnx, DEFAULT_EVAL_QUERIES
 from scripts.rerank_recursive import rerank_with_learning
 from scripts.learning_reranker_worker import CollectionLearner
 import numpy as np
@@ -88,4 +87,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

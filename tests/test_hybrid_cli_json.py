@@ -6,7 +6,13 @@ import importlib
 
 
 def test_hybrid_cli_json_output(monkeypatch, capsys):
+    monkeypatch.setenv("HYBRID_LEXICAL_WEIGHT", "0.20")
+    monkeypatch.setenv("HYBRID_LEX_VECTOR_WEIGHT", "0.20")
+    monkeypatch.setenv("HYBRID_DENSE_WEIGHT", "1.5")
+    importlib.reload(importlib.import_module("scripts.hybrid.config"))
+    importlib.reload(importlib.import_module("scripts.hybrid.ranking"))
     hy = importlib.import_module("scripts.hybrid_search")
+    hy = importlib.reload(hy)
     embedder = importlib.import_module("scripts.embedder")
 
     class DummyVec:

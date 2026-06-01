@@ -10,6 +10,7 @@ import scripts.mcp_indexer_server as srv
 def test_repo_search_malformed_jsonl_subprocess(monkeypatch):
     # Force subprocess path and simulate malformed JSONL stdout
     monkeypatch.setenv("HYBRID_IN_PROCESS", "0")
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     async def fake_run(cmd, **kwargs):
         # Simulate subprocess failure with malformed output
@@ -30,6 +31,8 @@ def test_repo_search_inproc_qdrant_failure_fallback_and_fail(monkeypatch):
     # In-process hybrid raises (simulating Qdrant connectivity failure),
     # subprocess fallback also fails.
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
+    monkeypatch.setenv("RERANKER_ENABLED", "0")
 
     # Avoid real model load
     monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: object())

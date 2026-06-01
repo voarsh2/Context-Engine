@@ -638,7 +638,8 @@ def _maybe_handle_staging_file(
 
     cmd = [
         sys.executable or "python3",
-        str(watch_config.ROOT_DIR / "scripts" / "ingest_code.py"),
+        "-m",
+        "scripts.ingest_code",
         "--root",
         str(path),
         "--no-skip-unchanged",

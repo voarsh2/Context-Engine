@@ -177,7 +177,7 @@ def test_dense_query_preserves_collection_on_filter_drop(monkeypatch):
 
 @pytest.mark.unit
 def test_run_pure_dense_search_honors_per_path_cap(monkeypatch):
-    hybrid_qdrant = importlib.import_module("scripts.hybrid_qdrant")
+    hybrid_qdrant = importlib.import_module("scripts.hybrid.qdrant")
 
     points = [
         SimpleNamespace(

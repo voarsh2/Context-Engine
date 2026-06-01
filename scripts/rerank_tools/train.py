@@ -10,13 +10,13 @@ Implements TRM-style deep supervision training:
 
 Usage:
     # Generate synthetic training data
-    python scripts/rerank_train.py --generate-data --output data/rerank_train.jsonl
+    python scripts/rerank_tools/train.py --generate-data --output data/rerank_train.jsonl
 
     # Train the model
-    python scripts/rerank_train.py --train --data data/rerank_train.jsonl --epochs 100
+    python scripts/rerank_tools/train.py --train --data data/rerank_train.jsonl --epochs 100
 
     # Evaluate
-    python scripts/rerank_train.py --evaluate --data data/rerank_test.jsonl
+    python scripts/rerank_tools/train.py --evaluate --data data/rerank_test.jsonl
 """
 
 import os

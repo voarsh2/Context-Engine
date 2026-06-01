@@ -10,7 +10,7 @@ Provides:
 
 Usage:
     # In your search pipeline:
-    from scripts.rerank_ab_test import ABTestManager, RerankerVariant
+    from scripts.rerank_tools.ab_test import ABTestManager, RerankerVariant
 
     ab = ABTestManager()
     variant = ab.get_variant(session_id="user_123")
@@ -179,33 +179,17 @@ class ABTestManager:
             VariantType.BASELINE, baseline_rerank
         )
 
-        # Recursive reranker
-        try:
-            try:
-                from scripts.rerank_recursive import rerank_recursive
-            except ImportError:
-                from rerank_recursive import rerank_recursive
+        from scripts.rerank_recursive import rerank_recursive
+        from scripts.rerank_tools.local import rerank_in_process
 
-            self._variant_impls[VariantType.RECURSIVE] = RerankerVariant(
-                VariantType.RECURSIVE,
-                lambda q, c, **kw: rerank_recursive(q, c, n_iterations=3)
-            )
-        except ImportError:
-            pass
-
-        # ONNX reranker
-        try:
-            try:
-                from scripts.rerank_local import rerank_in_process
-            except ImportError:
-                from rerank_local import rerank_in_process
-
-            self._variant_impls[VariantType.ONNX] = RerankerVariant(
-                VariantType.ONNX,
-                lambda q, c, **kw: rerank_in_process(q, c, limit=len(c))
-            )
-        except ImportError:
-            pass
+        self._variant_impls[VariantType.RECURSIVE] = RerankerVariant(
+            VariantType.RECURSIVE,
+            lambda q, c, **kw: rerank_recursive(q, c, n_iterations=3)
+        )
+        self._variant_impls[VariantType.ONNX] = RerankerVariant(
+            VariantType.ONNX,
+            lambda q, c, **kw: rerank_in_process(q, c, limit=len(c))
+        )
 
     def _hash_to_bucket(self, session_id: str) -> float:
         """Hash session ID to a value in [0, 1) for consistent bucketing."""

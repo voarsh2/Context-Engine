@@ -67,7 +67,7 @@ def test_main_resolves_collection_from_state(monkeypatch, tmp_path):
     # Make the main loop exit immediately by raising KeyboardInterrupt on sleep
     def _raise_kb(_):
         raise KeyboardInterrupt()
-    monkeypatch.setattr(wi.time, "sleep", _raise_kb, raising=True)
+    monkeypatch.setattr(wi, "_sleep", _raise_kb, raising=True)
 
     # Precondition: module-level COLLECTION should reflect placeholder at import time
     assert wi.COLLECTION == os.environ.get("COLLECTION_NAME") == "my-collection"

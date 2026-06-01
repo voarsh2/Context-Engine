@@ -21,6 +21,8 @@ import logging
 import os
 from typing import Any, Dict
 
+from scripts.toon_encoder import encode_context_results, encode_search_results
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,16 +66,11 @@ def _format_results_as_toon(response: Dict[str, Any], compact: bool = False) -> 
         Modified response with TOON-encoded text
     """
     try:
-        from scripts.toon_encoder import encode_search_results
-
         results = response.get("results", [])
         if isinstance(results, list):
             response["text"] = encode_search_results(results, compact=compact)
         response["output_format"] = "toon"
 
-        return response
-    except ImportError:
-        logger.warning("TOON encoder not available, returning JSON format")
         return response
     except Exception as e:
         logger.debug(f"TOON encoding failed: {e}")
@@ -95,16 +92,11 @@ def _format_context_results_as_toon(response: Dict[str, Any], compact: bool = Fa
         Modified response with TOON-encoded text
     """
     try:
-        from scripts.toon_encoder import encode_context_results
-
         results = response.get("results", [])
         if isinstance(results, list):
             response["text"] = encode_context_results(results, compact=compact)
         response["output_format"] = "toon"
 
-        return response
-    except ImportError:
-        logger.warning("TOON encoder not available, returning JSON format")
         return response
     except Exception as e:
         logger.debug(f"TOON encoding failed: {e}")

@@ -57,13 +57,10 @@ from scripts.indexing_admin import (
     resolve_collection_root,
     spawn_ingest_code,
     recreate_collection_qdrant,
+    start_staging_rebuild,
+    activate_staging_rebuild,
+    abort_staging_rebuild,
 )
-
-try:
-    from scripts.workspace_state import is_staging_enabled
-except Exception:
-    is_staging_enabled = None  # type: ignore
-
 
 from pydantic import BaseModel, Field
 from scripts.auth_backend import (
@@ -86,78 +83,32 @@ from scripts.auth_backend import (
     revoke_collection_access,
 )
 
-try:
-    from scripts.collection_admin import delete_collection_everywhere, copy_collection_qdrant
-except Exception:
-    delete_collection_everywhere = None
-    copy_collection_qdrant = None
-try:
-    from scripts.qdrant_client_manager import pooled_qdrant_client
-except Exception:
-    pooled_qdrant_client = None
-try:
-    from scripts.admin_ui import (
-        render_admin_acl,
-        render_admin_bootstrap,
-        render_admin_error,
-        render_admin_login,
-    )
-except Exception:
+from scripts.collection_admin import delete_collection_everywhere, copy_collection_qdrant
+from scripts.qdrant_client_manager import pooled_qdrant_client
+from scripts.admin_ui import (
+    render_admin_acl,
+    render_admin_bootstrap,
+    render_admin_error,
+    render_admin_login,
+)
 
-    def _admin_ui_unavailable(*args, **kwargs):
-        raise HTTPException(status_code=500, detail="Admin UI unavailable")
-
-    render_admin_acl = _admin_ui_unavailable
-    render_admin_bootstrap = _admin_ui_unavailable
-    render_admin_error = _admin_ui_unavailable
-    render_admin_login = _admin_ui_unavailable
-
-# Import staging/indexing admin helpers
-try:
-    from scripts.indexing_admin import (
-        start_staging_rebuild,
-        activate_staging_rebuild,
-        abort_staging_rebuild,
-    )
-except ImportError:
-    start_staging_rebuild = None  # type: ignore
-    activate_staging_rebuild = None  # type: ignore
-    abort_staging_rebuild = None  # type: ignore
-
-# Import existing workspace state and indexing functions
-try:
-    from scripts.workspace_state import (
-        log_activity,
-        get_collection_name,
-        get_cached_file_hash,
-        set_cached_file_hash,
-        _extract_repo_name_from_path,
-        update_repo_origin,
-        get_collection_mappings,
-        find_collection_for_logical_repo,
-        update_workspace_state,
-        set_staging_state,
-        update_staging_status,
-        clear_staging_collection,
-        logical_repo_reuse_enabled,
-        get_collection_state_snapshot,
-    )
-except ImportError:
-    # Fallback for testing without full environment
-    log_activity = None
-    get_collection_name = None
-    get_cached_file_hash = None
-    set_cached_file_hash = None
-    _extract_repo_name_from_path = None
-    update_repo_origin = None
-    get_collection_mappings = None
-    find_collection_for_logical_repo = None
-    update_workspace_state = None
-    set_staging_state = None
-    update_staging_status = None
-    clear_staging_collection = None
-    def logical_repo_reuse_enabled() -> bool:  # type: ignore[no-redef]
-        return False
+from scripts.workspace_state import (
+    is_staging_enabled,
+    log_activity,
+    get_collection_name,
+    get_cached_file_hash,
+    set_cached_file_hash,
+    _extract_repo_name_from_path,
+    update_repo_origin,
+    get_collection_mappings,
+    find_collection_for_logical_repo,
+    update_workspace_state,
+    set_staging_state,
+    update_staging_status,
+    clear_staging_collection,
+    logical_repo_reuse_enabled,
+    get_collection_state_snapshot,
+)
 
 
 # Configure logging
@@ -450,8 +401,6 @@ def _resolve_bridge_state_target(
     repo = (repo_name or "").strip() or None
 
     if collection:
-        if resolve_collection_root is None:
-            raise HTTPException(status_code=400, detail="collection mapping unavailable")
         root, resolved_repo = resolve_collection_root(collection=collection, work_dir=WORK_DIR)
         if not root:
             raise HTTPException(status_code=404, detail="collection mapping not found")
@@ -560,21 +509,20 @@ async def _process_bundle_background(
             "partial": bool(failed_count > 0 and applied_count > 0),
             "completed_at": datetime.now().isoformat(),
         }
-        if log_activity:
-            try:
-                repo = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
-                log_activity(
-                    repo_name=repo,
-                    action="uploaded",
-                    file_path=bundle_id,
-                    details={
-                        "bundle_id": bundle_id,
-                        "operations": operations_count,
-                        "source": "delta_upload",
-                    },
-                )
-            except Exception as activity_err:
-                logger.debug(f"[upload_service] Failed to log activity for bundle {bundle_id}: {activity_err}")
+        try:
+            repo = _extract_repo_name_from_path(workspace_path)
+            log_activity(
+                repo_name=repo,
+                action="uploaded",
+                file_path=bundle_id,
+                details={
+                    "bundle_id": bundle_id,
+                    "operations": operations_count,
+                    "source": "delta_upload",
+                },
+            )
+        except Exception as activity_err:
+            logger.debug(f"[upload_service] Failed to log activity for bundle {bundle_id}: {activity_err}")
         if failed_count > 0:
             logger.warning(
                 "[upload_service] Finished processing bundle %s seq %s with failures in %sms "
@@ -903,9 +851,6 @@ async def bridge_collection_state(
     workspace: Optional[str] = None,
     repo_name: Optional[str] = None,
 ):
-    if get_collection_state_snapshot is None:
-        raise HTTPException(status_code=503, detail="workspace_state helper unavailable")
-
     _bridge_state_authorized(request)
 
     workspace_path, repo = _resolve_bridge_state_target(collection=collection, workspace=workspace, repo_name=repo_name)
@@ -914,7 +859,7 @@ async def bridge_collection_state(
     if not snapshot:
         raise HTTPException(status_code=404, detail="Workspace state not found")
 
-    if not (is_staging_enabled() if callable(is_staging_enabled) else False):
+    if not is_staging_enabled():
         # Classic mode: ignore any serving_* overrides from staging/migration.
         snapshot = dict(snapshot)
         snapshot.pop("serving_collection", None)
@@ -1013,14 +958,6 @@ async def admin_delete_collection(
             back_href="/admin/acl",
         )
 
-    if delete_collection_everywhere is None:
-        return render_admin_error(
-            request,
-            title="Delete Collection Failed",
-            message="Collection delete helper unavailable",
-            back_href="/admin/acl",
-        )
-
     # Default is Qdrant-only (no filesystem cleanup). Users must explicitly opt in.
     try:
         cleanup_fs = (delete_fs or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -1067,7 +1004,7 @@ async def admin_start_staging(
     collection: str = Form(...),
 ):
     _require_admin_session(request)
-    if not (is_staging_enabled() if callable(is_staging_enabled) else False):
+    if not is_staging_enabled():
         return render_admin_error(
             request,
             title="Start Staging Failed",
@@ -1081,14 +1018,6 @@ async def admin_start_staging(
             request,
             title="Start Staging Failed",
             message="collection is required",
-            back_href="/admin/acl",
-        )
-
-    if start_staging_rebuild is None:
-        return render_admin_error(
-            request,
-            title="Start Staging Failed",
-            message="Staging helper unavailable",
             back_href="/admin/acl",
         )
 
@@ -1123,12 +1052,10 @@ async def admin_start_staging(
         },
     }
 
-    if set_staging_state:
-        try:
-            set_staging_state(workspace_path=root, repo_name=repo_name, staging=staging_payload)
-        except Exception as set_err:
-            logger.warning(f"[admin] Failed to persist queued staging state for {name}: {set_err}")
-    elif update_workspace_state:
+    try:
+        set_staging_state(workspace_path=root, repo_name=repo_name, staging=staging_payload)
+    except Exception as set_err:
+        logger.warning(f"[admin] Failed to persist queued staging state for {name}: {set_err}")
         try:
             update_workspace_state(
                 workspace_path=root,
@@ -1138,15 +1065,14 @@ async def admin_start_staging(
         except Exception as set_err:
             logger.warning(f"[admin] Failed to update workspace state for queued staging {name}: {set_err}")
 
-    if update_staging_status:
-        try:
-            update_staging_status(
-                workspace_path=root,
-                repo_name=repo_name,
-                status={"state": "queued", "queued_at": now, "request_id": request_id},
-            )
-        except Exception as status_err:
-            logger.debug(f"[admin] Failed to mark staging status queued for {name}: {status_err}")
+    try:
+        update_staging_status(
+            workspace_path=root,
+            repo_name=repo_name,
+            status={"state": "queued", "queued_at": now, "request_id": request_id},
+        )
+    except Exception as status_err:
+        logger.debug(f"[admin] Failed to mark staging status queued for {name}: {status_err}")
 
     try:
         async def _bg_start() -> None:
@@ -1159,9 +1085,9 @@ async def admin_start_staging(
                 logger.error(f"[admin] Background staging start failed for {name}: {e}")
                 # Ensure we don't leave the workspace stuck in a queued staging state.
                 try:
-                    if clear_staging_collection:
+                    try:
                         clear_staging_collection(workspace_path=root, repo_name=repo_name)
-                    elif update_workspace_state:
+                    except Exception:
                         update_workspace_state(
                             workspace_path=root,
                             repo_name=repo_name,
@@ -1190,7 +1116,7 @@ async def admin_activate_staging(
     collection: str = Form(...),
 ):
     _require_admin_session(request)
-    if not (is_staging_enabled() if callable(is_staging_enabled) else False):
+    if not is_staging_enabled():
         return render_admin_error(
             request,
             title="Activate Staging Failed",
@@ -1203,14 +1129,6 @@ async def admin_activate_staging(
             request,
             title="Activate Staging Failed",
             message="collection is required",
-            back_href="/admin/acl",
-        )
-
-    if activate_staging_rebuild is None:
-        return render_admin_error(
-            request,
-            title="Activate Staging Failed",
-            message="Staging helper unavailable",
             back_href="/admin/acl",
         )
 
@@ -1259,21 +1177,13 @@ async def admin_abort_staging(
         )
 
     try:
-        if abort_staging_rebuild is not None:
-            # Run abort to completion so we always clear staging metadata before returning.
-            await asyncio.to_thread(
-                abort_staging_rebuild,
-                collection=name,
-                work_dir=WORK_DIR,
-                delete_collection=True,
-            )
-            logger.info(f"[admin] Aborted staging rebuild for {name}")
-        elif clear_staging_collection:
-            # Fallback for older deployments: clear staging metadata only.
-            clear_staging_collection(workspace_path=root, repo_name=repo_name)
-            logger.info(f"[admin] Aborted staging for {name} (metadata only)")
-        else:
-            raise RuntimeError("staging abort helpers unavailable")
+        await asyncio.to_thread(
+            abort_staging_rebuild,
+            collection=name,
+            work_dir=WORK_DIR,
+            delete_collection=True,
+        )
+        logger.info(f"[admin] Aborted staging rebuild for {name}")
     except Exception as e:
         return render_admin_error(
             request,
@@ -1302,14 +1212,6 @@ async def admin_copy_collection(
             back_href="/admin/acl",
         )
 
-    if copy_collection_qdrant is None:
-        return render_admin_error(
-            request,
-            title="Copy Collection Failed",
-            message="copy helper unavailable",
-            back_href="/admin/acl",
-        )
-
     try:
         allow_overwrite = str(overwrite or "").strip().lower() in {"1", "true", "yes", "on"}
     except Exception:
@@ -1334,22 +1236,20 @@ async def admin_copy_collection(
     graph_copied: Optional[str] = None
     try:
         if not name.endswith("_graph") and not str(new_name).endswith("_graph"):
-            used_pooled = False
-            if pooled_qdrant_client is not None:
-                used_pooled = True
-                try:
-                    with pooled_qdrant_client(
-                        url=QDRANT_URL,
-                        api_key=os.environ.get("QDRANT_API_KEY"),
-                    ) as cli:
-                        try:
-                            cli.get_collection(collection_name=f"{new_name}_graph")
-                            graph_copied = "1"
-                        except Exception:
-                            graph_copied = "0"
-                except Exception:
-                    # Failed to acquire pooled client; fall back to non-pooled
-                    used_pooled = False
+            used_pooled = True
+            try:
+                with pooled_qdrant_client(
+                    url=QDRANT_URL,
+                    api_key=os.environ.get("QDRANT_API_KEY"),
+                ) as cli:
+                    try:
+                        cli.get_collection(collection_name=f"{new_name}_graph")
+                        graph_copied = "1"
+                    except Exception:
+                        graph_copied = "0"
+            except Exception:
+                # Failed to acquire pooled client; fall back to non-pooled
+                used_pooled = False
             if not used_pooled:
                 try:
                     from qdrant_client import QdrantClient  # type: ignore
@@ -1508,11 +1408,8 @@ async def get_status(workspace_path: str):
     """Get upload status for workspace."""
     try:
         # Get collection name
-        if get_collection_name:
-            repo_name = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
-            collection_name = get_collection_name(repo_name)
-        else:
-            collection_name = DEFAULT_COLLECTION
+        repo_name = _extract_repo_name_from_path(workspace_path)
+        collection_name = get_collection_name(repo_name)
 
         # Get last sequence
         last_sequence = get_last_sequence(workspace_path)
@@ -1562,60 +1459,55 @@ def _resolve_collection_for_request(
     collection_name: Optional[str] = None
     repo_name: Optional[str] = None
 
-    if _extract_repo_name_from_path or (get_collection_name and logical_repo_reuse_enabled and find_collection_for_logical_repo):
-        # Always derive repo_name from workspace_path for origin tracking
-        repo_name = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
-        if not repo_name:
-            repo_name = Path(workspace_path).name
+    # Always derive repo_name from workspace_path for origin tracking
+    repo_name = _extract_repo_name_from_path(workspace_path)
+    if not repo_name:
+        repo_name = Path(workspace_path).name
 
-        # Preserve any client-supplied collection name but allow server-side overrides
-        resolved_collection: Optional[str] = None
+    # Preserve any client-supplied collection name but allow server-side overrides
+    resolved_collection: Optional[str] = None
 
-        # Resolve collection name, preferring server-side mapping for logical_repo_id when enabled
-        if logical_repo_reuse_enabled() and logical_repo_id and find_collection_for_logical_repo:
-            try:
-                existing = find_collection_for_logical_repo(logical_repo_id, search_root=WORK_DIR)
-            except Exception:
-                existing = None
-            if existing:
-                resolved_collection = existing
+    # Resolve collection name, preferring server-side mapping for logical_repo_id when enabled
+    if logical_repo_reuse_enabled() and logical_repo_id:
+        try:
+            existing = find_collection_for_logical_repo(logical_repo_id, search_root=WORK_DIR)
+        except Exception:
+            existing = None
+        if existing:
+            resolved_collection = existing
 
-        # Latent migration: when no explicit mapping exists yet for this logical_repo_id, but there is a
-        # single existing collection mapping, prefer reusing it rather than creating a fresh collection.
-        if logical_repo_reuse_enabled() and logical_repo_id and resolved_collection is None and get_collection_mappings:
-            try:
-                mappings = get_collection_mappings(search_root=WORK_DIR) or []
-            except Exception:
-                mappings = []
+    # Latent migration: when no explicit mapping exists yet for this logical_repo_id, but there is a
+    # single existing collection mapping, prefer reusing it rather than creating a fresh collection.
+    if logical_repo_reuse_enabled() and logical_repo_id and resolved_collection is None:
+        try:
+            mappings = get_collection_mappings(search_root=WORK_DIR) or []
+        except Exception:
+            mappings = []
 
-            if len(mappings) == 1:
-                canonical = mappings[0]
-                canonical_coll = canonical.get("collection_name")
-                if canonical_coll:
-                    resolved_collection = canonical_coll
-                    if update_workspace_state:
-                        try:
-                            update_workspace_state(
-                                workspace_path=canonical.get("container_path") or canonical.get("state_file"),
-                                updates={"logical_repo_id": logical_repo_id},
-                                repo_name=canonical.get("repo_name"),
-                            )
-                        except Exception as migrate_err:
-                            logger.debug(
-                                f"[upload_service] Failed to migrate logical_repo_id for existing mapping: {migrate_err}"
-                            )
+        if len(mappings) == 1:
+            canonical = mappings[0]
+            canonical_coll = canonical.get("collection_name")
+            if canonical_coll:
+                resolved_collection = canonical_coll
+                try:
+                    update_workspace_state(
+                        workspace_path=canonical.get("container_path") or canonical.get("state_file"),
+                        updates={"logical_repo_id": logical_repo_id},
+                        repo_name=canonical.get("repo_name"),
+                    )
+                except Exception as migrate_err:
+                    logger.debug(
+                        f"[upload_service] Failed to migrate logical_repo_id for existing mapping: {migrate_err}"
+                    )
 
-        # Finalize collection_name: prefer resolved server-side mapping, then client-supplied name,
-        # then standard get_collection_name/DEFAULT_COLLECTION fallbacks.
-        if resolved_collection is not None:
-            collection_name = resolved_collection
-        elif client_collection_name:
-            collection_name = client_collection_name
-        else:
-            if get_collection_name and repo_name:
-                collection_name = get_collection_name(repo_name)
-            else:
-                collection_name = DEFAULT_COLLECTION
+    # Finalize collection_name: prefer resolved server-side mapping, then client-supplied name,
+    # then standard get_collection_name/DEFAULT_COLLECTION fallbacks.
+    if resolved_collection is not None:
+        collection_name = resolved_collection
+    elif client_collection_name:
+        collection_name = client_collection_name
+    else:
+        collection_name = get_collection_name(repo_name) if repo_name else DEFAULT_COLLECTION
 
     return collection_name, repo_name
 

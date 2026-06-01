@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import sys
 from pathlib import Path
 
 from qdrant_client import QdrantClient, models
@@ -8,21 +7,8 @@ from qdrant_client import QdrantClient, models
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 from datetime import datetime
 ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
-# Import critical functions first
-try:
-    from scripts.workspace_state import get_collection_name, is_multi_repo_mode
-except Exception:
-    get_collection_name = None  # type: ignore
-    is_multi_repo_mode = None  # type: ignore
-
-# Import other optional functions
-try:
-    from scripts.workspace_state import log_activity
-except Exception:
-    log_activity = None  # type: ignore
+from scripts.workspace_state import get_collection_name, is_multi_repo_mode, log_activity
 
 COLLECTION = os.environ.get("COLLECTION_NAME", "codebase")
 # Discover workspace path for state updates (allows subdir indexing)

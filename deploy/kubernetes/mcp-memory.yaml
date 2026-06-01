@@ -36,7 +36,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/mcp_memory_server.py
+        - -m
+        - scripts.mcp_memory_server
+        workingDir: /app
         ports:
         - name: sse
           containerPort: 8000

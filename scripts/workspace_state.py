@@ -262,6 +262,16 @@ def logical_repo_reuse_enabled() -> bool:
         "on",
     }
 
+
+def bindmount_repo_detection_enabled() -> bool:
+    """Allow git-based repo inference for bindmount-style deployments."""
+    return os.environ.get("CTXCE_BINDMOUNT_REPO_DETECTION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 _state_lock = threading.Lock()
 # Track last-used timestamps for cleanup of idle workspace locks
 _state_locks: Dict[str, threading.RLock] = {}
@@ -703,15 +713,13 @@ def _git_remote_repo_name(repo_path: Path) -> Optional[str]:
 
 
 def _detect_repo_name_from_path(path: Path) -> str:
-    """Detect repository name from path using git remote origin URL.
+    """Detect repository name from managed upload/workspace path structure.
 
-    This ensures consistency with how the MCP server detects repos during search.
     Priority:
-    1. Fast-path for server-managed uploads and workspace-relative paths
-    2. Git remote origin URL (canonical repo name like 'Context-Engine')
-    3. Git toplevel directory name (folder name like 'Context-Engine-hash')
-    4. Walk up to find .git and return that folder name
-    5. Return parent folder name as fallback
+    1. Server-managed upload slug markers
+    2. Workspace-relative first path segment
+    3. Bindmount git inference when CTXCE_BINDMOUNT_REPO_DETECTION=1
+    4. Structure/name fallback
     """
     slug = _server_managed_slug_from_path(path)
     if slug:
@@ -739,24 +747,24 @@ def _detect_repo_name_from_path(path: Path) -> str:
     except Exception:
         pass
 
-    try:
-        base = path if path.is_dir() else path.parent
-        git_name = _git_remote_repo_name(base)
-        if git_name:
-            return git_name
-    except Exception:
-        pass
-    try:
-        # Walk up to find .git
-        cur = path if path.is_dir() else path.parent
-        for p in [cur] + list(cur.parents):
-            try:
-                if (p / ".git").exists():
-                    return p.name
-            except Exception:
-                continue
-    except Exception:
-        pass
+    if bindmount_repo_detection_enabled():
+        try:
+            base = path if path.is_dir() else path.parent
+            git_name = _git_remote_repo_name(base)
+            if git_name:
+                return git_name
+        except Exception:
+            pass
+        try:
+            cur = path if path.is_dir() else path.parent
+            for p in [cur] + list(cur.parents):
+                try:
+                    if (p / ".git").exists():
+                        return p.name
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     try:
         structure_name = _detect_repo_name_from_path_by_structure(path)
@@ -1434,6 +1442,37 @@ def _collection_name_for_repo_slug(normalized_repo: str, *, is_old_slug: bool) -
     return None
 
 
+def _coerce_collection_repo_name(repo_name: Optional[str]) -> Optional[str]:
+    if not repo_name:
+        return None
+
+    value = str(repo_name).strip()
+    if not value:
+        return None
+
+    if "/" not in value and "\\" not in value:
+        return value
+
+    try:
+        path = Path(value).resolve()
+    except Exception:
+        path = Path(value)
+
+    try:
+        workspace_root = Path(_resolve_workspace_root()).resolve()
+    except Exception:
+        workspace_root = Path(_resolve_workspace_root())
+
+    try:
+        if path == workspace_root:
+            return None
+    except Exception:
+        pass
+
+    detected = _extract_repo_name_from_path(str(path))
+    return detected or None
+
+
 def get_collection_name(repo_name: Optional[str] = None) -> str:
     """Get collection name for repository or workspace.
 
@@ -1441,7 +1480,7 @@ def get_collection_name(repo_name: Optional[str] = None) -> str:
     1. Explicit COLLECTION_NAME env var - master override when set to a real value
        (if repo_name is an *_old clone, append _old to the override unless already present)
     2. Derive from repo slug (including *_old suffix handling)
-    3. Fallback: "global-collection"
+    3. Fallback: DEFAULT_COLLECTION, COLLECTION_NAME, or "codebase"
 
     This ensures COLLECTION_NAME works as a master override in both local dev
     and container environments, while still allowing deterministic derivation
@@ -1458,6 +1497,7 @@ def get_collection_name(repo_name: Optional[str] = None) -> str:
             pass
         return env_coll
 
+    repo_name = _coerce_collection_repo_name(repo_name)
     normalized = _normalize_repo_name_for_collection(repo_name) if repo_name else None
     is_old_slug = False
     try:
@@ -1472,8 +1512,7 @@ def get_collection_name(repo_name: Optional[str] = None) -> str:
     if derived:
         return derived
 
-    # Default fallback
-    return "global-collection"
+    return os.environ.get("DEFAULT_COLLECTION") or os.environ.get("COLLECTION_NAME") or "codebase"
 
 def _detect_repo_name_from_path_by_structure(path: Path) -> str:
     """Detect repository name from path structure (fallback when git is unavailable)."""
@@ -1528,7 +1567,8 @@ def _normalize_repo_slug(candidate: Optional[str]) -> Optional[str]:
 def _extract_repo_name_from_path(workspace_path: str) -> str:
     """Extract repository slug or canonical name from workspace path.
 
-    Accepts canonical slugs (repo-hash), `_old` slugs, and falls back to git remote name.
+    Accepts managed upload slugs and workspace-relative repo paths. Git-based
+    bindmount inference is opt-in via CTXCE_BINDMOUNT_REPO_DETECTION=1.
     """
     if not workspace_path:
         return ""
@@ -1543,13 +1583,29 @@ def _extract_repo_name_from_path(workspace_path: str) -> str:
         return slug
 
     try:
-        repo_path = path if path.is_dir() else path.parent
-        if (repo_path / ".git").exists():
-            name = _git_remote_repo_name(repo_path)
-            if name:
-                return name
+        workspace_root = Path(_resolve_workspace_root()).resolve()
+    except Exception:
+        workspace_root = Path(_resolve_workspace_root())
+
+    try:
+        rel = path.relative_to(workspace_root)
+        if not rel.parts:
+            return ""
+        candidate = rel.parts[0]
+        if candidate not in INTERNAL_STATE_TOP_LEVEL_DIRS:
+            return candidate
     except Exception:
         pass
+
+    if bindmount_repo_detection_enabled():
+        try:
+            repo_path = path if path.is_dir() else path.parent
+            if (repo_path / ".git").exists():
+                name = _git_remote_repo_name(repo_path)
+                if name:
+                    return name
+        except Exception:
+            pass
 
     try:
         candidate = _normalize_repo_slug(path.name)

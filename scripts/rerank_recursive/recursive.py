@@ -23,21 +23,13 @@ except ImportError:
     Tokenizer = None
     HAS_ONNX = False
 
-# Use centralized reranker factory (supports FastEmbed + ONNX backends)
-try:
-    from scripts.reranker import (
-        get_reranker_model as _get_reranker_model,
-        rerank_pairs as _rerank_pairs,
-        is_reranker_available as _is_reranker_available,
-        RERANKER_MODEL,
-    )
-    HAS_RERANKER_FACTORY = True
-except ImportError:
-    HAS_RERANKER_FACTORY = False
-    _get_reranker_model = None
-    _rerank_pairs = None
-    _is_reranker_available = None
-    RERANKER_MODEL = None
+from scripts.reranker import (
+    get_reranker_model as _get_reranker_model,
+    rerank_pairs as _rerank_pairs,
+    is_reranker_available as _is_reranker_available,
+)
+
+HAS_RERANKER_FACTORY = True
 
 # Legacy: direct FastEmbed imports (fallback when factory unavailable)
 try:
@@ -845,34 +837,25 @@ def rerank_with_learning(
     if learn_from_onnx and candidates:
         teacher_scores = None
         if str(os.environ.get("RERANK_TEACHER_INLINE", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            from scripts.rerank_tools.local import rerank_local
+
             try:
-                from scripts.rerank_local import rerank_local
-            except ImportError:
-                try:
-                    from rerank_local import rerank_local
-                except ImportError:
-                    rerank_local = None
-            if rerank_local is not None:
-                try:
-                    pairs = []
-                    for c in candidates:
-                        doc = c.get("code") or c.get("snippet") or ""
-                        if not doc:
-                            parts = []
-                            if c.get("symbol"):
-                                parts.append(str(c["symbol"]))
-                            if c.get("path"):
-                                parts.append(str(c["path"]))
-                            doc = " ".join(parts) if parts else "empty"
-                        pairs.append((query, doc[:1000]))
-                    teacher_scores = rerank_local(pairs)
-                except Exception:
-                    teacher_scores = None
+                pairs = []
+                for c in candidates:
+                    doc = c.get("code") or c.get("snippet") or ""
+                    if not doc:
+                        parts = []
+                        if c.get("symbol"):
+                            parts.append(str(c["symbol"]))
+                        if c.get("path"):
+                            parts.append(str(c["path"]))
+                        doc = " ".join(parts) if parts else "empty"
+                    pairs.append((query, doc[:1000]))
+                teacher_scores = rerank_local(pairs)
+            except Exception:
+                teacher_scores = None
         try:
-            try:
-                from rerank_events import log_training_event
-            except ImportError:
-                from scripts.rerank_events import log_training_event
+            from scripts.rerank_tools.events import log_training_event
             log_training_event(
                 query=query,
                 candidates=candidates,

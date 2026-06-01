@@ -789,31 +789,6 @@ def test_resolve_codebase_root_fallbacks_to_parent(monkeypatch: pytest.MonkeyPat
     assert resolved_parent == codebase_root
 
 
-def test_admin_abort_endpoint_falls_back_to_clear_when_abort_helper_missing(monkeypatch: pytest.MonkeyPatch):
-    from scripts import upload_service
-
-    calls = {"clear": []}
-
-    monkeypatch.setattr(upload_service, "_require_admin_session", lambda request: {"user_id": "admin"})
-    monkeypatch.setattr(upload_service, "abort_staging_rebuild", None)
-    monkeypatch.setattr(
-        upload_service,
-        "clear_staging_collection",
-        lambda workspace_path, repo_name: calls["clear"].append((workspace_path, repo_name)),
-    )
-    monkeypatch.setattr(
-        upload_service,
-        "resolve_collection_root",
-        lambda **kwargs: ("/fake/root", "repo1"),
-    )
-
-    client = TestClient(upload_service.app)
-
-    resp = client.post("/admin/staging/abort", data={"collection": "coll1"}, follow_redirects=False)
-    assert resp.status_code == 302
-    assert calls["clear"] == [("/fake/root", "repo1")]
-
-
 def test_watcher_collection_reuse_logical_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from scripts.watch_index_core import utils as watch_utils
 

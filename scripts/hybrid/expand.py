@@ -40,21 +40,14 @@ logger = logging.getLogger("hybrid_expand")
 if TYPE_CHECKING:
     from qdrant_client import QdrantClient
 
-# Import semantic expansion functionality (optional)
-try:
-    from scripts.semantic_expansion import (
-        expand_queries_semantically,
-        expand_queries_with_prf,
-        get_expansion_stats,
-        clear_expansion_cache,
-    )
-    SEMANTIC_EXPANSION_AVAILABLE = True
-except ImportError:
-    SEMANTIC_EXPANSION_AVAILABLE = False
-    expand_queries_semantically = None
-    expand_queries_with_prf = None
-    get_expansion_stats = None
-    clear_expansion_cache = None
+from scripts.semantic_expansion import (
+    expand_queries_semantically,
+    expand_queries_with_prf,
+    get_expansion_stats,
+    clear_expansion_cache,
+)
+
+SEMANTIC_EXPANSION_AVAILABLE = True
 
 
 # Feature flag for embedding-based dynamic expansion

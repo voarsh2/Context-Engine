@@ -6,11 +6,9 @@ import hashlib
 import re
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
-
-try:
-    from scripts.workspace_state import (
+from scripts.workspace_state import (
     _normalize_cache_key_path,
     _extract_repo_name_from_path,
     get_staging_targets,
@@ -18,10 +16,6 @@ try:
     is_staging_enabled,
     upsert_index_journal_entries,
 )
-except ImportError as exc:
-    raise ImportError(
-        "upload_delta_bundle requires scripts.workspace_state; ensure the module is available"
-    ) from exc
 
 
 logger = logging.getLogger(__name__)
@@ -166,19 +160,18 @@ def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) 
     repo_name_for_state: Optional[str] = None
     serving_slug: Optional[str] = None
     active_slug: Optional[str] = None
-    if _extract_repo_name_from_path and get_collection_state_snapshot:
-        try:
-            repo_name_for_state = _extract_repo_name_from_path(workspace_path)
-            if repo_name_for_state:
-                snapshot = get_collection_state_snapshot(
-                    workspace_path=None,
-                    repo_name=repo_name_for_state,
-                )  # type: ignore[arg-type]
-                serving_slug = snapshot.get("serving_repo_slug")
-                active_slug = snapshot.get("active_repo_slug")
-        except Exception:
-            serving_slug = None
-            active_slug = None
+    try:
+        repo_name_for_state = _extract_repo_name_from_path(workspace_path)
+        if repo_name_for_state:
+            snapshot = get_collection_state_snapshot(
+                workspace_path=None,
+                repo_name=repo_name_for_state,
+            )  # type: ignore[arg-type]
+            serving_slug = snapshot.get("serving_repo_slug")
+            active_slug = snapshot.get("active_repo_slug")
+    except Exception:
+        serving_slug = None
+        active_slug = None
 
     slug_order: list[str] = []
     serving_candidate: Optional[str] = None
@@ -188,7 +181,7 @@ def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) 
         slug_order.append(active_slug)
 
     staging_active = False
-    staging_gate = bool(is_staging_enabled() if callable(is_staging_enabled) else False)
+    staging_gate = bool(is_staging_enabled())
     try:
         if serving_slug and str(serving_slug).endswith("_old"):
             staging_active = True
@@ -227,14 +220,11 @@ def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) 
         if _SLUGGED_REPO_RE.match(workspace_leaf):
             slug_order.append(workspace_leaf)
         else:
-            if _extract_repo_name_from_path:
-                repo_name = _extract_repo_name_from_path(workspace_path) or workspace_leaf
-            else:
-                repo_name = workspace_leaf
+            repo_name = _extract_repo_name_from_path(workspace_path) or workspace_leaf
             workspace_key = get_workspace_key(workspace_path)
             slug_order.append(f"{repo_name}-{workspace_key}")
 
-    if staging_gate and (not staging_active) and get_staging_targets and _extract_repo_name_from_path:
+    if staging_gate and not staging_active:
         try:
             repo_name_for_staging = _extract_repo_name_from_path(workspace_path) or slug_order[0]
             targets = get_staging_targets(

@@ -98,7 +98,7 @@ async def test_rerank_inproc_changes_order(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        importlib.import_module("scripts.rerank_local"),
+        importlib.import_module("scripts.rerank_tools.local"),
         "rerank_local",
         fake_rerank_local,
     )
@@ -140,7 +140,7 @@ async def test_rerank_inproc_dense_respects_collection_argument(monkeypatch):
         return []
 
     monkeypatch.setattr(
-        importlib.import_module("scripts.rerank_local"),
+        importlib.import_module("scripts.rerank_tools.local"),
         "rerank_in_process",
         fake_rerank_in_process,
     )
@@ -187,7 +187,7 @@ async def test_rerank_inproc_dense_respects_path_filters(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        importlib.import_module("scripts.rerank_local"),
+        importlib.import_module("scripts.rerank_tools.local"),
         "rerank_in_process",
         fake_rerank_in_process,
     )

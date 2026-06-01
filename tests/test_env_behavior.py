@@ -11,6 +11,7 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
     # Force rerank via env default when arg not provided
     monkeypatch.setenv("RERANKER_ENABLED", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "0")
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     # Floor 1500ms; client asks 200ms -> effective >= 1500ms -> 1.5s
     monkeypatch.setenv("RERANK_TIMEOUT_FLOOR_MS", "1500")
@@ -22,8 +23,8 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
 
     async def fake_run(cmd, env=None, timeout=None):
         calls.append({"cmd": cmd, "timeout": timeout})
-        # Distinguish hybrid vs rerank by script name
-        if any("rerank_local.py" in str(x) for x in cmd):
+        # Distinguish hybrid vs rerank by module name
+        if "scripts.rerank_tools.local" in " ".join(map(str, cmd)):
             # Return something that looks like rerank stdout
             return {
                 "ok": True,
@@ -48,9 +49,9 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
     )
 
     assert any(
-        "rerank_local.py" in " ".join(map(str, c["cmd"])) for c in calls
+        "scripts.rerank_tools.local" in " ".join(map(str, c["cmd"])) for c in calls
     ), "rerank subprocess should be invoked"
     # find rerank call
-    rc = next(c for c in calls if any("rerank_local.py" in str(x) for x in c["cmd"]))
+    rc = next(c for c in calls if "scripts.rerank_tools.local" in " ".join(map(str, c["cmd"])))
     assert rc["timeout"] >= 1.5 and rc["timeout"] <= 2.0
     assert res["used_rerank"] is True

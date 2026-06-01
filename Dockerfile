@@ -19,12 +19,13 @@ RUN pip install --no-cache-dir --upgrade -r /tmp/requirements.txt
 
 # Copy scripts for all services
 COPY scripts /app/scripts
+RUN chmod -R a+rX /app/scripts
 
 # Create directories
-WORKDIR /work
+WORKDIR /app
 
 # Expose all necessary ports
 EXPOSE 8000 8001 8002 8003 18000 18001 18002 18003
 
 # Default to memory server
-CMD ["python", "/app/scripts/mcp_memory_server.py"]
+CMD ["python", "-m", "scripts.mcp_memory_server"]

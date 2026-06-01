@@ -42,11 +42,11 @@ class FakeEmbedder:
 @pytest.mark.integration
 def test_index_and_search_minirepo(tmp_path, monkeypatch, qdrant_container):
     # Env for services
-    os.environ["QDRANT_URL"] = qdrant_container
-    os.environ["COLLECTION_NAME"] = f"test-{uuid.uuid4().hex[:8]}"
-    os.environ["USE_TREE_SITTER"] = "0"
-    os.environ["HYBRID_IN_PROCESS"] = "1"
-    os.environ["EMBEDDING_MODEL"] = "fake"
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
+    monkeypatch.setenv("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
+    monkeypatch.setenv("USE_TREE_SITTER", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "fake")
 
     # Stub embeddings everywhere (FakeEmbedder produces 32-dim vectors)
     monkeypatch.setattr(ing, "TextEmbedding", lambda *a, **k: FakeEmbedder("fake"))
@@ -93,11 +93,11 @@ def test_index_and_search_minirepo(tmp_path, monkeypatch, qdrant_container):
 @pytest.mark.integration
 def test_filters_language_and_path(tmp_path, monkeypatch, qdrant_container):
     # Reuse container; set env
-    os.environ["QDRANT_URL"] = qdrant_container
-    os.environ.setdefault("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
-    os.environ["USE_TREE_SITTER"] = "0"
-    os.environ["HYBRID_IN_PROCESS"] = "1"
-    os.environ["EMBEDDING_MODEL"] = "fake"
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
+    monkeypatch.setenv("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
+    monkeypatch.setenv("USE_TREE_SITTER", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "fake")
 
     # Stub embeddings (FakeEmbedder produces 32-dim vectors)
     monkeypatch.setattr(ing, "TextEmbedding", lambda *a, **k: FakeEmbedder("fake"))

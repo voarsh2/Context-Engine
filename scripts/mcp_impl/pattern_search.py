@@ -9,13 +9,9 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Union
 
-# Import logger with fallback
-try:
-    from scripts.logger import get_logger
-    logger = get_logger(__name__)
-except ImportError:
-    import logging
-    logger = logging.getLogger(__name__)
+from scripts.logger import get_logger
+
+logger = get_logger(__name__)
 
 # Import pattern detection components (lazy to avoid startup penalty)
 _PATTERN_SEARCH_LOADED = False
@@ -28,18 +24,14 @@ def _ensure_pattern_search():
     global _PATTERN_SEARCH_LOADED, _pattern_search_fn, _search_by_pattern_description_fn
     if _PATTERN_SEARCH_LOADED:
         return True
-    try:
-        from scripts.pattern_detection.search import (
-            pattern_search,
-            search_by_pattern_description,
-        )
-        _pattern_search_fn = pattern_search
-        _search_by_pattern_description_fn = search_by_pattern_description
-        _PATTERN_SEARCH_LOADED = True
-        return True
-    except ImportError as e:
-        logger.warning(f"Pattern search not available: {e}")
-        return False
+    from scripts.pattern_detection.search import (
+        pattern_search,
+        search_by_pattern_description,
+    )
+    _pattern_search_fn = pattern_search
+    _search_by_pattern_description_fn = search_by_pattern_description
+    _PATTERN_SEARCH_LOADED = True
+    return True
 
 
 # Supported languages for tree-sitter parsing

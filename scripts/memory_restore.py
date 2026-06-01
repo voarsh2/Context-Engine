@@ -20,29 +20,10 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
-# Add project root to path for imports
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, HnswConfigDiff
 
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import VectorParams, Distance, HnswConfigDiff
-except ImportError as e:
-    print(f"ERROR: Missing required dependency: {e}")
-    print("Install with: pip install qdrant-client fastembed")
-    sys.exit(1)
-
-# Use embedder factory for Qwen3 support; fallback to direct fastembed
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
-    try:
-        from fastembed import TextEmbedding
-    except ImportError:
-        TextEmbedding = None  # type: ignore
+from scripts.embedder import get_embedding_model as _get_embedding_model
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -55,18 +36,7 @@ def get_qdrant_client() -> QdrantClient:
 
 def get_embedding_model(model_name: str):
     """Initialize embedding model with Qwen3 support via embedder factory."""
-    # Try centralized embedder factory first (supports Qwen3 feature flag)
-    if _EMBEDDER_FACTORY:
-        return _get_embedding_model(model_name)
-    # Fallback to direct fastembed
-    if TextEmbedding is not None:
-        try:
-            return TextEmbedding(model_name=model_name)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load embedding model '{model_name}': {e}")
-    raise RuntimeError(
-        "No embedding model available. Install fastembed: pip install fastembed"
-    )
+    return _get_embedding_model(model_name)
 
 
 def ensure_collection_exists(
