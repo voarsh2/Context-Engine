@@ -134,6 +134,10 @@ Dynamic HNSW_EF tuning and intelligent query routing for 2x faster simple querie
 | Name | Description | Default |
 |------|-------------|---------|
 | WATCH_DEBOUNCE_SECS | Debounce between FS events | 1.5 |
+| WATCH_INIT_MAINTENANCE_ENABLED | Run periodic init maintenance from watcher | 1 (enabled) |
+| WATCH_INIT_MAINTENANCE_INTERVAL_MINUTES | Minutes between init maintenance passes | 120 |
+| WATCH_INIT_MAINTENANCE_RUN_ON_START | Run immediately on watcher startup instead of waiting one interval | 0 (disabled) |
+| WATCH_INIT_MAINTENANCE_COMMAND_TIMEOUT_SECS | Per-command timeout for init maintenance scripts | 1800 |
 | INDEX_UPSERT_BATCH | Upsert batch size (watcher) | 128 |
 | INDEX_UPSERT_RETRIES | Retry count | 5 |
 | INDEX_UPSERT_BACKOFF | Seconds between retries | 0.5 |

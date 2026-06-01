@@ -299,7 +299,7 @@ spec:
         command:
         - /bin/sh
         - -c
-        - PYTHONPATH=/app python /app/scripts/create_indexes.py && PYTHONPATH=/app python /app/scripts/warm_all_collections.py && PYTHONPATH=/app python /app/scripts/health_check.py
+        - PYTHONPATH=/app python /app/scripts/run_init_maintenance.py
         workingDir: /work
         env:
         - name: QDRANT_URL

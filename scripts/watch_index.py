@@ -22,6 +22,7 @@ from scripts.watch_index_core.utils import (
     create_observer,
 )
 from scripts.watch_index_core.handler import IndexHandler  # noqa: E402
+from scripts.watch_index_core.init_maintenance import start_init_maintenance_worker  # noqa: E402
 from scripts.watch_index_core.pseudo import _start_pseudo_backfill_worker  # noqa: E402
 from scripts.watch_index_core.processor import _process_paths  # noqa: E402
 from scripts.watch_index_core.queue import ChangeQueue  # noqa: E402
@@ -239,6 +240,7 @@ def main() -> None:
         vector_name,
         allow_default_collection_fallback=ensure_default_collection,
     )
+    init_maintenance_shutdown = start_init_maintenance_worker()
 
     try:
         initialize_watcher_state(str(ROOT), multi_repo_enabled, default_collection)
@@ -274,6 +276,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if init_maintenance_shutdown is not None:
+            init_maintenance_shutdown.set()
         obs.stop()
         obs.join()
 

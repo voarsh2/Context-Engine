@@ -471,6 +471,9 @@ services:
       - WATCH_ROOT=${WATCH_ROOT:-/work}
       - HOST_INDEX_PATH=/work
       - QDRANT_TIMEOUT=${QDRANT_TIMEOUT:-60}
+      - WATCH_INIT_MAINTENANCE_ENABLED=${WATCH_INIT_MAINTENANCE_ENABLED:-1}
+      - WATCH_INIT_MAINTENANCE_INTERVAL_MINUTES=${WATCH_INIT_MAINTENANCE_INTERVAL_MINUTES:-120}
+      - WATCH_INIT_MAINTENANCE_RUN_ON_START=${WATCH_INIT_MAINTENANCE_RUN_ON_START:-0}
       # Chunking config - use ${VAR:-} to properly inherit from .env (not host shell)
       - INDEX_SEMANTIC_CHUNKS=${INDEX_SEMANTIC_CHUNKS:-}
       - INDEX_MICRO_CHUNKS=${INDEX_MICRO_CHUNKS:-}
@@ -532,7 +535,7 @@ services:
     command: [
       "sh",
       "-c",
-      "mkdir -p /tmp/logs /work/.codebase && (chgrp -R 1000 /work/.codebase 2>/dev/null || true) && (chmod -R g+rwX /work/.codebase 2>/dev/null || true) && (find /work/.codebase -type d -exec chmod g+s {} + 2>/dev/null || true) && echo 'Starting initialization sequence...' && /app/scripts/wait-for-qdrant.sh && PYTHONPATH=/app python /app/scripts/create_indexes.py && echo 'Collections and metadata created' && python /app/scripts/warm_all_collections.py && echo 'Search caches warmed for all collections' && python /app/scripts/health_check.py && echo 'Initialization completed successfully!'"
+      "mkdir -p /tmp/logs /work/.codebase && (chgrp -R 1000 /work/.codebase 2>/dev/null || true) && (chmod -R g+rwX /work/.codebase 2>/dev/null || true) && (find /work/.codebase -type d -exec chmod g+s {} + 2>/dev/null || true) && echo 'Starting initialization sequence...' && PYTHONPATH=/app python /app/scripts/run_init_maintenance.py && echo 'Initialization completed successfully!'"
     ]
     restart: "no"  # Run once on startup
     networks:
