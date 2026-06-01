@@ -101,7 +101,7 @@ from qdrant_client import QdrantClient
 
 ### Qdrant client version
 
-Use `qdrant-client>=1.15.0,<1.16.0`. Version 1.16+ changed to `.query_points()` which breaks OpenLit's instrumentation hooks.
+Use `qdrant-client==1.15.1` with `qdrant/qdrant:v1.15.4`. Version 1.16+ removed the legacy `.search()` path used by OpenLit's Qdrant instrumentation hooks.
 
 ## Disabling
 

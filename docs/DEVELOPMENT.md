@@ -402,7 +402,7 @@ class TestSearchIntegration:
     @pytest.fixture(scope="module")
     def qdrant_container(self):
         """Set up real Qdrant container for integration tests."""
-        container = DockerContainer("qdrant/qdrant:latest").with_exposed_ports(6333)
+        container = DockerContainer("qdrant/qdrant:v1.15.4").with_exposed_ports(6333)
         container.start()
         yield f"http://{container.get_container_host_ip()}:{container.get_exposed_port(6333)}"
         container.stop()

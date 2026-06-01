@@ -86,7 +86,7 @@ def qdrant_url():
         pytest.skip("testcontainers not available and QDRANT_URL not set")
 
     container = (
-        DockerContainer("qdrant/qdrant:latest")
+        DockerContainer("qdrant/qdrant:v1.15.4")
         .with_env("TESTCONTAINERS_RYUK_DISABLED", "true")
         .with_env("TESTCONTAINERS_RYUK_TIMEOUT", "0")
         .with_exposed_ports(6333)

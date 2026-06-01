@@ -1,6 +1,6 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.15.4
     container_name: qdrant-db
     # Expose Qdrant database APIs to the host
     # 6333 = HTTP API, 6334 = gRPC
