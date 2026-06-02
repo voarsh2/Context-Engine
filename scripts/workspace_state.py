@@ -286,6 +286,20 @@ def _resolve_workspace_root() -> str:
         or "/work"
     )
 
+
+def _configured_workspace_roots() -> List[Path]:
+    roots: List[Path] = []
+    for key in ("CTXCE_METADATA_ROOT", "WORKSPACE_PATH", "WATCH_ROOT", "WORK_DIR", "WORKDIR"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            roots.append(Path(raw).resolve())
+        except Exception:
+            roots.append(Path(raw))
+    return roots
+
+
 def _resolve_repo_context(
     workspace_path: Optional[str] = None,
     repo_name: Optional[str] = None,
@@ -305,6 +319,8 @@ def _resolve_repo_context(
                 requested = Path(workspace_path)
                 workspace_root = Path(_resolve_workspace_root())
             if requested != workspace_root:
+                if any(requested == root for root in _configured_workspace_roots()):
+                    return resolved_workspace, None
                 detected = _detect_repo_name_from_path(requested)
                 if detected:
                     return resolved_workspace, detected
@@ -1956,6 +1972,16 @@ def list_pending_index_journal_entries(
         repos_state_root = root_path / STATE_DIRNAME / "repos"
         if repos_state_root.exists():
             for state_dir in repos_state_root.iterdir():
+                if not state_dir.is_dir():
+                    continue
+                repo_candidates.add(state_dir.name)
+    except Exception:
+        pass
+
+    try:
+        metadata_repos_root = Path(_resolve_workspace_root()).resolve() / STATE_DIRNAME / "repos"
+        if metadata_repos_root != root_path / STATE_DIRNAME / "repos" and metadata_repos_root.exists():
+            for state_dir in metadata_repos_root.iterdir():
                 if not state_dir.is_dir():
                     continue
                 repo_candidates.add(state_dir.name)

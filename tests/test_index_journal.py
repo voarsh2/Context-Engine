@@ -133,6 +133,45 @@ def test_index_journal_aggregates_repo_scoped_entries_in_multi_repo_mode(
     assert str(file_path.resolve()) in pending
 
 
+def test_index_journal_aggregates_split_watch_and_metadata_roots(monkeypatch, tmp_path):
+    watch_root = tmp_path / "work"
+    metadata_root = tmp_path / "metadata"
+    repo_name = "Context-Engine-41e67959950c8ab3"
+    file_path = watch_root / repo_name / "src" / "split.py"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("WATCH_ROOT", str(watch_root))
+    monkeypatch.setenv("WORK_DIR", str(watch_root))
+    monkeypatch.setenv("CTXCE_METADATA_ROOT", str(metadata_root))
+    monkeypatch.setenv("MULTI_REPO_MODE", "1")
+    ws_module = importlib.import_module("scripts.workspace_state")
+    ws_module = importlib.reload(ws_module)
+
+    ws_module.upsert_index_journal_entries(
+        [{"path": str(file_path), "op_type": "upsert", "content_hash": "abc123"}],
+        workspace_path=str(file_path.parent.parent),
+        repo_name=repo_name,
+    )
+
+    pending = [
+        str(e["path"])
+        for e in ws_module.list_pending_index_journal_entries(workspace_path=str(watch_root))
+    ]
+    assert str(file_path.resolve()) in pending
+
+    ws_module.update_index_journal_entry_status(
+        str(file_path),
+        status="done",
+        workspace_path=str(file_path.parent.parent),
+        repo_name=repo_name,
+    )
+    pending_after = [
+        str(e["path"])
+        for e in ws_module.list_pending_index_journal_entries(workspace_path=str(watch_root))
+    ]
+    assert str(file_path.resolve()) not in pending_after
+
+
 def test_index_journal_file_is_group_writable(ws_module, tmp_path):
     repo_name = "repo-1234567890abcdef"
     file_path = tmp_path / "work" / repo_name / "src" / "perm.py"
