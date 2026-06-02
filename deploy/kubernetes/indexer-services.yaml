@@ -103,6 +103,11 @@ spec:
             configMapKeyRef:
               name: context-engine-config
               key: WATCH_DEBOUNCE_SECS
+        - name: WATCH_USE_POLLING
+          valueFrom:
+            configMapKeyRef:
+              name: context-engine-config
+              key: WATCH_USE_POLLING
         - name: HF_HOME
           value: /work/models/hf-cache
         - name: XDG_CACHE_HOME

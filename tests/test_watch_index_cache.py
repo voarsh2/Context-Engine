@@ -586,7 +586,12 @@ def test_runtime_root_override_updates_internal_path_checks(monkeypatch, tmp_pat
     monkeypatch.setattr(watch_index, "run_consistency_audit", lambda *a, **k: None)
     monkeypatch.setattr(watch_index, "run_empty_dir_sweep_maintenance", lambda *a, **k: None)
     monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", lambda *a, **k: [])
-    monkeypatch.setattr(watch_index, "get_boolean_env", lambda *a, **k: False)
+    def _bool_env(name, default=False):
+        if name == "WATCH_JOURNAL_DRAIN_ENABLED":
+            return True
+        return False
+
+    monkeypatch.setattr(watch_index, "get_boolean_env", _bool_env)
     monkeypatch.setattr(watch_index, "_sleep", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     try:
@@ -646,7 +651,12 @@ def test_main_throttles_periodic_maintenance(monkeypatch, tmp_path):
         "QdrantClient",
         MagicMock(return_value=MagicMock(get_collection=MagicMock())),
     )
-    monkeypatch.setattr(watch_index, "get_boolean_env", lambda *a, **k: False)
+    def _bool_env(name, default=False):
+        if name == "WATCH_JOURNAL_DRAIN_ENABLED":
+            return True
+        return False
+
+    monkeypatch.setattr(watch_index, "get_boolean_env", _bool_env)
 
     drain_mock = MagicMock()
     maintenance_mock = MagicMock()
@@ -673,3 +683,25 @@ def test_main_throttles_periodic_maintenance(monkeypatch, tmp_path):
 
     assert drain_mock.call_count == 4
     assert maintenance_mock.call_count == 2
+
+
+def test_watch_source_defaults_follow_repo_mode(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    monkeypatch.delenv("WATCH_JOURNAL_DRAIN_ENABLED", raising=False)
+    monkeypatch.delenv("WATCH_FS_EVENTS_ENABLED", raising=False)
+
+    assert watch_index._journal_drain_enabled(True) is True
+    assert watch_index._fs_events_enabled(True) is False
+    assert watch_index._journal_drain_enabled(False) is False
+    assert watch_index._fs_events_enabled(False) is True
+
+
+def test_watch_source_env_overrides_defaults(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    monkeypatch.setenv("WATCH_JOURNAL_DRAIN_ENABLED", "0")
+    monkeypatch.setenv("WATCH_FS_EVENTS_ENABLED", "1")
+
+    assert watch_index._journal_drain_enabled(True) is False
+    assert watch_index._fs_events_enabled(True) is True

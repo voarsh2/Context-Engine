@@ -171,6 +171,14 @@ def _maintenance_interval_secs() -> float:
         return 300.0
 
 
+def _journal_drain_enabled(multi_repo_enabled: bool) -> bool:
+    return get_boolean_env("WATCH_JOURNAL_DRAIN_ENABLED", default=multi_repo_enabled)
+
+
+def _fs_events_enabled(multi_repo_enabled: bool) -> bool:
+    return get_boolean_env("WATCH_FS_EVENTS_ENABLED", default=(not multi_repo_enabled))
+
+
 def main() -> None:
     _set_runtime_root()
 
@@ -305,22 +313,32 @@ def main() -> None:
             paths, client, model, vector_name, model_dim, str(ROOT)
         )
     )
-    handler = IndexHandler(ROOT, q, client, default_collection)
+    journal_drain_enabled = _journal_drain_enabled(multi_repo_enabled)
+    fs_events_enabled = _fs_events_enabled(multi_repo_enabled)
 
-    use_polling = get_boolean_env("WATCH_USE_POLLING")
-    obs = create_observer(use_polling, observer_cls=Observer)
-    obs.schedule(handler, str(ROOT), recursive=True)
-    obs.start()
+    print(
+        "[watch_mode] sources "
+        f"journal_drain={'on' if journal_drain_enabled else 'off'} "
+        f"fs_events={'on' if fs_events_enabled else 'off'}"
+    )
+
+    obs = None
+    if fs_events_enabled:
+        handler = IndexHandler(ROOT, q, client, default_collection)
+        use_polling = get_boolean_env("WATCH_USE_POLLING")
+        obs = create_observer(use_polling, observer_cls=Observer)
+        obs.schedule(handler, str(ROOT), recursive=True)
+        obs.start()
 
     maintenance_interval = _maintenance_interval_secs()
     last_maintenance: Optional[float] = None
 
     try:
         while True:
-            # Watcher is the sole durable journal consumer in v1. Upload/apply
-            # records upsert/delete intent here so missed filesystem events can
-            # still be replayed after watcher/container restarts.
-            _drain_pending_journal(q)
+            if journal_drain_enabled:
+                # Upload/apply records upsert/delete intent here so missed filesystem
+                # events can still be replayed after watcher/container restarts.
+                _drain_pending_journal(q)
             now = time.time()
             if last_maintenance is None or (now - last_maintenance) >= maintenance_interval:
                 _run_periodic_maintenance(client)
@@ -331,8 +349,9 @@ def main() -> None:
     finally:
         if init_maintenance_shutdown is not None:
             init_maintenance_shutdown.set()
-        obs.stop()
-        obs.join()
+        if obs is not None:
+            obs.stop()
+            obs.join()
 
 
 if __name__ == "__main__":
