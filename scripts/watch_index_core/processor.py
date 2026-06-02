@@ -148,7 +148,7 @@ def _run_git_history_ingest(
     if not script.exists():
         raise RuntimeError(f"[git_history_manifest] ingest script missing: {script}")
 
-    cmd = [sys.executable or "python3", str(script), "--manifest-json", str(p)]
+    cmd = [sys.executable or "python3", "-m", "scripts.ingest_history", "--manifest-json", str(p)]
     env = _build_subprocess_env(collection, repo_name, env_snapshot)
     started = time.monotonic()
     timeout = _GIT_HISTORY_TIMEOUT_SECONDS if _GIT_HISTORY_TIMEOUT_SECONDS > 0 else None
@@ -181,6 +181,7 @@ def _run_git_history_ingest(
     try:
         proc = subprocess.Popen(
             cmd,
+            cwd=str(watch_config.ROOT_DIR),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
