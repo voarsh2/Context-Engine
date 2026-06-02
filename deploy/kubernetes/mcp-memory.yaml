@@ -71,6 +71,11 @@ spec:
             configMapKeyRef:
               name: context-engine-config
               key: COLLECTION_NAME
+        - name: MULTI_REPO_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: context-engine-config
+              key: MULTI_REPO_MODE
         - name: EMBEDDING_MODEL
           valueFrom:
             configMapKeyRef:

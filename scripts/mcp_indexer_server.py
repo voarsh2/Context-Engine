@@ -178,7 +178,7 @@ DEFAULT_COLLECTION = (
 try:
     from scripts.workspace_state import get_collection_name as _ws_get_collection_name  # type: ignore
 
-    if DEFAULT_COLLECTION in {"", "default-collection", "my-collection", "codebase"}:
+    if DEFAULT_COLLECTION in {"", "codebase"}:
         resolved = _ws_get_collection_name(None)
         if resolved:
             DEFAULT_COLLECTION = resolved

@@ -6,9 +6,9 @@ import pytest
 pytestmark = pytest.mark.unit
 
 def test_main_resolves_collection_from_state(monkeypatch, tmp_path):
-    # Env setup: placeholder collection name at startup
+    # Env setup: default collection name at startup
     monkeypatch.setenv("WATCH_ROOT", str(tmp_path))
-    monkeypatch.setenv("COLLECTION_NAME", "my-collection")
+    monkeypatch.setenv("COLLECTION_NAME", "codebase")
     monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
     monkeypatch.setenv("EMBEDDING_MODEL", "fake")
 
@@ -69,15 +69,15 @@ def test_main_resolves_collection_from_state(monkeypatch, tmp_path):
         raise KeyboardInterrupt()
     monkeypatch.setattr(wi, "_sleep", _raise_kb, raising=True)
 
-    # Precondition: module-level COLLECTION should reflect placeholder at import time
-    assert wi.COLLECTION == os.environ.get("COLLECTION_NAME") == "my-collection"
+    # Precondition: module-level COLLECTION should reflect the configured default at import time
+    assert wi.COLLECTION == os.environ.get("COLLECTION_NAME") == "codebase"
 
     # Run main(); in single-repo mode it should keep the env-provided COLLECTION_NAME
     try:
         wi.main()
 
         # Postcondition: global COLLECTION remains the env-provided name
-        assert wi.COLLECTION == "my-collection"
+        assert wi.COLLECTION == "codebase"
     finally:
         watch_config.ROOT = original_root
         wi.ROOT = original_watch_root

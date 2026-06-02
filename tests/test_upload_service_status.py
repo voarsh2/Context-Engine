@@ -168,6 +168,27 @@ def test_delta_plan_endpoint_returns_needed_files(monkeypatch):
 
 
 @pytest.mark.unit
+def test_upload_managed_resolution_ignores_client_collection(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(srv, "logical_repo_reuse_enabled", lambda: False)
+    monkeypatch.setattr(srv, "_extract_repo_name_from_path", lambda path: Path(path).name)
+    monkeypatch.setattr(srv, "get_collection_name", lambda repo=None: f"server-{repo}")
+
+    collection, repo = srv._resolve_collection_for_request(
+        workspace_path="/work/repo",
+        client_collection_name="repo-071ca222",
+        logical_repo_id="fs:123",
+        source_path="/host/Context-Engine",
+    )
+
+    assert repo == "Context-Engine"
+    assert collection == "server-Context-Engine"
+
+
+@pytest.mark.unit
 def test_delta_plan_endpoint_uses_safe_defaults_for_sparse_plan(monkeypatch):
     srv = importlib.import_module("scripts.upload_service")
     srv = importlib.reload(srv)

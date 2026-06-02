@@ -221,17 +221,6 @@ def hash_id(text: str, path: str, start: int, end: int) -> str:
     ).hexdigest()
     return h[:16]
 
-def get_collection_name(repo_name: Optional[str] = None) -> str:
-    """Generate collection name with 8-char hash for local workspaces.
-
-    Simplified version from workspace_state.py.
-    """
-    if not repo_name:
-        return "default-collection"
-    hash_obj = hashlib.sha256(repo_name.encode())
-    short_hash = hash_obj.hexdigest()[:8]
-    return f"{repo_name}-{short_hash}"
-
 def _extract_repo_name_from_path(workspace_path: str) -> str:
     """Extract repository name from workspace path.
 
@@ -742,7 +731,7 @@ class RemoteUploadClient:
 
         return host_path.replace('\\', '/').replace(':', '')
 
-    def __init__(self, upload_endpoint: str, workspace_path: str, collection_name: str,
+    def __init__(self, upload_endpoint: str, workspace_path: str, collection_name: Optional[str] = None,
                  max_retries: int = 3, timeout: int = 30, metadata_path: Optional[str] = None,
                  logical_repo_id: Optional[str] = None):
         """Initialize remote upload client."""
@@ -914,7 +903,7 @@ class RemoteUploadClient:
         container_path = self._translate_to_container_path(self.workspace_path)
         return {
             "repo_name": self.repo_name,
-            "collection_name": self.collection_name,
+            "collection_name": self.collection_name or "<server-owned>",
             "source_path": self.workspace_path,
             "container_path": container_path,
             "upload_endpoint": self.upload_endpoint,
@@ -1312,7 +1301,6 @@ class RemoteUploadClient:
                 "version": "1.0",
                 "bundle_id": bundle_id,
                 "workspace_path": self.workspace_path,
-                "collection_name": self.collection_name,
                 "created_at": created_at,
                 # CLI is stateless - server handles sequence numbers
                 "sequence_number": None,  # Server will assign
@@ -1463,7 +1451,6 @@ class RemoteUploadClient:
             "version": "1.0",
             "bundle_id": bundle_id,
             "workspace_path": self.workspace_path,
-            "collection_name": self.collection_name,
             "created_at": created_at,
             "sequence_number": None,
             "parent_sequence": None,
@@ -1492,7 +1479,6 @@ class RemoteUploadClient:
             self._last_plan_payload = payload
             data = {
                 "workspace_path": self._translate_to_container_path(self.workspace_path),
-                "collection_name": self.collection_name,
                 "source_path": self.workspace_path,
                 "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
                 "manifest": payload["manifest"],
@@ -1583,7 +1569,6 @@ class RemoteUploadClient:
         try:
             data = {
                 "workspace_path": self._translate_to_container_path(self.workspace_path),
-                "collection_name": self.collection_name,
                 "source_path": self.workspace_path,
                 "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
                 "manifest": payload["manifest"],
@@ -1698,13 +1683,11 @@ class RemoteUploadClient:
                 }
                 data = {
                     "workspace_path": self._translate_to_container_path(self.workspace_path),
-                    "collection_name": self.collection_name,
                     "sequence_number": manifest.get("sequence_number"),
                     "force": False,
                     "source_path": self.workspace_path,
                     "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
                 }
-
                 sess = get_auth_session(self.upload_endpoint)
                 if sess:
                     data["session"] = sess
@@ -2577,7 +2560,7 @@ class RemoteUploadClient:
             logger.exception("[remote_upload] Full traceback:")
             return False
 
-def get_remote_config(cli_path: Optional[str] = None) -> Dict[str, str]:
+def get_remote_config(cli_path: Optional[str] = None) -> Dict[str, Any]:
     """Get remote upload configuration from environment variables and command-line arguments."""
     # Use command-line path if provided, otherwise fall back to environment variables
     if cli_path:
@@ -2587,17 +2570,10 @@ def get_remote_config(cli_path: Optional[str] = None) -> Dict[str, str]:
 
     logical_repo_id = _compute_logical_repo_id(workspace_path)
 
-    # Use auto-generated collection name based on repo name
-    repo_name = _extract_repo_name_from_path(workspace_path)
-    # Fallback to directory name if repo detection fails
-    if not repo_name:
-        repo_name = Path(workspace_path).name
-    collection_name = get_collection_name(repo_name)
-
     return {
         "upload_endpoint": os.environ.get("REMOTE_UPLOAD_ENDPOINT", "http://localhost:8080"),
         "workspace_path": workspace_path,
-        "collection_name": collection_name,
+        "collection_name": None,
         "logical_repo_id": logical_repo_id,
         # Use higher, more robust defaults but still allow env overrides
         "max_retries": int(os.environ.get("REMOTE_UPLOAD_MAX_RETRIES", "5")),
@@ -2723,7 +2699,7 @@ Examples:
         config["timeout"] = args.timeout
 
     logger.info(f"Workspace path: {config['workspace_path']}")
-    logger.info(f"Collection name: {config['collection_name']}")
+    logger.info(f"Collection name: {config['collection_name'] or '<server-owned>'}")
     logger.info(f"Upload endpoint: {config['upload_endpoint']}")
 
     if args.show_mapping:
@@ -2842,7 +2818,7 @@ Examples:
                     )
                 else:
                     logger.info("Repository upload completed successfully!")
-                logger.info(f"Collection name: {config['collection_name']}")
+                logger.info(f"Collection name: {config['collection_name'] or '<server-owned>'}")
                 logger.info(f"Files uploaded: {len(all_files)}")
             else:
                 logger.error("Repository upload failed!")

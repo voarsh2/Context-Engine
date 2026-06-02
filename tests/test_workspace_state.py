@@ -129,10 +129,10 @@ class TestCollectionNameResolution:
     def test_single_repo_env_override_preserved(self, ws_module, monkeypatch):
         """In single-repo mode, COLLECTION_NAME remains a master override."""
         monkeypatch.delenv("MULTI_REPO_MODE", raising=False)
-        monkeypatch.setenv("COLLECTION_NAME", "codebase")
+        monkeypatch.setenv("COLLECTION_NAME", "custom")
         ws = importlib.reload(ws_module)
 
-        assert ws.get_collection_name("my-repo_old") == "codebase_old"
+        assert ws.get_collection_name("my-repo_old") == "custom_old"
 
     def test_multi_repo_workspace_level_env_override_still_applies(self, ws_module, monkeypatch):
         """When repo_name is None, env override should still apply even in multi-repo mode."""
@@ -153,7 +153,6 @@ class TestCollectionNameResolution:
         ws = importlib.reload(ws_module)
 
         assert ws.get_collection_name(str(ws_root)) == "context-engine"
-        assert ws.get_collection_name(str(ws_root)) != "global-collection"
 
     def test_multi_repo_upload_managed_detection_does_not_probe_git(self, ws_module, monkeypatch, tmp_path):
         """Upload-managed multi-repo identity comes from workspace path, not git metadata."""
@@ -463,9 +462,7 @@ class TestConstants:
 
     def test_placeholder_collection_names(self, ws_module):
         """PLACEHOLDER_COLLECTION_NAMES contains expected values."""
-        assert "" in ws_module.PLACEHOLDER_COLLECTION_NAMES
-        assert "default-collection" in ws_module.PLACEHOLDER_COLLECTION_NAMES
-        assert "my-collection" in ws_module.PLACEHOLDER_COLLECTION_NAMES
+        assert ws_module.PLACEHOLDER_COLLECTION_NAMES == {"", "codebase"}
 
 
 class TestCompareSymbolChanges:

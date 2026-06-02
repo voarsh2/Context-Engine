@@ -138,7 +138,7 @@ STATE_DIRNAME = ".codebase"
 STATE_FILENAME = "state.json"
 CACHE_FILENAME = "cache.json"
 INDEX_JOURNAL_FILENAME = "index_journal.json"
-PLACEHOLDER_COLLECTION_NAMES = {"", "default-collection", "my-collection"}
+PLACEHOLDER_COLLECTION_NAMES = {"", "codebase"}
 
 class IndexingProgress(TypedDict, total=False):
     files_processed: int

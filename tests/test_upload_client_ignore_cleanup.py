@@ -2,6 +2,24 @@ import importlib
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.mark.parametrize(
+    "mod_name",
+    ["scripts.remote_upload_client", "scripts.standalone_upload_client"],
+)
+def test_remote_upload_config_does_not_generate_collection_name(monkeypatch, tmp_path, mod_name):
+    mod = importlib.import_module(mod_name)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    monkeypatch.setattr(mod, "_compute_logical_repo_id", lambda _path: "fs:test")
+
+    config = mod.get_remote_config(str(workspace))
+
+    assert config["collection_name"] is None
+
 
 def _exercise_ignored_path_cleanup(mod_name: str, monkeypatch, tmp_path: Path) -> None:
     mod = importlib.import_module(mod_name)

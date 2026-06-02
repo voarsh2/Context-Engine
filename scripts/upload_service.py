@@ -1448,6 +1448,7 @@ def _resolve_collection_for_request(
     workspace_path: str,
     client_collection_name: Optional[str],
     logical_repo_id: Optional[str],
+    source_path: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """
     Resolve collection name and repo_name for upload/plan/apply requests.
@@ -1459,12 +1460,11 @@ def _resolve_collection_for_request(
     collection_name: Optional[str] = None
     repo_name: Optional[str] = None
 
-    # Always derive repo_name from workspace_path for origin tracking
-    repo_name = _extract_repo_name_from_path(workspace_path)
+    repo_source = (source_path or "").strip() or workspace_path
+    repo_name = _extract_repo_name_from_path(repo_source)
     if not repo_name:
-        repo_name = Path(workspace_path).name
+        repo_name = Path(repo_source).name
 
-    # Preserve any client-supplied collection name but allow server-side overrides
     resolved_collection: Optional[str] = None
 
     # Resolve collection name, preferring server-side mapping for logical_repo_id when enabled
@@ -1500,12 +1500,9 @@ def _resolve_collection_for_request(
                         f"[upload_service] Failed to migrate logical_repo_id for existing mapping: {migrate_err}"
                     )
 
-    # Finalize collection_name: prefer resolved server-side mapping, then client-supplied name,
-    # then standard get_collection_name/DEFAULT_COLLECTION fallbacks.
+    # Upload-managed requests are server-owned; ignore client-supplied collection routing.
     if resolved_collection is not None:
         collection_name = resolved_collection
-    elif client_collection_name:
-        collection_name = client_collection_name
     else:
         collection_name = get_collection_name(repo_name) if repo_name else DEFAULT_COLLECTION
 
@@ -1541,6 +1538,7 @@ async def plan_delta(request: PlanRequest):
             workspace_path=workspace_path,
             client_collection_name=request.collection_name,
             logical_repo_id=request.logical_repo_id,
+            source_path=request.source_path,
         )
 
         # Enforce collection write access for plan/apply when auth is enabled
@@ -1651,6 +1649,7 @@ async def apply_delta_ops(request: ApplyOperationsRequest):
             workspace_path=workspace_path,
             client_collection_name=request.collection_name,
             logical_repo_id=request.logical_repo_id,
+            source_path=request.source_path,
         )
 
         # Enforce collection write access for plan/apply when auth is enabled
@@ -1846,6 +1845,7 @@ async def upload_delta_bundle(
             workspace_path=workspace_path,
             client_collection_name=collection_name,
             logical_repo_id=logical_repo_id,
+            source_path=source_path,
         )
 
         # Enforce collection write access for uploads when auth is enabled.

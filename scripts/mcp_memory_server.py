@@ -34,13 +34,23 @@ from scripts.qdrant_client_manager import (
     return_qdrant_client,
 )
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_default_collection() -> str:
+    raw = (os.environ.get("DEFAULT_COLLECTION") or os.environ.get("COLLECTION_NAME") or "").strip()
+    if _env_flag("MULTI_REPO_MODE") and raw in {"", "codebase"}:
+        return ""
+    return raw or "codebase"
+
+
 # Env
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-DEFAULT_COLLECTION = (
-    os.environ.get("DEFAULT_COLLECTION")
-    or os.environ.get("COLLECTION_NAME")
-    or "codebase"
-)
+DEFAULT_COLLECTION = _resolve_default_collection()
 LEX_VECTOR_NAME = os.environ.get("LEX_VECTOR_NAME", "lex")
 LEX_VECTOR_DIM = int(os.environ.get("LEX_VECTOR_DIM", "4096") or 4096)
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
@@ -58,9 +68,9 @@ VECTOR_NAME = _sanitize_vector_name(EMBEDDING_MODEL)
 # I/O-safety knobs for memory server behavior
 # These env vars allow tuning startup latency vs. first-call latency, especially important
 # on slow storage backends (e.g., Ceph + HDD). See comments below for rationale.
-MEMORY_ENSURE_ON_START = str(os.environ.get("MEMORY_ENSURE_ON_START", "1")).strip().lower() in {"1", "true", "yes", "on"}
-MEMORY_COLD_SKIP_DENSE = str(os.environ.get("MEMORY_COLD_SKIP_DENSE", "0")).strip().lower() in {"1", "true", "yes", "on"}
-MEMORY_PROBE_EMBED_DIM = str(os.environ.get("MEMORY_PROBE_EMBED_DIM", "1")).strip().lower() in {"1", "true", "yes", "on"}
+MEMORY_ENSURE_ON_START = _env_flag("MEMORY_ENSURE_ON_START", False)
+MEMORY_COLD_SKIP_DENSE = _env_flag("MEMORY_COLD_SKIP_DENSE", False)
+MEMORY_PROBE_EMBED_DIM = _env_flag("MEMORY_PROBE_EMBED_DIM", True)
 try:
     MEMORY_VECTOR_DIM = int(os.environ.get("MEMORY_VECTOR_DIM") or os.environ.get("EMBED_DIM") or "768")
 except Exception:
@@ -261,13 +271,9 @@ def _return_qdrant_client(client: QdrantClient):
 def _ensure_collection(name: str):
     """Create collection if missing.
 
-    Default behavior mirrors the original implementation for PR compatibility:
-    - Probe the embedding model to detect the dense vector dimension (MEMORY_PROBE_EMBED_DIM=1)
-    - Eager ensure on startup (MEMORY_ENSURE_ON_START=1)
-
     For slow storage backends (e.g., Ceph + HDD), set the following in your env:
     - MEMORY_PROBE_EMBED_DIM=0  -> skip model probing; use MEMORY_VECTOR_DIM/EMBED_DIM
-    - MEMORY_ENSURE_ON_START=0  -> ensure lazily on first tool call
+    - MEMORY_ENSURE_ON_START=1  -> eagerly create DEFAULT_COLLECTION at startup
     """
     client = _get_qdrant_client()
     try:
@@ -337,9 +343,8 @@ def _ensure_collection(name: str):
         _return_qdrant_client(client)
 
 
-# Optional eager collection ensure on startup (enabled by default for backward compatibility).
-# Set MEMORY_ENSURE_ON_START=0 to defer ensure to first tool call (recommended on slow storage).
-if MEMORY_ENSURE_ON_START:
+# Optional eager collection ensure for single-collection deployments.
+if MEMORY_ENSURE_ON_START and DEFAULT_COLLECTION:
     try:
         _ensure_collection(DEFAULT_COLLECTION)
     except Exception:
@@ -725,7 +730,10 @@ def _resolve_collection(
         except Exception:
             pass
 
-    return coll or DEFAULT_COLLECTION
+    resolved = coll or DEFAULT_COLLECTION
+    if not resolved:
+        raise ValueError("collection is required in multi-repo memory server mode")
+    return resolved
 
 
 if __name__ == "__main__":
