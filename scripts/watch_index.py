@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +45,8 @@ ROOT = watch_config.ROOT
 # Back-compat: legacy modules/tests expect a module-level COLLECTION constant.
 # We use a sentinel and a getter to ensure the resolved value is returned.
 _COLLECTION: Optional[str] = None
+_JOURNAL_DRAIN_LAST_LOG = 0.0
+_JOURNAL_DRAIN_LAST_TOTAL = 0
 
 
 def get_collection() -> str:
@@ -69,13 +72,74 @@ def _set_runtime_root() -> None:
     watch_config.ROOT = runtime_root
 
 
+def _journal_log_interval_secs() -> float:
+    try:
+        return max(0.0, float(os.environ.get("WATCH_JOURNAL_LOG_INTERVAL_SECS", "120") or 120.0))
+    except Exception:
+        return 120.0
+
+
+def _maybe_log_journal_drain(
+    *,
+    total: int,
+    queued: int,
+    op_counts: Counter[str],
+    queue: ChangeQueue,
+) -> None:
+    global _JOURNAL_DRAIN_LAST_LOG, _JOURNAL_DRAIN_LAST_TOTAL
+    now = time.time()
+    interval = _journal_log_interval_secs()
+    should_log = False
+    if total <= 0 and _JOURNAL_DRAIN_LAST_TOTAL > 0:
+        should_log = True
+    elif total > 0 and (_JOURNAL_DRAIN_LAST_LOG <= 0 or (now - _JOURNAL_DRAIN_LAST_LOG) >= interval):
+        should_log = True
+    if not should_log:
+        _JOURNAL_DRAIN_LAST_TOTAL = total
+        return
+
+    queue_stats = {}
+    try:
+        queue_stats = queue.stats()
+    except Exception:
+        queue_stats = {}
+    logger.info(
+        "watch_index::journal_drain backlog=%d queued=%d ops=%s queue=%s",
+        total,
+        queued,
+        dict(op_counts),
+        queue_stats,
+        extra={
+            "root": str(ROOT),
+            "backlog": total,
+            "queued": queued,
+            "op_counts": dict(op_counts),
+            "queue_stats": queue_stats,
+        },
+    )
+    _JOURNAL_DRAIN_LAST_LOG = now
+    _JOURNAL_DRAIN_LAST_TOTAL = total
+
+
 def _drain_pending_journal(queue: ChangeQueue) -> None:
     pending_path: Optional[str] = None
     try:
-        for pending_entry in list_pending_index_journal_entries(str(ROOT)):
+        pending_entries = list_pending_index_journal_entries(str(ROOT))
+        queued = 0
+        op_counts: Counter[str] = Counter()
+        for pending_entry in pending_entries:
+            op_type = str(pending_entry.get("op_type") or "unknown").strip() or "unknown"
+            op_counts[op_type] += 1
             pending_path = str(pending_entry.get("path") or "").strip()
             if pending_path:
                 queue.add(Path(pending_path), force=True)
+                queued += 1
+        _maybe_log_journal_drain(
+            total=len(pending_entries),
+            queued=queued,
+            op_counts=op_counts,
+            queue=queue,
+        )
     except Exception as exc:
         logger.exception(
             "watch_index::pending_journal_drain_failed",

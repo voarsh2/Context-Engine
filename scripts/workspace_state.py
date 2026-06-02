@@ -1883,6 +1883,25 @@ def upsert_index_journal_entries(
     return _update_index_journal(workspace_path, repo_name, _mutate)
 
 
+def clear_index_journal_entries(
+    *,
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Remove all operations from a workspace/repo index journal."""
+    removed = 0
+
+    def _mutate(journal: Dict[str, Any]) -> None:
+        nonlocal removed
+        ops = journal.get("operations", {})
+        if isinstance(ops, dict):
+            removed = len(ops)
+        journal["operations"] = {}
+
+    _update_index_journal(workspace_path, repo_name, _mutate)
+    return removed
+
+
 def list_pending_index_journal_entries(
     workspace_path: Optional[str] = None,
     repo_name: Optional[str] = None,

@@ -44,6 +44,16 @@ class ChangeQueue:
                 self._timer.daemon = True
                 self._timer.start()
 
+    def stats(self) -> dict[str, int | bool]:
+        with self._lock:
+            return {
+                "queued": len(self._paths),
+                "pending": len(self._pending),
+                "forced": len(self._forced_paths),
+                "pending_forced": len(self._pending_forced),
+                "processing": self._processing_lock.locked(),
+            }
+
     def _fingerprint_path(self, p: Path) -> tuple[int, int] | None:
         try:
             st = p.stat()

@@ -310,10 +310,10 @@ ctx: ## enhance a prompt with repo context: make ctx Q="your question" [ARGS='--
 
 # --- Reranker Evaluation ---
 rerank-eval: ## run offline reranker evaluation (fixed queries, MRR/Recall/latency)
-	python3 scripts/rerank_eval.py --output rerank_eval_results.json
+	python3 -m scripts.rerank_tools.eval --output rerank_eval_results.json
 
 rerank-eval-ablations: ## run full ablation study (baseline, recursive, learning, onnx)
-	python3 scripts/rerank_eval.py --ablations --output rerank_eval_ablations.json
+	python3 -m scripts.rerank_tools.eval --ablations --output rerank_eval_ablations.json
 
 rerank-benchmark: ## run production benchmark on real codebase
-	python3 scripts/rerank_real_benchmark.py
+	python3 -m scripts.rerank_tools.benchmark

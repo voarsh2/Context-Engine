@@ -84,6 +84,35 @@ def test_index_journal_entries_include_operation_types(ws_module, tmp_path):
     assert by_path[str((file_path.with_name("gone.py")).resolve())]["op_type"] == "delete"
 
 
+def test_index_journal_clear_entries(ws_module, tmp_path):
+    repo_name = "repo-1234567890abcdef"
+    file_path = tmp_path / "work" / repo_name / "src" / "entry.py"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ws_module.upsert_index_journal_entries(
+        [
+            {"path": str(file_path), "op_type": "upsert", "content_hash": "abc123"},
+            {"path": str(file_path.with_name("gone.py")), "op_type": "delete"},
+        ],
+        workspace_path=str(tmp_path / "work" / repo_name),
+        repo_name=repo_name,
+    )
+
+    removed = ws_module.clear_index_journal_entries(
+        workspace_path=str(tmp_path / "work" / repo_name),
+        repo_name=repo_name,
+    )
+
+    assert removed == 2
+    assert (
+        ws_module.list_pending_index_journal_entries(
+            workspace_path=str(tmp_path / "work" / repo_name),
+            repo_name=repo_name,
+        )
+        == []
+    )
+
+
 def test_index_journal_aggregates_repo_scoped_entries(ws_module, tmp_path):
     repo_name = "repo-1234567890abcdef"
     file_path = tmp_path / "work" / repo_name / "src" / "x.py"

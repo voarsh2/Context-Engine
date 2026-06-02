@@ -106,6 +106,7 @@ from scripts.workspace_state import (
     set_staging_state,
     update_staging_status,
     clear_staging_collection,
+    clear_index_journal_entries,
     logical_repo_reuse_enabled,
     get_collection_state_snapshot,
 )
@@ -926,6 +927,49 @@ async def admin_recreate_collection(
         )
 
     return RedirectResponse(url="/admin/acl", status_code=302)
+
+
+@app.post("/admin/collections/clear-journal")
+async def admin_clear_collection_journal(
+    request: Request,
+    collection: str = Form(...),
+):
+    _require_admin_session(request)
+    name = (collection or "").strip()
+    if not name:
+        return render_admin_error(
+            request,
+            title="Clear Journal Failed",
+            message="collection is required",
+            back_href="/admin/acl",
+        )
+
+    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    if not root:
+        return render_admin_error(
+            request,
+            title="Clear Journal Failed",
+            message="No workspace mapping found for collection",
+            back_href="/admin/acl",
+        )
+
+    try:
+        removed = clear_index_journal_entries(workspace_path=root, repo_name=repo_name)
+    except Exception as e:
+        return render_admin_error(
+            request,
+            title="Clear Journal Failed",
+            message=str(e),
+            back_href="/admin/acl",
+        )
+
+    try:
+        from urllib.parse import urlencode
+
+        url = "/admin/acl?" + urlencode({"journal_cleared": name, "journal_removed": str(removed)})
+    except Exception:
+        url = "/admin/acl"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/admin/collections/delete")

@@ -76,6 +76,40 @@ def test_delete_redirect_includes_graph_deleted_param(monkeypatch):
 
 
 @pytest.mark.unit
+def test_clear_journal_endpoint_clears_mapped_collection(monkeypatch):
+    monkeypatch.setenv("CTXCE_AUTH_ENABLED", "1")
+
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+
+    calls = {}
+    monkeypatch.setattr(srv, "_require_admin_session", lambda _req: {"user_id": "admin"})
+    monkeypatch.setattr(
+        srv,
+        "resolve_collection_root",
+        lambda **_kwargs: ("/work/repo-1234567890abcdef", "repo-1234567890abcdef"),
+    )
+
+    def _clear_index_journal_entries(**kwargs):
+        calls.update(kwargs)
+        return 3
+
+    monkeypatch.setattr(srv, "clear_index_journal_entries", _clear_index_journal_entries)
+
+    client = TestClient(srv.app)
+    resp = client.post("/admin/collections/clear-journal", data={"collection": "c1"}, follow_redirects=False)
+
+    assert resp.status_code == 302
+    loc = resp.headers.get("location") or ""
+    assert "journal_cleared=c1" in loc
+    assert "journal_removed=3" in loc
+    assert calls == {
+        "workspace_path": "/work/repo-1234567890abcdef",
+        "repo_name": "repo-1234567890abcdef",
+    }
+
+
+@pytest.mark.unit
 def test_collection_admin_refuses_when_env_disabled(monkeypatch):
     monkeypatch.setenv("CTXCE_ADMIN_COLLECTION_DELETE_ENABLED", "0")
     ca = importlib.import_module("scripts.collection_admin")

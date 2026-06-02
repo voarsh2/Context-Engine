@@ -87,3 +87,24 @@ def test_change_queue_repeated_same_path_does_not_rearm_timer(monkeypatch, tmp_p
 
     assert FakeTimer.created == 1
     assert FakeTimer.canceled == 0
+
+
+def test_change_queue_stats_reports_backlog(tmp_path):
+    from scripts.watch_index_core import queue as queue_mod
+
+    q = queue_mod.ChangeQueue(lambda _paths: None)
+    p = tmp_path / "file.py"
+    p.write_text("print('x')\n", encoding="utf-8")
+
+    q._paths.add(p)
+    q._forced_paths.add(p)
+    q._pending.add(p.with_name("pending.py"))
+    q._pending_forced.add(p.with_name("pending.py"))
+
+    assert q.stats() == {
+        "queued": 1,
+        "pending": 1,
+        "forced": 1,
+        "pending_forced": 1,
+        "processing": False,
+    }
