@@ -8,9 +8,19 @@ import os
 import threading
 import time
 import weakref
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List, TYPE_CHECKING
 from contextlib import contextmanager
-from qdrant_client import QdrantClient
+
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient
+else:
+    QdrantClient = Any
+
+
+def _new_qdrant_client(url: str, api_key: Optional[str] = None) -> QdrantClient:
+    from qdrant_client import QdrantClient as _QdrantClient
+
+    return _QdrantClient(url=url, api_key=api_key if api_key else None)
 
 
 # Connection pool implementation
@@ -44,7 +54,7 @@ class QdrantConnectionPool:
             
             # No suitable client found, create a new one
             if self._created_count < self.max_size:
-                client = QdrantClient(url=url, api_key=api_key)
+                client = _new_qdrant_client(url, api_key)
                 pool_entry = {
                     'client': client,
                     'url': url,
@@ -60,7 +70,7 @@ class QdrantConnectionPool:
             else:
                 # Pool is full, create a temporary client (not pooled)
                 self._misses += 1
-                return QdrantClient(url=url, api_key=api_key)
+                return _new_qdrant_client(url, api_key)
     
     def return_client(self, client: QdrantClient):
         """Return a client to the pool."""
@@ -166,13 +176,13 @@ def get_qdrant_client(
     
     # Fallback to singleton pattern for backward compatibility
     if force_new:
-        return QdrantClient(url=url, api_key=api_key if api_key else None)
+        return _new_qdrant_client(url, api_key)
     
     global _client
     
     with _client_lock:
         if _client is None:
-            _client = QdrantClient(url=url, api_key=api_key if api_key else None)
+            _client = _new_qdrant_client(url, api_key)
         return _client
 
 

@@ -6,6 +6,23 @@ import pytest
 hyb = importlib.import_module("scripts.hybrid_search")
 
 
+@pytest.fixture(autouse=True)
+def fake_qdrant_models(monkeypatch):
+    hybrid_qdrant = importlib.import_module("scripts.hybrid.qdrant")
+
+    class FakeModels:
+        class SearchParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class QuantizationSearchParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(hyb, "models", FakeModels)
+    monkeypatch.setattr(hybrid_qdrant, "models", FakeModels)
+
+
 class _Pt:
     def __init__(self, pid, path, code=""):
         self.id = pid
@@ -38,6 +55,28 @@ class _CountingQdrant:
         # Some paths may still call legacy .search(), count it as well
         self.calls += 1
         return self._points
+
+    def get_collection(self, collection):
+        return type(
+            "CollectionInfo",
+            (),
+            {
+                "config": type(
+                    "Config",
+                    (),
+                    {
+                        "params": type(
+                            "Params",
+                            (),
+                            {
+                                "vectors": {"unit-test": type("Vector", (), {"size": 8})()},
+                                "sparse_vectors": {},
+                            },
+                        )()
+                    },
+                )()
+            },
+        )()
 
 
 class _FakeEmbed:
@@ -131,4 +170,3 @@ def test_lexical_bm25_boost_is_gentle_and_matches_multiplier():
     # Gentle behavior: overall change should be modest (within 50%)
     ratio = weighted / base
     assert 0.5 <= ratio <= 1.5, f"BM25 weighting should be gentle, got ratio={ratio:.3f}"
-

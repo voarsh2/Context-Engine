@@ -10,7 +10,44 @@ import pytest
 
 # Import targets
 hyb = importlib.import_module("scripts.hybrid_search")
-srv = importlib.import_module("scripts.mcp_indexer_server")
+search_impl = importlib.import_module("scripts.mcp_impl.search")
+
+
+@pytest.fixture(autouse=True)
+def fake_qdrant_models(monkeypatch):
+    hybrid_qdrant = importlib.import_module("scripts.hybrid.qdrant")
+
+    class FakeModels:
+        class SearchParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class QuantizationSearchParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class Filter:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FieldCondition:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class MatchValue:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class MatchAny:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class SparseVector:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(hyb, "models", FakeModels)
+    monkeypatch.setattr(hybrid_qdrant, "models", FakeModels)
 
 
 class _Pt:
@@ -34,6 +71,19 @@ class _QP:
 class FakeQdrant:
     def __init__(self, points):
         self._points = points
+
+    def get_collection(self, collection):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params=SimpleNamespace(
+                    vectors={
+                        "unit-test": SimpleNamespace(size=8),
+                        "dense": SimpleNamespace(size=8),
+                    },
+                    sparse_vectors={},
+                )
+            )
+        )
 
     # dense_query tries query_points first, then search on exception
     def query_points(self, **kwargs):
@@ -176,9 +226,7 @@ def test_dense_query_preserves_collection_on_filter_drop(monkeypatch):
 
 
 @pytest.mark.unit
-def test_run_pure_dense_search_honors_per_path_cap(monkeypatch):
-    hybrid_qdrant = importlib.import_module("scripts.hybrid.qdrant")
-
+def test_run_pure_dense_search_honors_per_path_cap():
     points = [
         SimpleNamespace(
             score=0.99,
@@ -194,21 +242,10 @@ def test_run_pure_dense_search_honors_per_path_cap(monkeypatch):
         ),
     ]
 
-    monkeypatch.setattr(hybrid_qdrant, "get_qdrant_client", lambda *a, **k: object())
-    monkeypatch.setattr(hybrid_qdrant, "return_qdrant_client", lambda *a, **k: None)
-    monkeypatch.setattr(hybrid_qdrant, "dense_query", lambda *a, **k: points)
-
-    class FakeEmbed:
-        def embed(self, texts):
-            for _ in texts:
-                yield SimpleNamespace(tolist=lambda: [0.1, 0.2, 0.3])
-
-    items = hyb.run_pure_dense_search(
-        query="foo",
+    items = hyb._shape_dense_points(
+        points,
         limit=2,
         per_path=1,
-        collection="test-coll",
-        model=FakeEmbed(),
     )
 
     assert [item["path"] for item in items] == ["/work/repo/a.py", "/work/repo/b.py"]
@@ -229,17 +266,8 @@ def test_collection_prefers_env_over_state(monkeypatch, tmp_path):
 
 @pytest.mark.unit
 def test_repo_search_snippet_strict_cap_after_highlight(monkeypatch):
-    # Stub run_hybrid_search to emit a single result with a known path and range
-    async def fake_run(**kwargs):
-        return {"results": [{"path": "/work/f.txt", "start_line": 1, "end_line": 1}]}
-
     # Force in-process shaping to trigger snippet code path
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
-
-    # Monkeypatch srv.hybrid_search.run_hybrid_search result pathing via repo_search flow
-    monkeypatch.setattr(
-        srv, "_tokens_from_queries", lambda q: ["foo"]
-    )  # ensure highlight runs
 
     # Fake open for the specific /work path
     big_line = "foo " * 1000  # large content to exceed cap
@@ -251,9 +279,9 @@ def test_repo_search_snippet_strict_cap_after_highlight(monkeypatch):
         return _orig_open(path, *a, **k)  # pragma: no cover
 
     # Ensure sandbox passes
-    monkeypatch.setattr(srv.os.path, "isabs", lambda p: True)
-    monkeypatch.setattr(srv.os.path, "realpath", lambda p: "/work/f.txt")
-    monkeypatch.setenv("MCP_SNIPPET_MAX_BYTES", "64")
+    monkeypatch.setattr(search_impl.os.path, "isabs", lambda p: True)
+    monkeypatch.setattr(search_impl.os.path, "realpath", lambda p: "/work/f.txt")
+    monkeypatch.setattr(search_impl, "SNIPPET_MAX_BYTES", 64)
 
     # Stub hybrid_search.run_hybrid_search to return a single item
     import sys
@@ -269,17 +297,21 @@ def test_repo_search_snippet_strict_cap_after_highlight(monkeypatch):
 
     import io
 
-    # Patch open builtin used by server
+    # Patch open builtin used by repo_search implementation.
     monkeypatch.setattr(builtins, "open", fake_open)
 
     # Execute
     res = asyncio.run(
-        srv.repo_search(
+        search_impl._repo_search_impl(
             query="foo",
             mode="hybrid",
             include_snippet=True,
             highlight_snippet=True,
             context_lines=0,
+            get_embedding_model_fn=lambda _name: object(),
+            require_auth_session_fn=lambda session: session,
+            do_highlight_snippet_fn=lambda snippet, _tokens: snippet,
+            run_async_fn=lambda *_a, **_k: {"ok": True, "code": 0, "stdout": "", "stderr": ""},
         )
     )
     snip = res["results"][0].get("snippet", "")
@@ -289,7 +321,7 @@ def test_repo_search_snippet_strict_cap_after_highlight(monkeypatch):
 
 @pytest.mark.unit
 def test_repo_search_docstring_clean():
-    doc = srv.repo_search.__doc__
+    doc = search_impl._repo_search_impl.__doc__
     assert doc and "Zero-config code search" in doc
     # Ensure stray inline pseudo-code is not embedded in docstring
     assert "Accept common alias keys from clients" not in doc

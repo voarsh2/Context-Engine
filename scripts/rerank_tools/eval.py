@@ -134,7 +134,7 @@ def rerank_recursive(
 ) -> List[Dict[str, Any]]:
     """Recursive reranker (no learning)."""
     try:
-        from scripts.rerank_recursive import RecursiveReranker
+        from scripts.rerank_recursive.recursive import RecursiveReranker
         reranker = RecursiveReranker(n_iterations=n_iterations, dim=256)
         initial_scores = [c.get("score", 0) for c in candidates]
         return reranker.rerank(query, candidates, initial_scores)
@@ -150,7 +150,7 @@ def rerank_learning(
 ) -> List[Dict[str, Any]]:
     """Learning reranker (uses trained weights)."""
     try:
-        from scripts.rerank_recursive import rerank_with_learning
+        from scripts.rerank_recursive.recursive import rerank_with_learning
         return rerank_with_learning(
             query=query,
             candidates=candidates,

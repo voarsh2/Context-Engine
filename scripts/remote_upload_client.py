@@ -99,9 +99,14 @@ from scripts.workspace_state import (
     _extract_repo_name_from_path,
     remove_cached_file,
 )
+from scripts.ingest.config import CODE_EXTS, EXTENSIONLESS_FILES
 
-# Import existing hash function
-import scripts.ingest_code as idx
+
+def hash_id(text: str, path: str, start: int, end: int) -> int:
+    h = hashlib.sha1(
+        f"{path}:{start}-{end}\n{text}".encode("utf-8", errors="ignore")
+    ).hexdigest()
+    return int(h[:16], 16)
 
 
 def _cache_missing_stats(file_hashes: Dict[str, Any]) -> Tuple[bool, int, int]:
@@ -828,7 +833,7 @@ class RemoteUploadClient:
         if any(p.startswith(".") for p in rel.parts[:-1]):
             return True
         try:
-            extensionless = set((idx.EXTENSIONLESS_FILES or {}).keys())
+            extensionless = set((EXTENSIONLESS_FILES or {}).keys())
         except Exception:
             extensionless = set()
         if rel.name.startswith(".") and rel.name.lower() not in extensionless:
@@ -840,11 +845,11 @@ class RemoteUploadClient:
         if self._is_ignored_path(path):
             return False
         suffix = path.suffix.lower()
-        if idx.CODE_EXTS.get(suffix, "unknown") != "unknown":
+        if CODE_EXTS.get(suffix, "unknown") != "unknown":
             return True
         name = path.name.lower()
         try:
-            extensionless_names = {k.lower() for k in (idx.EXTENSIONLESS_FILES or {}).keys()}
+            extensionless_names = {k.lower() for k in (EXTENSIONLESS_FILES or {}).keys()}
         except Exception:
             extensionless_names = set()
         return name in extensionless_names or name.startswith("dockerfile")
@@ -1060,7 +1065,7 @@ class RemoteUploadClient:
 
                     # Get file info
                     stat = path.stat()
-                    language = idx.CODE_EXTS.get(path.suffix.lower(), "unknown")
+                    language = CODE_EXTS.get(path.suffix.lower(), "unknown")
 
                     operation = {
                         "operation": "created",
@@ -1069,7 +1074,7 @@ class RemoteUploadClient:
                         "absolute_path": str(path.resolve()),
                         "size_bytes": stat.st_size,
                         "content_hash": content_hash,
-                        "file_hash": f"sha1:{idx.hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
+                        "file_hash": f"sha1:{hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
                         "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                         "language": language
                     }
@@ -1098,7 +1103,7 @@ class RemoteUploadClient:
 
                     # Get file info
                     stat = path.stat()
-                    language = idx.CODE_EXTS.get(path.suffix.lower(), "unknown")
+                    language = CODE_EXTS.get(path.suffix.lower(), "unknown")
 
                     operation = {
                         "operation": "updated",
@@ -1108,7 +1113,7 @@ class RemoteUploadClient:
                         "size_bytes": stat.st_size,
                         "content_hash": content_hash,
                         "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
-                        "file_hash": f"sha1:{idx.hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
+                        "file_hash": f"sha1:{hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
                         "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                         "language": language
                     }
@@ -1137,7 +1142,7 @@ class RemoteUploadClient:
 
                     # Get file info
                     stat = dest_path.stat()
-                    language = idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown")
+                    language = CODE_EXTS.get(dest_path.suffix.lower(), "unknown")
 
                     operation = {
                         "operation": "moved",
@@ -1149,7 +1154,7 @@ class RemoteUploadClient:
                         "source_absolute_path": str(source_path.resolve()),
                         "size_bytes": stat.st_size,
                         "content_hash": content_hash,
-                        "file_hash": f"sha1:{idx.hash_id(content.decode('utf-8', errors='ignore'), dest_rel_path, 1, len(content.splitlines()))}",
+                        "file_hash": f"sha1:{hash_id(content.decode('utf-8', errors='ignore'), dest_rel_path, 1, len(content.splitlines()))}",
                         "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                         "language": language
                     }
@@ -1175,7 +1180,7 @@ class RemoteUploadClient:
                         "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
                         "file_hash": None,
                         "modified_time": datetime.now().isoformat(),
-                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown")
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown")
                     }
                     operations.append(operation)
 
@@ -1260,7 +1265,7 @@ class RemoteUploadClient:
                         "path": rel_path,
                         "size_bytes": stat.st_size,
                         "content_hash": f"sha1:{file_hash}",
-                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown"),
                     }
                 )
                 file_hashes[rel_path] = f"sha1:{file_hash}"
@@ -1282,7 +1287,7 @@ class RemoteUploadClient:
                         "size_bytes": stat.st_size,
                         "content_hash": f"sha1:{file_hash}",
                         "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
-                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown"),
                     }
                 )
                 file_hashes[rel_path] = f"sha1:{file_hash}"
@@ -1304,7 +1309,7 @@ class RemoteUploadClient:
                         "source_path": source_rel_path,
                         "size_bytes": stat.st_size,
                         "content_hash": f"sha1:{file_hash}",
-                        "language": idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown"),
+                        "language": CODE_EXTS.get(dest_path.suffix.lower(), "unknown"),
                     }
                 )
                 file_hashes[dest_rel_path] = f"sha1:{file_hash}"
@@ -1326,7 +1331,7 @@ class RemoteUploadClient:
                         "operation": "deleted",
                         "path": rel_path,
                         "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
-                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown"),
                     }
                 )
             except Exception as e:
@@ -2133,9 +2138,9 @@ class RemoteUploadClient:
                 return files
 
             # Single walk with early pruning similar to standalone client
-            ext_suffixes = {str(ext).lower() for ext in idx.CODE_EXTS if str(ext).startswith('.')}
+            ext_suffixes = {str(ext).lower() for ext in CODE_EXTS if str(ext).startswith('.')}
             try:
-                extensionless_names = {k.lower() for k in (idx.EXTENSIONLESS_FILES or {}).keys()}
+                extensionless_names = {k.lower() for k in (EXTENSIONLESS_FILES or {}).keys()}
             except Exception:
                 extensionless_names = set()
             excluded = self._excluded_dirnames()

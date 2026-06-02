@@ -161,7 +161,7 @@ def pattern_collection():
         pass
 
 
-@pytest.mark.service
+@pytest.mark.integration
 def test_pattern_search_qdrant(pattern_collection):
     """Test pattern search against real Qdrant."""
     from scripts.pattern_detection.search import pattern_search

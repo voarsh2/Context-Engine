@@ -1,9 +1,9 @@
-import os
-import asyncio
+import importlib
+import sys
 import types
 import pytest
 
-import scripts.mcp_indexer_server as srv
+search_impl = importlib.import_module("scripts.mcp_impl.search")
 
 
 @pytest.mark.service
@@ -11,15 +11,24 @@ def test_repo_search_malformed_jsonl_subprocess(monkeypatch):
     # Force subprocess path and simulate malformed JSONL stdout
     monkeypatch.setenv("HYBRID_IN_PROCESS", "0")
     monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
+    monkeypatch.setenv("RERANKER_ENABLED", "0")
+
+    fake_hybrid = types.ModuleType("scripts.hybrid_search")
+    fake_hybrid.run_hybrid_search = lambda *a, **k: []
+    monkeypatch.setitem(sys.modules, "scripts.hybrid_search", fake_hybrid)
 
     async def fake_run(cmd, **kwargs):
         # Simulate subprocess failure with malformed output
         return {"ok": False, "code": 1, "stdout": "not-json\n", "stderr": "malformed"}
 
-    monkeypatch.setattr(srv, "_run_async", fake_run)
-
-    res = srv.asyncio.get_event_loop().run_until_complete(
-        srv.repo_search(queries=["x"], limit=1, compact=False)
+    res = search_impl.asyncio.get_event_loop().run_until_complete(
+        search_impl._repo_search_impl(
+            queries=["x"],
+            limit=1,
+            compact=False,
+            run_async_fn=fake_run,
+            require_auth_session_fn=lambda session: session,
+        )
     )
 
     assert res.get("ok") is False
@@ -34,25 +43,27 @@ def test_repo_search_inproc_qdrant_failure_fallback_and_fail(monkeypatch):
     monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
     monkeypatch.setenv("RERANKER_ENABLED", "0")
 
-    # Avoid real model load
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: object())
-
     # Cause in-process path to fail
-    import scripts.hybrid_search as hy
-
     def boom(*a, **k):
         raise ConnectionError("qdrant down")
 
-    monkeypatch.setattr(hy, "run_hybrid_search", boom)
+    fake_hybrid = types.ModuleType("scripts.hybrid_search")
+    fake_hybrid.run_hybrid_search = boom
+    monkeypatch.setitem(sys.modules, "scripts.hybrid_search", fake_hybrid)
 
     # And make the subprocess fallback fail too
     async def fake_run(cmd, **kwargs):
         return {"ok": False, "code": 1, "stdout": "", "stderr": "qdrant unreachable"}
 
-    monkeypatch.setattr(srv, "_run_async", fake_run)
-
-    res = srv.asyncio.get_event_loop().run_until_complete(
-        srv.repo_search(queries=["x"], limit=1, compact=True)
+    res = search_impl.asyncio.get_event_loop().run_until_complete(
+        search_impl._repo_search_impl(
+            queries=["x"],
+            limit=1,
+            compact=True,
+            get_embedding_model_fn=lambda *a, **k: object(),
+            run_async_fn=fake_run,
+            require_auth_session_fn=lambda session: session,
+        )
     )
 
     assert res.get("ok") is False

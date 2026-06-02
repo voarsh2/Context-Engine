@@ -52,16 +52,6 @@ from scripts.upload_delta_bundle import (
     process_delta_bundle,
 )
 
-from scripts.indexing_admin import (
-    build_admin_collections_view,
-    resolve_collection_root,
-    spawn_ingest_code,
-    recreate_collection_qdrant,
-    start_staging_rebuild,
-    activate_staging_rebuild,
-    abort_staging_rebuild,
-)
-
 from pydantic import BaseModel, Field
 from scripts.auth_backend import (
     AuthDisabledError,
@@ -83,8 +73,6 @@ from scripts.auth_backend import (
     revoke_collection_access,
 )
 
-from scripts.collection_admin import delete_collection_everywhere, copy_collection_qdrant
-from scripts.qdrant_client_manager import pooled_qdrant_client
 from scripts.admin_ui import (
     render_admin_acl,
     render_admin_bootstrap,
@@ -142,6 +130,15 @@ CTXCE_MCP_ACL_ENFORCE = (
     in {"1", "true", "yes", "on"}
 )
 BRIDGE_STATE_TOKEN = (os.environ.get("CTXCE_BRIDGE_STATE_TOKEN") or "").strip()
+
+
+# Admin collection operations import Qdrant clients, subprocess indexing helpers,
+# and collection-copy/delete wiring. Keep those off the upload/status import path.
+def _indexing_admin():
+    from scripts import indexing_admin
+
+    return indexing_admin
+
 
 # FastAPI app
 app = FastAPI(
@@ -402,7 +399,8 @@ def _resolve_bridge_state_target(
     repo = (repo_name or "").strip() or None
 
     if collection:
-        root, resolved_repo = resolve_collection_root(collection=collection, work_dir=WORK_DIR)
+        indexing_admin = _indexing_admin()
+        root, resolved_repo = indexing_admin.resolve_collection_root(collection=collection, work_dir=WORK_DIR)
         if not root:
             raise HTTPException(status_code=404, detail="collection mapping not found")
         workspace_path = root
@@ -749,8 +747,9 @@ async def admin_acl_page(request: Request):
         logger.error(f"[upload_service] Failed to load admin UI data: {e}")
         raise HTTPException(status_code=500, detail="Failed to load admin data")
 
+    indexing_admin = _indexing_admin()
     enriched = await asyncio.to_thread(
-        build_admin_collections_view, collections=collections, work_dir=WORK_DIR
+        indexing_admin.build_admin_collections_view, collections=collections, work_dir=WORK_DIR
     )
 
     resp = render_admin_acl(
@@ -795,8 +794,9 @@ async def admin_collections_status(request: Request):
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to load collections")
 
+    indexing_admin = _indexing_admin()
     enriched = await asyncio.to_thread(
-        lambda: build_admin_collections_view(collections=collections, work_dir=WORK_DIR)
+        lambda: indexing_admin.build_admin_collections_view(collections=collections, work_dir=WORK_DIR)
     )
     return JSONResponse({"collections": enriched})
 
@@ -816,7 +816,8 @@ async def admin_reindex_collection(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -826,7 +827,7 @@ async def admin_reindex_collection(
         )
 
     try:
-        spawn_ingest_code(
+        indexing_admin.spawn_ingest_code(
             root=root,
             work_dir=WORK_DIR,
             collection=name,
@@ -895,7 +896,8 @@ async def admin_recreate_collection(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -905,12 +907,12 @@ async def admin_recreate_collection(
         )
 
     try:
-        recreate_collection_qdrant(
+        indexing_admin.recreate_collection_qdrant(
             qdrant_url=QDRANT_URL,
             api_key=os.environ.get("QDRANT_API_KEY") or None,
             collection=name,
         )
-        spawn_ingest_code(
+        indexing_admin.spawn_ingest_code(
             root=root,
             work_dir=WORK_DIR,
             collection=name,
@@ -944,7 +946,8 @@ async def admin_clear_collection_journal(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -1009,6 +1012,9 @@ async def admin_delete_collection(
         cleanup_fs = False
 
     try:
+        # Collection deletion imports Qdrant admin helpers only on the admin route.
+        from scripts.collection_admin import delete_collection_everywhere
+
         out = delete_collection_everywhere(
             collection=name,
             work_dir=WORK_DIR,
@@ -1068,7 +1074,8 @@ async def admin_start_staging(
     root: Optional[str] = None
     repo_name: Optional[str] = None
     try:
-        root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+        indexing_admin = _indexing_admin()
+        root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     except Exception:
         root, repo_name = None, None
     if not root:
@@ -1122,7 +1129,7 @@ async def admin_start_staging(
         async def _bg_start() -> None:
             try:
                 staging_collection = await asyncio.to_thread(
-                    start_staging_rebuild, collection=name, work_dir=WORK_DIR
+                    indexing_admin.start_staging_rebuild, collection=name, work_dir=WORK_DIR
                 )
                 logger.info(f"[admin] Started staging rebuild for {name} -> {staging_collection}")
             except Exception as e:
@@ -1179,7 +1186,8 @@ async def admin_activate_staging(
     try:
         async def _bg_activate() -> None:
             try:
-                await asyncio.to_thread(activate_staging_rebuild, collection=name, work_dir=WORK_DIR)
+                indexing_admin = _indexing_admin()
+                await asyncio.to_thread(indexing_admin.activate_staging_rebuild, collection=name, work_dir=WORK_DIR)
                 logger.info(f"[admin] Activated staging for {name}")
             except Exception as e:
                 logger.error(f"[admin] Background staging activate failed for {name}: {e}")
@@ -1211,7 +1219,8 @@ async def admin_abort_staging(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -1222,7 +1231,7 @@ async def admin_abort_staging(
 
     try:
         await asyncio.to_thread(
-            abort_staging_rebuild,
+            indexing_admin.abort_staging_rebuild,
             collection=name,
             work_dir=WORK_DIR,
             delete_collection=True,
@@ -1262,6 +1271,9 @@ async def admin_copy_collection(
         allow_overwrite = False
 
     try:
+        # Collection copy imports Qdrant admin helpers only on the admin route.
+        from scripts.collection_admin import copy_collection_qdrant
+
         new_name = copy_collection_qdrant(
             source=name,
             target=(target or None),
@@ -1282,6 +1294,9 @@ async def admin_copy_collection(
         if not name.endswith("_graph") and not str(new_name).endswith("_graph"):
             used_pooled = True
             try:
+                # Qdrant client pool is only needed to verify the copied graph collection.
+                from scripts.qdrant_client_manager import pooled_qdrant_client
+
                 with pooled_qdrant_client(
                     url=QDRANT_URL,
                     api_key=os.environ.get("QDRANT_API_KEY"),

@@ -1,25 +1,10 @@
 import importlib
 import json
+import sys
+import types
 import pytest
 
-srv = importlib.import_module("scripts.mcp_indexer_server")
-
-
-class FakePoint:
-    def __init__(self, score, payload):
-        self.score = score
-        self.payload = payload
-
-
-class FakeQdrantMem:
-    def __init__(self, items):
-        self._items = items
-
-    def search(self, **kwargs):
-        return self._items
-
-    def scroll(self, **kwargs):
-        return (self._items, None)
+ctx_search = importlib.import_module("scripts.mcp_impl.context_search")
 
 
 class FakeEmbed:
@@ -45,27 +30,60 @@ async def test_context_search_blend_compact(monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(srv, "repo_search", fake_repo_search)
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: FakeEmbed())
+    monkeypatch.setenv("MEMORY_SSE_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_COLLECTION_NAME", "test-memory")
+    monkeypatch.setenv("MEMORY_MCP_READY_RETRIES", "1")
+    monkeypatch.setenv("MEMORY_MCP_READY_BACKOFF", "0")
+    monkeypatch.setenv("MEMORY_MCP_LIST_RETRIES", "1")
+    monkeypatch.setenv("MEMORY_MCP_LIST_BACKOFF", "0")
 
-    # Memory fallback via Qdrant: two memory-like points (no path in metadata)
-    mem_items = [
-        FakePoint(0.9, {"content": "foo note one", "metadata": {}}),
-        FakePoint(0.2, {"content": "bar note two", "metadata": {}}),
-    ]
-    import qdrant_client
+    import urllib.request
 
     monkeypatch.setattr(
-        qdrant_client, "QdrantClient", lambda *a, **k: FakeQdrantMem(mem_items)
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("not ready")),
     )
 
-    res = await srv.context_search(
+    class T:
+        def __init__(self, name):
+            self.name = name
+
+    class Item:
+        def __init__(self, text):
+            self.text = text
+
+    class Resp:
+        def __init__(self):
+            self.content = [Item("foo note one"), Item("bar note two")]
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def list_tools(self):
+            return [T("find")]
+
+        async def call_tool(self, *a, **k):
+            return Resp()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "fastmcp",
+        types.SimpleNamespace(Client=lambda *a, **k: FakeClient()),
+    )
+
+    res = await ctx_search._context_search_impl(
         query="foo bar",
         limit=3,
         per_path=1,
         include_memories=True,
         memory_weight=0.5,
         compact=True,
+        repo_search_fn=fake_repo_search,
     )
 
     assert "results" in res
@@ -88,10 +106,21 @@ async def test_context_search_weight_scaling(monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(srv, "repo_search", fake_repo_search)
-
     # Force SSE memory path with a fake FastMCP client
     monkeypatch.setenv("MEMORY_SSE_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_COLLECTION_NAME", "test-memory")
+    monkeypatch.setenv("MEMORY_MCP_READY_RETRIES", "1")
+    monkeypatch.setenv("MEMORY_MCP_READY_BACKOFF", "0")
+    monkeypatch.setenv("MEMORY_MCP_LIST_RETRIES", "1")
+    monkeypatch.setenv("MEMORY_MCP_LIST_BACKOFF", "0")
+
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("not ready")),
+    )
 
     class T:
         def __init__(self, name):
@@ -118,23 +147,20 @@ async def test_context_search_weight_scaling(monkeypatch):
         async def call_tool(self, *a, **k):
             return Resp()
 
-    # Import fastmcp inside test to avoid module-level import conflicts
-    # Clear any broken mcp modules from sys.modules first
-    import sys
-    mcp_modules = [k for k in sys.modules.keys() if k == 'mcp' or k.startswith('mcp.')]
-    for mod in mcp_modules:
-        if mod in sys.modules and not hasattr(sys.modules.get(mod, object()), 'types'):
-            del sys.modules[mod]
-    import fastmcp
-    monkeypatch.setattr(fastmcp, "Client", lambda *a, **k: FakeClient())
+    monkeypatch.setitem(
+        sys.modules,
+        "fastmcp",
+        types.SimpleNamespace(Client=lambda *a, **k: FakeClient()),
+    )
 
-    res = await srv.context_search(
+    res = await ctx_search._context_search_impl(
         query="foo",
         limit=2,
         per_path=1,
         include_memories=True,
         memory_weight=2.0,
         compact=False,
+        repo_search_fn=fake_repo_search,
     )
 
     mem_scores = [r["score"] for r in res["results"] if r.get("source") == "memory"]
@@ -157,11 +183,21 @@ async def test_context_search_per_source_limits(monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(srv, "repo_search", fake_repo_search)
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: FakeEmbed())
-
     # Drive memory hits via SSE path with a fake FastMCP client yielding 3 notes
     monkeypatch.setenv("MEMORY_SSE_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_COLLECTION_NAME", "test-memory")
+    monkeypatch.setenv("MEMORY_MCP_READY_RETRIES", "1")
+    monkeypatch.setenv("MEMORY_MCP_READY_BACKOFF", "0")
+    monkeypatch.setenv("MEMORY_MCP_LIST_RETRIES", "1")
+    monkeypatch.setenv("MEMORY_MCP_LIST_BACKOFF", "0")
+
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("not ready")),
+    )
 
     class T:
         def __init__(self, name):
@@ -188,23 +224,21 @@ async def test_context_search_per_source_limits(monkeypatch):
         async def call_tool(self, *a, **k):
             return Resp()
 
-    # Import fastmcp inside test to avoid module-level import conflicts
-    # Clear any broken mcp modules from sys.modules first
-    import sys
-    mcp_modules = [k for k in sys.modules.keys() if k == 'mcp' or k.startswith('mcp.')]
-    for mod in mcp_modules:
-        if mod in sys.modules and not hasattr(sys.modules.get(mod, object()), 'types'):
-            del sys.modules[mod]
-    import fastmcp
-    monkeypatch.setattr(fastmcp, "Client", lambda *a, **k: FakeClient())
+    monkeypatch.setitem(
+        sys.modules,
+        "fastmcp",
+        types.SimpleNamespace(Client=lambda *a, **k: FakeClient()),
+    )
 
-    res = await srv.context_search(
+    res = await ctx_search._context_search_impl(
         query="foo",
         limit=5,
         per_path=1,
         include_memories=True,
         per_source_limits=json.dumps({"code": 1, "memory": 2}),
         compact=True,
+        repo_search_fn=fake_repo_search,
+        get_embedding_model_fn=lambda *a, **k: FakeEmbed(),
     )
 
     kinds = [r.get("source") for r in res.get("results", [])]

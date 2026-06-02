@@ -30,9 +30,20 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
-# Core Qdrant imports
+# Lazy Qdrant model namespace
 # ---------------------------------------------------------------------------
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_config
@@ -248,10 +259,7 @@ else:
 # ---------------------------------------------------------------------------
 # Additional imports for backward compatibility
 # ---------------------------------------------------------------------------
-try:
-    from fastembed import TextEmbedding
-except ImportError:
-    TextEmbedding = None  # type: ignore
+TextEmbedding = None  # Tests may monkeypatch this; production imports lazily if needed.
 
 from scripts.embedder import get_embedding_model as _get_embedding_model
 
@@ -267,8 +275,7 @@ QUERY_OPTIMIZER_AVAILABLE = True
 
 # Import ingest helpers
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
-from scripts.ingest_code import ensure_collection as _ensure_collection_raw
-from scripts.ingest_code import project_mini as _project_mini
+from scripts.ingest.vectors import project_mini as _project_mini
 from scripts.path_scope import (
     normalize_under as _normalize_under_scope,
     metadata_matches_under as _metadata_matches_under,
@@ -398,6 +405,53 @@ def _generate_code_query_variants(query: str) -> List[str]:
     return result[:5]  # Max 5 variants to balance coverage vs compute
 
 
+def _shape_dense_points(
+    ranked_points: List[Any],
+    *,
+    limit: int,
+    per_path: int | None = 1,
+    under: str | None = None,
+) -> List[Dict[str, Any]]:
+    eff_under = _normalize_under_scope(under)
+    eff_per_path = int(per_path or 0)
+
+    results: List[Dict[str, Any]] = []
+    path_counts: dict[str, int] = {}
+    for p in ranked_points:
+        payload = p.payload or {}
+        md = payload.get("metadata") or {}
+        if eff_under and not _metadata_matches_under(md, eff_under):
+            continue
+
+        # Prefer host_path when available (consistent with hybrid search).
+        path = md.get("host_path") or payload.get("path") or md.get("path") or ""
+        if eff_per_path > 0:
+            current = path_counts.get(path, 0)
+            if current >= eff_per_path:
+                continue
+        else:
+            current = 0
+
+        results.append(
+            {
+                "score": float(getattr(p, "score", 0) or 0),
+                "path": path,
+                "symbol": payload.get("symbol") or md.get("symbol") or "",
+                "start_line": int(md.get("start_line") or 0),
+                "end_line": int(md.get("end_line") or 0),
+                "code_id": payload.get("code_id") or payload.get("_id") or "",
+                "doc_id": payload.get("code_id") or payload.get("_id") or "",
+                "payload": payload,
+            }
+        )
+        if eff_per_path > 0:
+            path_counts[path] = current + 1
+        if len(results) >= int(limit):
+            break
+
+    return results
+
+
 def run_pure_dense_search(
     query: str,
     limit: int = 10,
@@ -497,38 +551,12 @@ def run_pure_dense_search(
             fetch_limit = min(max(fetch_limit * 4, fetch_limit + 16), 2000)
         ranked_points = dense_query(client, vec_name, vec_list, flt, fetch_limit, coll, query_text=query)
 
-        # Build output
-        results = []
-        path_counts: dict[str, int] = {}
-        for p in ranked_points:
-            payload = p.payload or {}
-            md = payload.get("metadata") or {}
-            if eff_under and not _metadata_matches_under(md, eff_under):
-                continue
-
-            # Prefer host_path when available (consistent with hybrid search)
-            _path = md.get("host_path") or payload.get("path") or md.get("path") or ""
-            if eff_per_path > 0:
-                current = path_counts.get(_path, 0)
-                if current >= eff_per_path:
-                    continue
-
-            results.append({
-                "score": float(getattr(p, "score", 0) or 0),
-                "path": _path,
-                "symbol": payload.get("symbol") or md.get("symbol") or "",
-                "start_line": int(md.get("start_line") or 0),
-                "end_line": int(md.get("end_line") or 0),
-                "code_id": payload.get("code_id") or payload.get("_id") or "",
-                "doc_id": payload.get("code_id") or payload.get("_id") or "",
-                "payload": payload,
-            })
-            if eff_per_path > 0:
-                path_counts[_path] = current + 1
-            if len(results) >= int(limit):
-                break
-
-        return results
+        return _shape_dense_points(
+            ranked_points,
+            limit=limit,
+            per_path=per_path,
+            under=under,
+        )
 
     finally:
         return_qdrant_client(client)
@@ -617,7 +645,11 @@ def _run_hybrid_search_impl(
     elif _EMBEDDER_FACTORY:
         _model = _get_embedding_model(model_name)
     else:
-        _model = TextEmbedding(model_name=model_name)
+        text_embedding_cls = TextEmbedding
+        if text_embedding_cls is None:
+            from fastembed import TextEmbedding as text_embedding_cls
+
+        _model = text_embedding_cls(model_name=model_name)
     vec_name = _sanitize_vector_name(model_name)
 
     # Parse Query DSL and merge with explicit args

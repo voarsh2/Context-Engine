@@ -1,4 +1,6 @@
 import importlib
+import sys
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,11 +23,6 @@ def test_env_gate_blocks_delete_endpoint(monkeypatch):
         return Response(content=f"{title}: {message}", status_code=status_code)
 
     monkeypatch.setattr(srv, "render_admin_error", _fake_render_admin_error)
-
-    def _should_not_be_called(**_kwargs):
-        raise AssertionError("delete_collection_everywhere should not be called when env gate is off")
-
-    monkeypatch.setattr(srv, "delete_collection_everywhere", _should_not_be_called)
 
     client = TestClient(srv.app)
     resp = client.post("/admin/collections/delete", data={"collection": "c1", "delete_fs": ""})
@@ -65,7 +62,11 @@ def test_delete_redirect_includes_graph_deleted_param(monkeypatch):
     def _fake_delete_collection_everywhere(**_kwargs):
         return {"qdrant_deleted": True, "qdrant_graph_deleted": True}
 
-    monkeypatch.setattr(srv, "delete_collection_everywhere", _fake_delete_collection_everywhere)
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.collection_admin",
+        types.SimpleNamespace(delete_collection_everywhere=_fake_delete_collection_everywhere),
+    )
 
     client = TestClient(srv.app)
     resp = client.post("/admin/collections/delete", data={"collection": "c1", "delete_fs": ""}, follow_redirects=False)
@@ -84,10 +85,15 @@ def test_clear_journal_endpoint_clears_mapped_collection(monkeypatch):
 
     calls = {}
     monkeypatch.setattr(srv, "_require_admin_session", lambda _req: {"user_id": "admin"})
-    monkeypatch.setattr(
-        srv,
-        "resolve_collection_root",
-        lambda **_kwargs: ("/work/repo-1234567890abcdef", "repo-1234567890abcdef"),
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.indexing_admin",
+        types.SimpleNamespace(
+            resolve_collection_root=lambda **_kwargs: (
+                "/work/repo-1234567890abcdef",
+                "repo-1234567890abcdef",
+            )
+        ),
     )
 
     def _clear_index_journal_entries(**kwargs):

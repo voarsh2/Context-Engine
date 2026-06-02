@@ -1,9 +1,58 @@
-import importlib
+import asyncio
+import sys
+import threading
 import types
 import pytest
 
+from scripts.mcp_impl.context_answer import (
+    _ca_prepare_filters_and_retrieve,
+    _context_answer_impl,
+)
 
-srv = importlib.import_module("scripts.mcp_indexer_server")
+
+def _retrieval_result(items, **overrides):
+    result = {
+        "items": items,
+        "eff_language": None,
+        "eff_path_glob": None,
+        "eff_not_glob": None,
+        "override_under": False,
+        "sym_arg": None,
+        "cwd_root": "/work",
+        "path_regex": None,
+        "ext": None,
+        "kind": None,
+        "case": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _install_fake_hybrid(monkeypatch, run_hybrid_search):
+    fake = types.ModuleType("scripts.hybrid_search")
+    fake.run_hybrid_search = run_hybrid_search
+    fake.lang_matches_path = lambda language, path: True
+    fake._merge_and_budget_spans = lambda items: list(items or [])
+    monkeypatch.setitem(sys.modules, "scripts.hybrid_search", fake)
+    return fake
+
+
+def _run_context_answer(retrieval_fn=None, **kwargs):
+    return asyncio.get_event_loop().run_until_complete(
+        _context_answer_impl(
+            **kwargs,
+            get_embedding_model_fn=lambda *a, **k: None,
+            env_lock=threading.Lock(),
+            prepare_filters_and_retrieve_fn=retrieval_fn or _ca_prepare_filters_and_retrieve,
+        )
+    )
+
+
+def _isolate_context_answer_unit(monkeypatch):
+    monkeypatch.setenv("REFRAG_RUNTIME", "llamacpp")
+    monkeypatch.setenv("CTX_MULTI_COLLECTION", "0")
+    monkeypatch.setenv("CTX_DOC_PASS", "0")
+    monkeypatch.setenv("CTX_DOC_TOP_FALLBACK", "0")
 
 
 def _fake_items():
@@ -29,14 +78,7 @@ def _fake_items():
 
 @pytest.mark.service
 def test_context_answer_happy_path(monkeypatch):
-    # Mock embedding model to avoid loading real model
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: None)
-
-    # Fake retrieval output (already budgeted)
-    import scripts.hybrid_search as hs
-
-    monkeypatch.setattr(hs, "run_hybrid_search", lambda **k: _fake_items())
-
+    _isolate_context_answer_unit(monkeypatch)
     # Fake decoder
     import scripts.refrag_llamacpp as ref
 
@@ -51,8 +93,11 @@ def test_context_answer_happy_path(monkeypatch):
     monkeypatch.setattr(ref, "LlamaCppRefragClient", FakeLlama)
     monkeypatch.setattr(ref, "is_decoder_enabled", lambda: True)
 
-    out = srv.asyncio.get_event_loop().run_until_complete(
-        srv.context_answer(query="how to do x", limit=2, per_path=1)
+    out = _run_context_answer(
+        retrieval_fn=lambda **_kwargs: _retrieval_result(_fake_items()),
+        query="how to do x",
+        limit=2,
+        per_path=1,
     )
 
     assert isinstance(out, dict)
@@ -63,17 +108,12 @@ def test_context_answer_happy_path(monkeypatch):
 
 
 def test_context_answer_decoder_disabled(monkeypatch):
-    # Mock embedding model to avoid loading real model
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: None)
+    _isolate_context_answer_unit(monkeypatch)
     monkeypatch.setenv("REFRAG_MODE", "0")
     monkeypatch.setenv("REFRAG_GATE_FIRST", "0")
     monkeypatch.setenv("REFRAG_RUNTIME", "llamacpp")
     monkeypatch.setenv("CTX_CLIENT_DEADLINE_SEC", "178")
     monkeypatch.setenv("CTX_DEADLINE_MARGIN_SEC", "6")
-
-    import scripts.hybrid_search as hs
-
-    monkeypatch.setattr(hs, "run_hybrid_search", lambda **k: _fake_items())
 
     import scripts.refrag_llamacpp as ref
 
@@ -87,8 +127,10 @@ def test_context_answer_decoder_disabled(monkeypatch):
     monkeypatch.setattr(ref, "LlamaCppRefragClient", FakeLlama)
     monkeypatch.setattr(ref, "is_decoder_enabled", lambda: False)
 
-    out = srv.asyncio.get_event_loop().run_until_complete(
-        srv.context_answer(query="how to do y", limit=1)
+    out = _run_context_answer(
+        retrieval_fn=lambda **_kwargs: _retrieval_result(_fake_items()),
+        query="how to do y",
+        limit=1,
     )
 
     assert "error" in out
@@ -96,11 +138,7 @@ def test_context_answer_decoder_disabled(monkeypatch):
 
 
 def test_context_answer_prefers_identifier_spans(monkeypatch):
-    # Mock embedding model to avoid loading real model
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: None)
-
-    import scripts.hybrid_search as hs
-
+    _isolate_context_answer_unit(monkeypatch)
     def _items():
         return [
             {
@@ -110,6 +148,7 @@ def test_context_answer_prefers_identifier_spans(monkeypatch):
                 "start_line": 10,
                 "end_line": 16,
                 "text": "def helper():\n    return 42\n",
+                "span_budgeted": True,
             },
             {
                 "score": 0.8,
@@ -118,10 +157,9 @@ def test_context_answer_prefers_identifier_spans(monkeypatch):
                 "start_line": 5,
                 "end_line": 9,
                 "text": "RRF_K = 60\n",
+                "span_budgeted": True,
             },
         ]
-
-    monkeypatch.setattr(hs, "run_hybrid_search", lambda **k: _items())
 
     import scripts.refrag_llamacpp as ref
 
@@ -135,8 +173,11 @@ def test_context_answer_prefers_identifier_spans(monkeypatch):
     monkeypatch.setattr(ref, "LlamaCppRefragClient", FakeLlama)
     monkeypatch.setattr(ref, "is_decoder_enabled", lambda: True)
 
-    out = srv.asyncio.get_event_loop().run_until_complete(
-        srv.context_answer(query="what is RRF_K in hybrid_search.py?", limit=1, per_path=1)
+    out = _run_context_answer(
+        retrieval_fn=lambda **_kwargs: _retrieval_result(_items()),
+        query="what is RRF_K in hybrid_search.py?",
+        limit=1,
+        per_path=1,
     )
 
     cits = out.get("citations") or []
@@ -146,11 +187,7 @@ def test_context_answer_prefers_identifier_spans(monkeypatch):
 
 def test_context_answer_tier2_retry_without_gating(monkeypatch):
     """Tier 2 should retry run_hybrid_search with relaxed filters when Tier 1 yields zero."""
-    # Mock embedding model to avoid loading real model
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: None)
-
-    import scripts.hybrid_search as hs
-
+    _isolate_context_answer_unit(monkeypatch)
     calls = []
 
     def _run_hybrid_search(**kwargs):
@@ -170,7 +207,7 @@ def test_context_answer_tier2_retry_without_gating(monkeypatch):
         # All other calls (tier1/usage/targeted search) yield no hits
         return []
 
-    monkeypatch.setattr(hs, "run_hybrid_search", _run_hybrid_search)
+    _install_fake_hybrid(monkeypatch, _run_hybrid_search)
 
     import scripts.refrag_llamacpp as ref
 
@@ -184,9 +221,7 @@ def test_context_answer_tier2_retry_without_gating(monkeypatch):
     monkeypatch.setattr(ref, "LlamaCppRefragClient", FakeLlama)
     monkeypatch.setattr(ref, "is_decoder_enabled", lambda: True)
 
-    out = srv.asyncio.get_event_loop().run_until_complete(
-        srv.context_answer(query="RRF_K", limit=1, per_path=1)
-    )
+    out = _run_context_answer(query="RRF_K", limit=1, per_path=1)
 
     # Ensure Tier 2 was invoked (run_hybrid_search called twice)
     assert len(calls) >= 3, "Tier 2 fallback should re-run hybrid search"
@@ -205,9 +240,7 @@ def test_context_answer_tier2_retry_without_gating(monkeypatch):
 
 
 def test_context_answer_env_lock_release_on_retrieval_exception(monkeypatch):
-    # Mock embedding model to avoid loading real model
-    monkeypatch.setattr(srv, "_get_embedding_model", lambda *a, **k: None)
-
+    _isolate_context_answer_unit(monkeypatch)
     import os
     # Force retrieval to raise and ensure env/lock are restored
     prev = {k: os.environ.get(k) for k in (
@@ -217,16 +250,22 @@ def test_context_answer_env_lock_release_on_retrieval_exception(monkeypatch):
     def _raise_retrieval(*a, **k):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(srv, "_ca_prepare_filters_and_retrieve", _raise_retrieval)
-
-    out = srv.asyncio.get_event_loop().run_until_complete(
-        srv.context_answer(query="x", limit=1, per_path=1)
+    lock = threading.Lock()
+    out = asyncio.get_event_loop().run_until_complete(
+        _context_answer_impl(
+            query="x",
+            limit=1,
+            per_path=1,
+            get_embedding_model_fn=lambda *a, **k: None,
+            env_lock=lock,
+            prepare_filters_and_retrieve_fn=_raise_retrieval,
+        )
     )
     assert "error" in out
 
     # Lock should be free after failure
-    assert srv._ENV_LOCK.acquire(blocking=False), "_ENV_LOCK should be released on exception"
-    srv._ENV_LOCK.release()
+    assert lock.acquire(blocking=False), "context_answer env lock should be released on exception"
+    lock.release()
 
     # Env should be restored
     for k, v in prev.items():
@@ -248,12 +287,19 @@ def test_context_answer_env_lock_release_on_retrieval_exception(monkeypatch):
             "case": None,
         }
 
-    monkeypatch.setattr(srv, "_ca_prepare_filters_and_retrieve", _fake_retrieval)
-
     import scripts.refrag_llamacpp as ref
+
+    _install_fake_hybrid(monkeypatch, lambda **k: [])
     monkeypatch.setattr(ref, "is_decoder_enabled", lambda: False)
 
-    out2 = srv.asyncio.get_event_loop().run_until_complete(
-        srv.context_answer(query="x", limit=1, per_path=1)
+    out2 = asyncio.get_event_loop().run_until_complete(
+        _context_answer_impl(
+            query="x",
+            limit=1,
+            per_path=1,
+            get_embedding_model_fn=lambda *a, **k: None,
+            env_lock=lock,
+            prepare_filters_and_retrieve_fn=_fake_retrieval,
+        )
     )
     assert isinstance(out2, dict)

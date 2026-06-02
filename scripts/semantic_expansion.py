@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Semantic similarity-based query expansion for Context-Engine.
 
@@ -9,13 +11,24 @@ to improve search relevance by finding conceptually related terms.
 import os
 import math
 import re
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional, Set, TYPE_CHECKING
 from collections import defaultdict
 import logging
 
 logger = logging.getLogger("semantic_expansion")
 
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 from scripts.embedder import get_embedding_model as _get_embedding_model
 from scripts.utils import (

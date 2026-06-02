@@ -39,15 +39,13 @@ from scripts.rerank_tools.events import (
     list_event_files,
     cleanup_old_events,
 )
-from scripts.rerank_recursive import (
-    TinyScorer,
-    LatentRefiner,
-    RecursiveReranker,
-    VICReg,
-    LearnedProjection,
-    LearnedHybridWeights,
-    QueryExpander,
-)
+from scripts.rerank_recursive.expander import QueryExpander
+from scripts.rerank_recursive.hybrid_weights import LearnedHybridWeights
+from scripts.rerank_recursive.projection import LearnedProjection
+from scripts.rerank_recursive.recursive import RecursiveReranker
+from scripts.rerank_recursive.refiner import LatentRefiner
+from scripts.rerank_recursive.scorer import TinyScorer
+from scripts.rerank_recursive.vicreg import VICReg
 
 # Configuration
 BATCH_SIZE = int(os.environ.get("RERANK_LEARNING_BATCH_SIZE", "32"))

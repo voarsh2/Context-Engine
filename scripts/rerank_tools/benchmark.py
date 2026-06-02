@@ -113,7 +113,7 @@ def benchmark_baseline(query: str, candidates: List[Dict[str, Any]]) -> RealBenc
 
 def benchmark_recursive(query: str, candidates: List[Dict[str, Any]], n_iters: int = 3) -> RealBenchmarkResult:
     """Benchmark recursive reranker."""
-    from scripts.rerank_recursive import RecursiveReranker
+    from scripts.rerank_recursive.recursive import RecursiveReranker
 
     reranker = RecursiveReranker(n_iterations=n_iters, dim=256)
     initial_scores = [c.get("score", 0) for c in candidates]
@@ -167,7 +167,7 @@ def benchmark_onnx(query: str, candidates: List[Dict[str, Any]]) -> Optional[Rea
 
 def benchmark_session_aware(query: str, candidates: List[Dict[str, Any]], session_id: str) -> RealBenchmarkResult:
     """Benchmark session-aware recursive reranker."""
-    from scripts.rerank_recursive import SessionAwareReranker
+    from scripts.rerank_recursive.recursive import SessionAwareReranker
 
     reranker = SessionAwareReranker(n_iterations=3, dim=256)
     initial_scores = [c.get("score", 0) for c in candidates]
@@ -194,7 +194,7 @@ def get_learning_reranker():
     """Get or create the learning-enabled reranker."""
     global _LEARNING_RERANKER
     if _LEARNING_RERANKER is None:
-        from scripts.rerank_recursive import RecursiveReranker
+        from scripts.rerank_recursive.recursive import RecursiveReranker
         _LEARNING_RERANKER = RecursiveReranker(n_iterations=3, dim=256)
     return _LEARNING_RERANKER
 

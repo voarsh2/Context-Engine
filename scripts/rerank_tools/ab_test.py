@@ -179,7 +179,7 @@ class ABTestManager:
             VariantType.BASELINE, baseline_rerank
         )
 
-        from scripts.rerank_recursive import rerank_recursive
+        from scripts.rerank_recursive.recursive import rerank_recursive
         from scripts.rerank_tools.local import rerank_in_process
 
         self._variant_impls[VariantType.RECURSIVE] = RerankerVariant(

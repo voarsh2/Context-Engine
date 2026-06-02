@@ -14,16 +14,21 @@ import numpy as np
 from typing import List, Dict, Any
 
 
-# Import the reranker
-from scripts.rerank_recursive import (
+from scripts.rerank_recursive.alpha_scheduler import CosineAlphaScheduler, LearnedAlphaWeights
+from scripts.rerank_recursive.confidence import ConfidenceEstimator
+from scripts.rerank_recursive.recursive import (
     RecursiveReranker,
-    RefinementState,
-    TinyScorer,
-    LatentRefiner,
-    ConfidenceEstimator,
     rerank_recursive,
     rerank_recursive_inprocess,
 )
+from scripts.rerank_recursive.refiner import LatentRefiner
+from scripts.rerank_recursive.scorer import TinyScorer
+from scripts.rerank_recursive.state import RefinementState
+
+
+@pytest.fixture(autouse=True)
+def deterministic_recursive_embeddings(monkeypatch):
+    monkeypatch.setattr(RecursiveReranker, "_get_embedder", lambda self: None)
 
 
 class TestTinyScorer:
@@ -246,8 +251,6 @@ class TestCosineAlphaScheduler:
 
     def test_schedule_length(self):
         """Schedule should match n_iterations."""
-        from scripts.rerank_recursive import CosineAlphaScheduler
-        
         scheduler = CosineAlphaScheduler(n_iterations=5)
         schedule = scheduler.get_schedule()
         
@@ -255,8 +258,6 @@ class TestCosineAlphaScheduler:
 
     def test_schedule_decreasing(self):
         """Alpha should decrease over iterations (cosine decay)."""
-        from scripts.rerank_recursive import CosineAlphaScheduler
-        
         scheduler = CosineAlphaScheduler(n_iterations=3, alpha_max=0.7, alpha_min=0.3)
         schedule = scheduler.get_schedule()
         
@@ -266,8 +267,6 @@ class TestCosineAlphaScheduler:
 
     def test_schedule_bounds(self):
         """All alpha values should be within [alpha_min, alpha_max]."""
-        from scripts.rerank_recursive import CosineAlphaScheduler
-        
         scheduler = CosineAlphaScheduler(n_iterations=10, alpha_max=0.8, alpha_min=0.2)
         schedule = scheduler.get_schedule()
         
@@ -276,8 +275,6 @@ class TestCosineAlphaScheduler:
 
     def test_single_iteration(self):
         """Single iteration should return middle value."""
-        from scripts.rerank_recursive import CosineAlphaScheduler
-        
         scheduler = CosineAlphaScheduler(n_iterations=1, alpha_max=0.8, alpha_min=0.2)
         schedule = scheduler.get_schedule()
         
@@ -290,8 +287,6 @@ class TestLearnedAlphaWeights:
 
     def test_init_alpha(self):
         """Initial alpha should match init_alpha parameter."""
-        from scripts.rerank_recursive import LearnedAlphaWeights
-        
         learned = LearnedAlphaWeights(n_iterations=3, init_alpha=0.6)
         schedule = learned.get_schedule()
         
@@ -300,8 +295,6 @@ class TestLearnedAlphaWeights:
 
     def test_get_alpha_clamped(self):
         """get_alpha should clamp to valid iteration range."""
-        from scripts.rerank_recursive import LearnedAlphaWeights
-        
         learned = LearnedAlphaWeights(n_iterations=3)
         
         # Should not crash for out-of-range iterations
@@ -313,8 +306,6 @@ class TestLearnedAlphaWeights:
 
     def test_alpha_in_valid_range(self):
         """All alpha values should be in (0, 1) due to sigmoid."""
-        from scripts.rerank_recursive import LearnedAlphaWeights
-        
         learned = LearnedAlphaWeights(n_iterations=5, init_alpha=0.5)
         schedule = learned.get_schedule()
         
@@ -341,8 +332,6 @@ class TestAlphaIntegration:
 
     def test_custom_scheduler(self):
         """Should accept custom alpha scheduler."""
-        from scripts.rerank_recursive import LearnedAlphaWeights
-        
         custom_scheduler = LearnedAlphaWeights(n_iterations=2, init_alpha=0.4)
         reranker = RecursiveReranker(n_iterations=2, dim=64, alpha_scheduler=custom_scheduler)
         

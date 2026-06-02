@@ -450,6 +450,7 @@ def test_standalone_upload_client_delete_only_plan_uses_apply_ops(monkeypatch, t
 
 def _exercise_async_upload_sets_queued_result(mod_name: str, monkeypatch, tmp_path: Path) -> None:
     mod = importlib.import_module(mod_name)
+    monkeypatch.setenv("CTXCE_REMOTE_UPLOAD_STATUS_WAIT_SECS", "0")
 
     workspace = tmp_path / "repo"
     workspace.mkdir(parents=True, exist_ok=True)

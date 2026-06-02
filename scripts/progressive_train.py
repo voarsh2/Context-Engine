@@ -3,7 +3,7 @@
 import os
 
 from scripts.rerank_tools.eval import get_candidates, rerank_learning, rerank_onnx, DEFAULT_EVAL_QUERIES
-from scripts.rerank_recursive import rerank_with_learning
+from scripts.rerank_recursive.recursive import rerank_with_learning
 from scripts.learning_reranker_worker import CollectionLearner
 import numpy as np
 

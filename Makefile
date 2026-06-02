@@ -4,7 +4,7 @@ SHELL := /bin/bash
 # An empty export forces docker to use its default context/socket.
 export DOCKER_HOST =
 
-.PHONY: help up down logs ps restart rebuild index reindex watch watch-remote env hybrid bootstrap history rerank-local setup-reranker prune warm health test-e2e
+.PHONY: help up down logs ps restart rebuild index reindex watch watch-remote env hybrid bootstrap history rerank-local setup-reranker prune warm health test test-full test-integration test-e2e
 .PHONY: venv venv-install dev-remote-up dev-remote-down dev-remote-logs dev-remote-restart dev-remote-bootstrap dev-remote-test dev-remote-client dev-remote-clean
 .PHONY: rerank-eval rerank-eval-ablations rerank-benchmark
 
@@ -113,6 +113,15 @@ warm: ## prime ANN/search caches with a few queries
 
 health: ## run health checks for collection/model settings
 	docker compose run --rm --workdir /app --entrypoint python indexer -m scripts.health_check
+
+test: ## run default fast tests (excludes integration)
+	pytest
+
+test-full: ## run all tests including integration
+	pytest --run-integration -m ""
+
+test-integration: ## run integration tests only
+	pytest --run-integration -m integration
 
 
 # Check llama.cpp decoder health on localhost:8080 (200 OK expected)

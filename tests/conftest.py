@@ -15,6 +15,33 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("PATTERN_VECTORS", "1")
 
 
+_INTEGRATION_TEST_FILES = {
+    "test_collection_memory_backup_restore.py",
+    "test_integration_qdrant.py",
+    "test_subprocess_hybrid_smoke.py",
+    "test_tier2_fallback.py",
+}
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-integration",
+        action="store_true",
+        default=False,
+        help="collect tests that start real services such as Qdrant",
+    )
+
+
+def pytest_ignore_collect(collection_path, config):
+    if config.getoption("--run-integration", default=False):
+        return False
+    try:
+        name = Path(str(collection_path)).name
+    except Exception:
+        name = ""
+    return name in _INTEGRATION_TEST_FILES
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_mcp_imported():
     """Ensure mcp package is properly imported before any tests run.

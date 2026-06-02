@@ -6,7 +6,7 @@ The algorithm handles:
 - Position weighting (filename > directory)
 - Common token penalties
 """
-from scripts.rerank_recursive import (
+from scripts.rerank_recursive.utils import (
     _compute_fname_boost,
     _split_identifier,
     _normalize_token,

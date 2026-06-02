@@ -14,7 +14,18 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any  # type: ignore
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 from scripts.ingest.config import (
     ROOT_DIR,
@@ -1018,18 +1029,10 @@ def process_file_with_smart_reindexing(
     - Reusing existing embeddings/lexical vectors for unchanged chunks (by code content), and
     - Re-embedding only for changed chunks.
     """
-    # Allow test monkeypatching on ingest_code.* to be honored here.
-    # Must be done FIRST before any helper calls.
-    _ingest_mod = None
-    try:
-        import importlib
-        _ingest_mod = importlib.import_module("scripts.ingest_code")
-    except Exception:
-        _ingest_mod = None
-    _embed_batch = getattr(_ingest_mod, "embed_batch", embed_batch) if _ingest_mod else embed_batch
-    _upsert_points_fn = getattr(_ingest_mod, "upsert_points", upsert_points) if _ingest_mod else upsert_points
-    _delete_points_fn = getattr(_ingest_mod, "delete_points_by_path", delete_points_by_path) if _ingest_mod else delete_points_by_path
-    _should_process_pseudo = getattr(_ingest_mod, "should_process_pseudo_for_chunk", should_process_pseudo_for_chunk) if _ingest_mod else should_process_pseudo_for_chunk
+    _embed_batch = embed_batch
+    _upsert_points_fn = upsert_points
+    _delete_points_fn = delete_points_by_path
+    _should_process_pseudo = should_process_pseudo_for_chunk
 
     try:
         p = Path(str(file_path))

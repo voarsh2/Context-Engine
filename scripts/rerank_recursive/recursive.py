@@ -9,35 +9,28 @@ Implements TRM-style iterative refinement:
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Safe ONNX imports
-try:
-    import onnxruntime as ort
-    from tokenizers import Tokenizer
-    HAS_ONNX = True
-except ImportError:
-    ort = None
-    Tokenizer = None
-    HAS_ONNX = False
-
-from scripts.reranker import (
-    get_reranker_model as _get_reranker_model,
-    rerank_pairs as _rerank_pairs,
-    is_reranker_available as _is_reranker_available,
-)
-
+HAS_ONNX = False
 HAS_RERANKER_FACTORY = True
+_ONNX_RUNTIME: Optional[Tuple[Any, Any]] = None
 
-# Legacy: direct FastEmbed imports (fallback when factory unavailable)
-try:
-    from fastembed.rerank.cross_encoder import TextCrossEncoder
-    HAS_FASTEMBED_RERANK = True
-except ImportError:
-    TextCrossEncoder = None
-    HAS_FASTEMBED_RERANK = False
+
+def _get_onnx_runtime() -> Optional[Tuple[Any, Any]]:
+    global HAS_ONNX, _ONNX_RUNTIME
+    if _ONNX_RUNTIME is not None:
+        return _ONNX_RUNTIME
+    try:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+    except ImportError:
+        HAS_ONNX = False
+        return None
+    HAS_ONNX = True
+    _ONNX_RUNTIME = (ort, Tokenizer)
+    return _ONNX_RUNTIME
 
 from scripts.rerank_recursive.state import RefinementState
 from scripts.rerank_recursive.scorer import TinyScorer
@@ -353,8 +346,10 @@ class ONNXRecursiveReranker(RecursiveReranker):
     def _get_onnx_session(self):
         if self._session is not None:
             return self._session, self._tokenizer
-        if not HAS_ONNX or not self.onnx_path or not self.tokenizer_path:
+        runtime = _get_onnx_runtime()
+        if runtime is None or not self.onnx_path or not self.tokenizer_path:
             return None, None
+        ort, Tokenizer = runtime
         with self._onnx_lock:
             if self._session is not None:
                 return self._session, self._tokenizer
@@ -524,22 +519,22 @@ class FastEmbedRecursiveReranker(RecursiveReranker):
         """Get cached reranker model from factory."""
         if self._reranker_model is not None:
             return self._reranker_model
-        if not HAS_RERANKER_FACTORY or _get_reranker_model is None:
-            return None
         with self._model_lock:
             if self._reranker_model is not None:
                 return self._reranker_model
-            self._reranker_model = _get_reranker_model()
+            from scripts.reranker import get_reranker_model
+            self._reranker_model = get_reranker_model()
             return self._reranker_model
 
     def _factory_score(self, query: str, docs: List[str]) -> Optional[np.ndarray]:
         """Score documents using reranker factory."""
         model = self._get_model()
-        if model is None or _rerank_pairs is None:
+        if model is None:
             return None
         try:
+            from scripts.reranker import rerank_pairs
             pairs = [(query, doc) for doc in docs]
-            scores = _rerank_pairs(pairs, model=model)
+            scores = rerank_pairs(pairs, model=model)
             return np.array(scores, dtype=np.float32)
         except Exception:
             return None
@@ -882,14 +877,15 @@ def get_recursive_reranker(n_iterations: int = 3, **kwargs) -> RecursiveReranker
     Backwards compatible: existing ONNX configs continue to work.
     """
     # Priority 1: Use factory if RERANKER_MODEL is set
-    if HAS_RERANKER_FACTORY and _is_reranker_available is not None:
-        if _is_reranker_available():
+    if HAS_RERANKER_FACTORY:
+        from scripts.reranker import is_reranker_available
+        if is_reranker_available():
             return FastEmbedRecursiveReranker(n_iterations=n_iterations, **kwargs)
 
     # Priority 2: Legacy ONNX path (backwards compatibility)
     onnx_path = os.environ.get("RERANKER_ONNX_PATH", "")
     tokenizer_path = os.environ.get("RERANKER_TOKENIZER_PATH", "")
-    if HAS_ONNX and onnx_path and tokenizer_path:
+    if onnx_path and tokenizer_path and _get_onnx_runtime() is not None:
         return ONNXRecursiveReranker(n_iterations=n_iterations, **kwargs)
 
     # Priority 3: Base reranker (no neural scoring)

@@ -1,9 +1,7 @@
 import importlib
-import types
-import os
 import pytest
 
-srv = importlib.import_module("scripts.mcp_indexer_server")
+search_impl = importlib.import_module("scripts.mcp_impl.search")
 
 
 @pytest.mark.service
@@ -11,6 +9,7 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
     # Force rerank via env default when arg not provided
     monkeypatch.setenv("RERANKER_ENABLED", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "0")
     monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     # Floor 1500ms; client asks 200ms -> effective >= 1500ms -> 1.5s
@@ -18,7 +17,7 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
     # Fix default timeout for test determinism (CI may set a higher value)
     monkeypatch.setenv("RERANKER_TIMEOUT_MS", "200")
 
-    # Fake _run_async to capture calls
+    # Fake subprocess runner to capture hybrid + rerank calls without loading the MCP facade.
     calls = []
 
     async def fake_run(cmd, env=None, timeout=None):
@@ -41,11 +40,15 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
                 "code": 0,
             }
 
-    monkeypatch.setattr(srv, "_run_async", fake_run)
-
     # Call repo_search with no rerank_enabled arg to pick env default
-    res = srv.asyncio.get_event_loop().run_until_complete(
-        srv.repo_search(query="foo", limit=3, per_path=1)
+    res = search_impl.asyncio.get_event_loop().run_until_complete(
+        search_impl._repo_search_impl(
+            query="foo",
+            limit=3,
+            per_path=1,
+            run_async_fn=fake_run,
+            require_auth_session_fn=lambda session: session,
+        )
     )
 
     assert any(

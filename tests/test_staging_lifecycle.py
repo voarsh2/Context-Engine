@@ -497,6 +497,7 @@ def test_start_handles_spawn_failure_but_leaves_staging_state(staging_workspace:
 
 
 def test_admin_staging_endpoints_exercise_http_layer(monkeypatch: pytest.MonkeyPatch):
+    from scripts import indexing_admin
     from scripts import upload_service
 
     calls = {"start": 0, "activate": 0, "abort": 0}
@@ -518,11 +519,11 @@ def test_admin_staging_endpoints_exercise_http_layer(monkeypatch: pytest.MonkeyP
     def fake_abort(**kwargs):
         calls["abort"] += 1
 
-    monkeypatch.setattr(upload_service, "start_staging_rebuild", fake_start)
-    monkeypatch.setattr(upload_service, "activate_staging_rebuild", fake_activate)
-    monkeypatch.setattr(upload_service, "abort_staging_rebuild", fake_abort)
+    monkeypatch.setattr(indexing_admin, "start_staging_rebuild", fake_start)
+    monkeypatch.setattr(indexing_admin, "activate_staging_rebuild", fake_activate)
+    monkeypatch.setattr(indexing_admin, "abort_staging_rebuild", fake_abort)
     monkeypatch.setattr(
-        upload_service,
+        indexing_admin,
         "resolve_collection_root",
         lambda **kwargs: ("/fake/root", "repo1"),
     )
@@ -553,28 +554,34 @@ def test_admin_copy_endpoint_reports_graph_clone_in_redirect(monkeypatch: pytest
     monkeypatch.setattr(upload_service, "_require_admin_session", lambda request: {"user_id": "admin"})
     monkeypatch.setattr(upload_service, "WORK_DIR", "/fake/work")
     monkeypatch.setenv("WORK_DIR", "/fake/work")
-    monkeypatch.setattr(upload_service, "pooled_qdrant_client", None, raising=False)
 
     def fake_copy_collection_qdrant(**kwargs):
         assert kwargs.get("source") == "src"
         assert kwargs.get("target") == "dst"
         return "dst"
 
-    monkeypatch.setattr(upload_service, "copy_collection_qdrant", fake_copy_collection_qdrant)
-
     class _FakeQdrantClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
         def get_collection(self, collection_name: str):
             if collection_name == "dst_graph":
                 return {"name": collection_name}
             raise RuntimeError("not found")
 
-        def close(self):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
             return None
 
-    monkeypatch.setitem(sys.modules, "qdrant_client", types.SimpleNamespace(QdrantClient=_FakeQdrantClient))
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.collection_admin",
+        types.SimpleNamespace(copy_collection_qdrant=fake_copy_collection_qdrant),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.qdrant_client_manager",
+        types.SimpleNamespace(pooled_qdrant_client=lambda **kwargs: _FakeQdrantClient()),
+    )
 
     client = TestClient(upload_service.app)
     resp = client.post(

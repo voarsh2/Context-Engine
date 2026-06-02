@@ -790,8 +790,7 @@ async def _repo_search_impl(
                         rt = 0
                     if rt > eff_limit:
                         eff_limit = rt
-                # In-process path_glob/not_glob accept a single string; reduce list inputs safely
-                print(f"[debug] DEBUG_SEARCH_TIMING={os.environ.get('DEBUG_SEARCH_TIMING', 'not set')}", flush=True)
+                # In-process path_glob/not_glob accept list inputs.
                 items = await asyncio.to_thread(
                     lambda: run_hybrid_search(
                         queries=queries,
@@ -945,7 +944,7 @@ async def _repo_search_impl(
 
         if use_learning_rerank and json_lines:
             try:
-                from scripts.rerank_recursive import rerank_with_learning
+                from scripts.rerank_recursive.recursive import rerank_with_learning
 
                 rq = queries[0] if queries else ""
                 cand_objs = list(json_lines[: int(rerank_top_n)])

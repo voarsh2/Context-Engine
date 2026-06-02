@@ -11,9 +11,20 @@ import os
 import time
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any  # type: ignore
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 from scripts.ingest.config import (
     LEX_VECTOR_NAME,

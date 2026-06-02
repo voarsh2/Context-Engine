@@ -120,7 +120,7 @@ async def run_trm_benchmark(name: str = "default") -> TRMReport:
     """Run TRM/reranker benchmark."""
     try:
         from scripts.embedder import get_embedding_model
-        from scripts.rerank_recursive import rerank_with_learning
+        from scripts.rerank_recursive.recursive import rerank_with_learning
         from scripts.mcp_indexer_server import repo_search
     except ImportError as e:
         print(f"Import error: {e}")

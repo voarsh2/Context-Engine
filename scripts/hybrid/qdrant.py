@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Qdrant client and query logic extracted from hybrid_search.py.
 
@@ -25,11 +27,22 @@ import os
 import logging
 import threading
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, TYPE_CHECKING
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 logger = logging.getLogger("hybrid_qdrant")
 
@@ -247,8 +260,8 @@ def _ensure_collection(client, collection: str, dim: int, vec_name: str):
         _ENSURED_COLLECTIONS.add(cache_key)
         return
 
-    # Collection doesn't exist - only then call ensure_collection to create it
-    from scripts.ingest_code import ensure_collection as _ensure_collection_raw
+    # Collection doesn't exist - only then call the ingest Qdrant adapter to create it.
+    from scripts.ingest.qdrant import ensure_collection as _ensure_collection_raw
 
     _ensure_collection_raw(client, collection, dim, vec_name)
 

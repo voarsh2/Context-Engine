@@ -29,10 +29,10 @@ from scripts.embedder import get_embedding_model as _get_embedding_model
 
 _EMBEDDER_FACTORY = True
 
-from fastembed import TextEmbedding
+TextEmbedding = None
 
 # Type alias for embedding model (TextEmbedding or compatible)
-EmbeddingModel = TextEmbedding
+EmbeddingModel = Any
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -96,14 +96,12 @@ def get_embedding_model(model_name: Optional[str] = None) -> EmbeddingModel:
     if _EMBEDDER_FACTORY and _get_embedding_model is not None:
         return _get_embedding_model(model_name)
 
-    if TextEmbedding is None:
-        raise ImportError(
-            "No embedding backend available. Install fastembed or ensure "
-            "scripts.embedder is importable."
-        )
-
     name = model_name or MODEL_NAME
-    return TextEmbedding(model_name=name)
+    text_embedding_cls = TextEmbedding
+    if text_embedding_cls is None:
+        from fastembed import TextEmbedding as text_embedding_cls
+
+    return text_embedding_cls(model_name=name)
 
 
 # ---------------------------------------------------------------------------
