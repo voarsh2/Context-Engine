@@ -293,6 +293,31 @@ _FILTER_CACHE: Dict[int, Any] = {}
 _FILTER_CACHE_LOCK = threading.Lock()
 _FILTER_CACHE_MAX = 256
 
+def _compute_fname_boost(query: str, md: dict, boost_factor: float) -> float:
+    """Compute filename relevance boost based on query token matches in file path.
+
+    Args:
+        query: The search query text
+        md: Metadata dict containing at least a 'path' key
+        boost_factor: Maximum boost multiplier
+
+    Returns:
+        Boost score (0.0 if no match)
+    """
+    import re as _re
+    path = str(md.get("path") or "").lower()
+    q = query.lower()
+    q_toks = {t for t in _re.findall(r"[a-z0-9_]{3,}", q) if len(t) >= 3}
+    if not q_toks:
+        return 0.0
+    fname = path.rsplit("/", 1)[-1] if "/" in path else path
+    fname_base = _re.sub(r"\.[^.]+$", "", fname)
+    fname_toks = {t for t in _re.split(r"[_\-.]", fname_base) if t and len(t) >= 3}
+    match_count = len(q_toks & fname_toks)
+    if match_count >= 2:
+        return float(boost_factor) * match_count
+    return 0.0
+
 # Cached regex pattern compilation
 @lru_cache(maxsize=128)
 def _compile_regex(pattern: str, flags: int = 0):
@@ -1746,8 +1771,7 @@ def _run_hybrid_search_impl(
         # Filename boost: production-grade matching (handles snake/camel/kebab, acronyms, etc.)
         if FNAME_BOOST > 0.0 and path:
             try:
-                from scripts.rerank_recursive.utils import _compute_fname_boost as _compute_fname_boost  # type: ignore
-                fname_boost = float(_compute_fname_boost(_base_query, md, float(FNAME_BOOST)))
+                fname_boost = _compute_fname_boost(_base_query, md, float(FNAME_BOOST))
                 if fname_boost > 0:
                     rec["fname"] += fname_boost
                     rec["s"] += fname_boost

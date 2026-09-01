@@ -1576,7 +1576,6 @@ if __name__ == "__main__":
     logger.info(f"  Embedding Model: {os.environ.get('EMBEDDING_MODEL', 'BAAI/bge-base-en-v1.5')}")
     logger.info(f"  Embedding Provider: {os.environ.get('EMBEDDING_PROVIDER', 'fastembed')}")
     logger.info(f"  ReFRAG Decoder: {os.environ.get('REFRAG_DECODER', '1')}")
-    logger.info(f"  Rerank Learning: {os.environ.get('RERANK_LEARNING', '1')}")
     logger.info(f"  Semantic Chunks: {os.environ.get('INDEX_SEMANTIC_CHUNKS', '1')}")
     logger.info(f"  Micro Chunks: {os.environ.get('INDEX_MICRO_CHUNKS', '1')}")
     logger.info(f"  Micro Chunk Tokens: {os.environ.get('MICRO_CHUNK_TOKENS', '128')}")

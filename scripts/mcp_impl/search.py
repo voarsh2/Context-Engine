@@ -934,81 +934,8 @@ async def _repo_search_impl(
         "subprocess": 0,
         "timeout": 0,
         "error": 0,
-        "learning": 0,  # Learning-enabled recursive reranker
     }
     if rerank_enabled:
-        # Check for learning reranker mode (learns from ONNX teacher)
-        use_learning_rerank = str(
-            os.environ.get("RERANK_LEARNING", "")
-        ).strip().lower() in {"1", "true", "yes", "on"}
-
-        if use_learning_rerank and json_lines:
-            try:
-                from scripts.rerank_recursive.recursive import rerank_with_learning
-
-                rq = queries[0] if queries else ""
-                cand_objs = list(json_lines[: int(rerank_top_n)])
-
-                # Run learning-enabled reranking (collection-aware for weight isolation)
-                reranked = rerank_with_learning(
-                    query=rq,
-                    candidates=cand_objs,
-                    limit=int(rerank_return_m),
-                    n_iterations=int(os.environ.get("RERANK_LEARNING_ITERS", "3")),
-                    collection=collection or "default",
-                )
-
-                if reranked:
-                    # Format results for output
-                    tmp = []
-                    for obj in reranked:
-                        # Copy the list to avoid mutating the original object
-                        why_parts = list(obj.get("why", []))
-                        why_parts.append(f"refine:{obj.get('recursive_iterations', 0)}")
-                        why_parts.append(f"score:{float(obj.get('score', 0)):.3f}")
-
-                        # Build components with optional fname_boost
-                        components = (obj.get("components") or {}) | {
-                            "learning_score": float(obj.get("recursive_score", 0)),
-                            "refinement_iterations": int(obj.get("recursive_iterations", 0)),
-                        }
-                        if obj.get("fname_boost"):
-                            components["fname_boost"] = float(obj.get("fname_boost", 0))
-                            why_parts.append(f"fname:{float(obj.get('fname_boost', 0)):.2f}")
-
-                        # Extract benchmark IDs from payload for CoIR/CoSQA
-                        _payload = obj.get("payload") if isinstance(obj, dict) else None
-                        if not isinstance(_payload, dict):
-                            _payload = {}
-                        _doc_id = _payload.get("_id") or _payload.get("code_id") or _payload.get("id")
-                        _code_id = _payload.get("code_id")
-
-                        item = {
-                            "score": float(obj.get("score", 0)),
-                            "path": obj.get("path", ""),
-                            "symbol": obj.get("symbol", ""),
-                            "start_line": int(obj.get("start_line") or 0),
-                            "end_line": int(obj.get("end_line") or 0),
-                            "why": why_parts,
-                            "components": components,
-                            # Benchmark IDs (preserved through rerank)
-                            "doc_id": str(_doc_id) if _doc_id is not None else None,
-                            "code_id": str(_code_id) if _code_id is not None else None,
-                        }
-                        # Preserve dual-path metadata
-                        if obj.get("host_path"):
-                            item["host_path"] = obj["host_path"]
-                        if obj.get("container_path"):
-                            item["container_path"] = obj["container_path"]
-                        tmp.append(item)
-
-                    if tmp:
-                        results = tmp
-                        used_rerank = True
-                        rerank_counters["learning"] += 1
-            except Exception:
-                pass  # Fall through to standard reranking
-
         # Resolve in-process gating once and reuse
         use_rerank_inproc = str(
             os.environ.get("RERANK_IN_PROCESS", "")
