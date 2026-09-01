@@ -66,11 +66,9 @@ services:
       - RERANKER_MODEL=${RERANKER_MODEL:-}
       - RERANKER_ONNX_PATH=${RERANKER_ONNX_PATH:-}
       - RERANKER_TOKENIZER_PATH=${RERANKER_TOKENIZER_PATH:-}
-      # Learning reranker configuration
-      - RERANK_LEARNING=${RERANK_LEARNING:-1}
+      # Relevance feedback configuration
       - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
       - RERANK_EVENTS_DIR=/tmp/rerank_events
-      - RERANK_EVENTS_ENABLED=${RERANK_EVENTS_ENABLED:-1}
     ports:
       - "18000:18000"
       - "8000:8000"
@@ -148,17 +146,13 @@ services:
       - LEX_BIGRAM_WEIGHT=${LEX_BIGRAM_WEIGHT:-}
       - LEX_SPARSE_MODE=${LEX_SPARSE_MODE:-}
       - LEX_SPARSE_NAME=${LEX_SPARSE_NAME:-}
-      # Pattern vectors for structural code similarity
-      - PATTERN_VECTORS=${PATTERN_VECTORS:-}
       # Cross-encoder reranker configuration
       - RERANKER_MODEL=${RERANKER_MODEL:-}
       - RERANKER_ONNX_PATH=${RERANKER_ONNX_PATH:-}
       - RERANKER_TOKENIZER_PATH=${RERANKER_TOKENIZER_PATH:-}
-      # Learning reranker configuration
-      - RERANK_LEARNING=${RERANK_LEARNING:-1}
+      # Relevance feedback configuration
       - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
       - RERANK_EVENTS_DIR=/tmp/rerank_events
-      - RERANK_EVENTS_ENABLED=${RERANK_EVENTS_ENABLED:-1}
     ports:
       - "${FASTMCP_INDEXER_PORT:-8001}:8001"
       - "18001:18001"
@@ -170,14 +164,14 @@ services:
     networks:
       - dev-remote-network
 
-  # Learning reranker worker - processes training events in background
-  learning_worker:
+  # Relevance trainer - processes feedback events, updates per-collection weights
+  relevance_trainer:
     build:
       context: .
       dockerfile: Dockerfile.mcp-indexer
-    container_name: learning-worker-dev-remote
+    container_name: relevance-trainer-dev-remote
     user: "1000:1000"
-    command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.learning_reranker_worker --daemon"]
+    command: ["sh", "-c", "cd /app && exec python -m scripts.relevance_trainer --daemon"]
     depends_on:
       - qdrant
       - mcp_indexer
@@ -186,30 +180,13 @@ services:
     environment:
       - QDRANT_URL=${QDRANT_URL}
       - COLLECTION_NAME=${COLLECTION_NAME}
+      - RERANK_EVENTS_DIR=/tmp/rerank_events
+      - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
+      - RELEVANCE_TRAINER_POLL_INTERVAL=${RELEVANCE_TRAINER_POLL_INTERVAL:-30}
+      - RELEVANCE_TRAINER_MIN_EVENTS=${RELEVANCE_TRAINER_MIN_EVENTS:-10}
       - HF_HOME=/tmp/huggingface
       - HF_HUB_CACHE=/tmp/huggingface/hub
       - TRANSFORMERS_CACHE=/tmp/huggingface/transformers
-      - FASTEMBED_CACHE_PATH=/tmp/huggingface/fastembed
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}
-      # Cross-encoder reranker (used as teacher for learning)
-      - RERANKER_MODEL=${RERANKER_MODEL:-}
-      - RERANKER_ONNX_PATH=${RERANKER_ONNX_PATH:-}
-      - RERANKER_TOKENIZER_PATH=${RERANKER_TOKENIZER_PATH:-}
-      - RERANK_EVENTS_DIR=/tmp/rerank_events
-      - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
-      - RERANK_LEARNING_BATCH_SIZE=${RERANK_LEARNING_BATCH_SIZE:-32}
-      - RERANK_LEARNING_POLL_INTERVAL=${RERANK_LEARNING_POLL_INTERVAL:-30}
-      - RERANK_LEARNING_RATE=${RERANK_LEARNING_RATE:-0.001}
-      - RERANK_LLM_TEACHER=${RERANK_LLM_TEACHER:-0}
-      - RERANK_LLM_SAMPLE_RATE=${RERANK_LLM_SAMPLE_RATE:-1.0}
-      - GLM_API_KEY=${GLM_API_KEY:-}
-      - GLM_API_BASE=${GLM_API_BASE:-}
-      - GLM_MODEL=${GLM_MODEL:-}
-      - GLM_MODEL_FAST=${GLM_MODEL_FAST:-}
-      - REFRAG_RUNTIME=${REFRAG_RUNTIME:-glm}
-      - LLAMACPP_URL=${LLAMACPP_URL:-}
-      - RERANK_VICREG_WEIGHT=${RERANK_VICREG_WEIGHT:-0.1}
     volumes:
       - workspace_pvc:/work:rw
       - rerank_data:/tmp/rerank_weights:rw
@@ -267,11 +244,9 @@ services:
       - RERANKER_MODEL=${RERANKER_MODEL:-}
       - RERANKER_ONNX_PATH=${RERANKER_ONNX_PATH:-}
       - RERANKER_TOKENIZER_PATH=${RERANKER_TOKENIZER_PATH:-}
-      # Learning reranker configuration
-      - RERANK_LEARNING=${RERANK_LEARNING:-1}
+      # Relevance feedback configuration
       - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
       - RERANK_EVENTS_DIR=/tmp/rerank_events
-      - RERANK_EVENTS_ENABLED=${RERANK_EVENTS_ENABLED:-1}
     ports:
       - "${FASTMCP_HTTP_HEALTH_PORT:-18002}:18000"
       - "${FASTMCP_HTTP_PORT:-8002}:8000"
@@ -347,17 +322,13 @@ services:
       - LEX_BIGRAM_WEIGHT=${LEX_BIGRAM_WEIGHT:-}
       - LEX_SPARSE_MODE=${LEX_SPARSE_MODE:-}
       - LEX_SPARSE_NAME=${LEX_SPARSE_NAME:-}
-      # Pattern vectors for structural code similarity
-      - PATTERN_VECTORS=${PATTERN_VECTORS:-}
       # Cross-encoder reranker configuration
       - RERANKER_MODEL=${RERANKER_MODEL:-}
       - RERANKER_ONNX_PATH=${RERANKER_ONNX_PATH:-}
       - RERANKER_TOKENIZER_PATH=${RERANKER_TOKENIZER_PATH:-}
-      # Learning reranker configuration
-      - RERANK_LEARNING=${RERANK_LEARNING:-1}
+      # Relevance feedback configuration
       - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
       - RERANK_EVENTS_DIR=/tmp/rerank_events
-      - RERANK_EVENTS_ENABLED=${RERANK_EVENTS_ENABLED:-1}
     ports:
       - "${FASTMCP_INDEXER_HTTP_PORT:-8003}:8001"
       - "${FASTMCP_INDEXER_HTTP_HEALTH_PORT:-18003}:18001"
@@ -431,11 +402,11 @@ services:
       - LEX_BIGRAM_WEIGHT=${LEX_BIGRAM_WEIGHT:-}
       - LEX_SPARSE_MODE=${LEX_SPARSE_MODE:-}
       - LEX_SPARSE_NAME=${LEX_SPARSE_NAME:-}
-      # Pattern vectors for structural code similarity
-      - PATTERN_VECTORS=${PATTERN_VECTORS:-}
+      - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
     volumes:
       - workspace_pvc:/work:rw
       - codebase_pvc:/work/.codebase:rw
+      - rerank_data:/tmp/rerank_weights:rw
     entrypoint: ["sh", "-c", "mkdir -p /tmp/logs /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && /app/scripts/wait-for-qdrant.sh && cd /app && python -m scripts.ingest_code --root /work"]
     restart: "no"  # Run once on startup, do not restart after completion
     cpus: 2.0
@@ -492,11 +463,11 @@ services:
       - LEX_BIGRAM_WEIGHT=${LEX_BIGRAM_WEIGHT:-}
       - LEX_SPARSE_MODE=${LEX_SPARSE_MODE:-}
       - LEX_SPARSE_NAME=${LEX_SPARSE_NAME:-}
-      # Pattern vectors for structural code similarity
-      - PATTERN_VECTORS=${PATTERN_VECTORS:-}
+      - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
     volumes:
       - workspace_pvc:/work:rw
       - codebase_pvc:/work/.codebase:rw
+      - rerank_data:/tmp/rerank_weights:rw
     command: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.watch_index"]
     cpus: 2
     networks:
@@ -608,12 +579,14 @@ services:
       - LEX_BIGRAM_WEIGHT=${LEX_BIGRAM_WEIGHT:-}
       - LEX_SPARSE_MODE=${LEX_SPARSE_MODE:-}
       - LEX_SPARSE_NAME=${LEX_SPARSE_NAME:-}
+      - RERANKER_WEIGHTS_DIR=/tmp/rerank_weights
     ports:
       - "8004:8002"  # Map to different host port to avoid conflicts
       - "18004:18000"  # Health check port
     volumes:
       - workspace_pvc:/work:rw
       - codebase_pvc:/work/.codebase:rw
+      - rerank_data:/tmp/rerank_weights:rw
       - upload_temp:/tmp/uploads
     command: [
       "sh",
@@ -665,11 +638,11 @@ volumes:
   qdrant_storage_dev_remote:
     driver: local
 
-  # Learning reranker weights storage (shared between indexer and worker)
+  # Relevance feedback weights storage (shared between search/indexer/trainer)
   rerank_data:
     driver: local
 
-  # Learning reranker events storage (shared between indexer and worker)
+  # Relevance feedback events storage (shared between indexer/trainer)
   rerank_events:
     driver: local
 
