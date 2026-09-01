@@ -13,11 +13,10 @@ Complete environment variable reference for Context Engine.
 - [Query Optimization](#query-optimization)
 - [Watcher Settings](#watcher-settings)
 - [Reranker](#reranker)
-- [Learning Reranker](#learning-reranker)
+- [Relevance Feedback](#relevance-feedback)
 - [Decoder (llama.cpp / OpenAI / GLM / MiniMax)](#decoder-llamacpp--openai--glm--minimax)
 - [Git History & Commit Indexing](#git-history--commit-indexing)
 - [ReFRAG](#refrag)
-- [Pattern Search](#pattern-search)
 - [Lexical Vector Settings](#lexical-vector-settings)
 - [Ports](#ports)
 - [Search & Expansion](#search--expansion)
@@ -193,63 +192,31 @@ For custom models or explicit control, set both ONNX path and tokenizer:
 | EMBEDDING_WARMUP | Warm up embedding model on startup | 0 (disabled) |
 | RERANK_WARMUP | Warm up reranker model on startup | 0 (disabled) |
 
-## Learning Reranker
+## Relevance Feedback
 
-The learning reranker trains a lightweight neural network (TinyScorer) to improve search rankings over time. See [Architecture](ARCHITECTURE.md#5-learning-reranker-system) for details.
-
-**This feature is optional and enabled by default.** To disable:
-
-```bash
-# Disable learning scorer in search results
-RERANK_LEARNING=0
-
-# Disable event logging (no training data collected)
-RERANK_EVENTS_ENABLED=0
-
-# Or simply don't run the learning_worker container
-```
-
-### Enable/Disable
-
-| Name | Description | Default |
-|------|-------------|---------|
-| RERANK_LEARNING | Enable learning scorer in search results | 1 (enabled) |
-| RERANK_EVENTS_ENABLED | Enable event logging for training | 1 (enabled) |
-| RERANK_EVENTS_SAMPLE_RATE | Fraction of events to log (0.0-1.0) | 0.33 |
+The relevance feedback path records explicit agent/user ratings from
+`rate_search_results` and turns them into per-collection recall/boost metadata.
+It is not self-supervised learning and does not train on reranker scores.
 
 ### Weight Management
 
 | Name | Description | Default |
 |------|-------------|---------|
-| RERANKER_WEIGHTS_DIR | Directory for learned weight files | /tmp/rerank_weights |
-| RERANKER_WEIGHTS_RELOAD_INTERVAL | How often to check for new weights (seconds) | 60 |
-| RERANKER_MAX_CHECKPOINTS | Number of weight versions to retain | 5 |
-
-### Learning Rate
-
-| Name | Description | Default |
-|------|-------------|---------|
-| RERANKER_LR_DECAY_STEPS | Updates between learning rate decay | 1000 |
-| RERANKER_LR_DECAY_RATE | Decay multiplier (e.g., 0.95 = 5% reduction) | 0.95 |
-| RERANKER_MIN_LR | Minimum learning rate floor | 0.0001 |
+| RELEVANCE_BOOST_FACTOR | Max score boost for positively rated targets | 0.15 |
+| RELEVANCE_RECALL_MAX | Max positively rated targets to rehydrate per search | 3 |
+| RELEVANCE_GRAPH_RECALL_MAX | Max inverse-graph caller candidates per rated symbol | 3 |
+| RELEVANCE_GRAPH_RECALL_BOOST | Small seed boost for graph-recalled candidates | 0.01 |
+| RELEVANCE_SPLIT_MIN_OVERLAP | Minimum old-symbol token overlap for each split successor | 0.45 |
+| RELEVANCE_SPLIT_MIN_COVERAGE | Minimum combined old-symbol coverage before split inheritance | 0.75 |
+| RERANKER_WEIGHTS_DIR | Directory for feedback weight files | /tmp/rerank_weights |
+| RELEVANCE_TRAINER_MIN_EVENTS | Min feedback events before writing weights | 10 |
+| RELEVANCE_TRAINER_POLL_INTERVAL | Trainer daemon poll interval in seconds | 30 |
 
 ### Event Logging
 
 | Name | Description | Default |
 |------|-------------|---------|
-| RERANK_EVENTS_DIR | Directory for search event logs | /tmp/rerank_events |
-| RERANK_EVENTS_RETENTION_DAYS | Days to keep event files before cleanup | 7 |
-
-### Learning Worker
-
-| Name | Description | Default |
-|------|-------------|---------|
-| RERANK_LEARNING_BATCH_SIZE | Number of events per training batch | 32 |
-| RERANK_LEARNING_POLL_INTERVAL | Seconds between checking for new events | 30 |
-| RERANK_LEARNING_RATE | Initial learning rate for TinyScorer | 0.001 |
-| RERANK_LLM_TEACHER | Enable LLM-teacher guided learning | 1 (enabled) |
-| RERANK_LLM_SAMPLE_RATE | Fraction of queries to evaluate with LLM teacher | 1.0 |
-| RERANK_VICREG_WEIGHT | Weight for VICReg consistency loss | 0.1 |
+| RERANK_EVENTS_DIR | Directory for feedback event logs | /tmp/rerank_events |
 
 ## Decoder (llama.cpp / OpenAI / GLM / MiniMax)
 
@@ -370,24 +337,6 @@ Compact 64-dim vectors for fast candidate filtering before full dense search.
 | MINI_VEC_DIM | Dimension of mini vectors | 64 |
 | MINI_VEC_SEED | Random projection seed (for reproducibility) | 1337 |
 | HYBRID_MINI_WEIGHT | Weight of mini vectors in hybrid scoring | 0.5 |
-
-## Pattern Search
-
-Structural code pattern matching across languages. Disabled by default.
-
-| Name | Description | Default |
-|------|-------------|---------|
-| PATTERN_VECTORS | Enable pattern_search tool and pattern vector indexing | 0 (disabled) |
-
-**Enable:**
-```bash
-# In .env or docker-compose
-PATTERN_VECTORS=1
-```
-
-When enabled, the indexer extracts control-flow signatures (loops, branches, try/except, etc.) and stores them as pattern vectors. The `pattern_search` MCP tool allows finding structurally similar code across languages—e.g., a Python retry loop can match Go/Rust equivalents.
-
-**Note:** Enabling requires reindexing to generate pattern vectors for existing files.
 
 ## Lexical Vector Settings
 
