@@ -2387,6 +2387,8 @@ def _run_hybrid_search_impl(
         _imports = md.get("imports") or []
         _calls = md.get("calls") or []
         _symp = md.get("symbol_path") or md.get("symbol") or ""
+        _kind = str(md.get("kind") or "")
+        _repo_name = str(md.get("repo") or "")
         _pp = str(md.get("path_prefix") or "")
         _path = str(md.get("path") or "")
         _related_set = set()
@@ -2485,6 +2487,18 @@ def _run_hybrid_search_impl(
         _tags = _payload.get("tags")
         if _tags is None:
             _tags = _metadata.get("tags")
+        _file_hash = str(
+            _payload.get("file_hash")
+            or _metadata.get("file_hash")
+            or _payload.get("content_hash")
+            or _metadata.get("content_hash")
+            or ""
+        )
+        _symbol_content_hash = str(
+            _payload.get("symbol_content_hash")
+            or _metadata.get("symbol_content_hash")
+            or ""
+        )
         # Skip memory-like points without a real file path
         if not _path or not _path.strip():
             if os.environ.get("DEBUG_HYBRID_FILTER"):
@@ -2551,6 +2565,8 @@ def _run_hybrid_search_impl(
             "host_path": _host,
             "container_path": _cont,
             "symbol": _symp,
+            "kind": _kind,
+            "repo": _repo_name,
             "start_line": start_line,
             "end_line": end_line,
             "components": comp,
@@ -2561,6 +2577,8 @@ def _run_hybrid_search_impl(
             "text": _text,
             "pseudo": _pseudo,
             "tags": _tags,
+            "file_hash": _file_hash,
+            "symbol_content_hash": _symbol_content_hash,
         }
         if why is not None:
             item["why"] = why

@@ -27,13 +27,11 @@ from qdrant_client import QdrantClient, models
 # Import production pipeline components
 from scripts.ingest.chunking import chunk_by_tokens, chunk_lines, chunk_semantic
 from scripts.ingest.pipeline import build_information, _select_dense_text
-from scripts.ingest.vectors import project_mini, extract_pattern_vector
+from scripts.ingest.vectors import project_mini
 from scripts.ingest.qdrant import (
     hash_id,
     embed_batch,
     get_collection_vector_names,
-    PATTERN_VECTOR_NAME,
-    PATTERN_VECTOR_DIM,
     upsert_points as _upsert_points_with_retry,
 )
 from scripts.utils import (
@@ -292,12 +290,6 @@ def create_collection(
     if refrag_on:
         vectors_config[MINI_VECTOR_NAME] = models.VectorParams(
             size=MINI_VEC_DIM, distance=models.Distance.COSINE
-        )
-
-    pattern_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-    if pattern_on:
-        vectors_config[PATTERN_VECTOR_NAME] = models.VectorParams(
-            size=PATTERN_VECTOR_DIM, distance=models.Distance.COSINE
         )
 
     sparse_cfg = None
@@ -637,13 +629,6 @@ def index_benchmark_corpus(
             except Exception:
                 pass
 
-        if PATTERN_VECTOR_NAME in available_vectors:
-            try:
-                pattern_vec = extract_pattern_vector(cm.chunk_text, cm.language)
-                if pattern_vec:
-                    vectors_dict[PATTERN_VECTOR_NAME] = pattern_vec
-            except Exception:
-                pass
 
         sparse_dict = None
         if LEX_SPARSE_MODE and LEX_SPARSE_NAME in (available_vectors.get("sparse") or set()):

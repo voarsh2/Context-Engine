@@ -95,35 +95,3 @@ def _lex_hash_vector(text: str, dim: int = LEX_VECTOR_DIM) -> list[float]:
     norm = math.sqrt(sum(v * v for v in vec)) or 1.0
     return [v / norm for v in vec]
 
-
-# ---------------------------------------------------------------------------
-# Pattern vector extraction (structural similarity)
-# ---------------------------------------------------------------------------
-_PATTERN_EXTRACTOR = None
-_PATTERN_ENCODER = None
-
-
-def _get_pattern_tools():
-    """Lazy load pattern extraction tools."""
-    global _PATTERN_EXTRACTOR, _PATTERN_ENCODER
-    if _PATTERN_EXTRACTOR is None:
-        from scripts.pattern_detection import PatternExtractor, PatternEncoder
-
-        _PATTERN_EXTRACTOR = PatternExtractor()
-        _PATTERN_ENCODER = PatternEncoder()
-    return _PATTERN_EXTRACTOR, _PATTERN_ENCODER
-
-
-def extract_pattern_vector(code: str, language: str) -> list[float] | None:
-    """Extract structural pattern vector from code.
-
-    Returns 64-dim pattern vector or None if pattern detection unavailable.
-    """
-    extractor, encoder = _get_pattern_tools()
-    if extractor is None or encoder is None:
-        return None
-    try:
-        signature = extractor.extract(code, language)
-        return encoder.encode(signature)
-    except Exception:
-        return None

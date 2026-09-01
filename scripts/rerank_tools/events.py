@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Event log configuration
-RERANK_EVENTS_DIR = os.environ.get("RERANK_EVENTS_DIR", "/tmp/rerank_events")
+def _get_events_dir() -> Path:
+    return Path(os.environ.get("RERANK_EVENTS_DIR", "/tmp/rerank_events"))
 RERANK_EVENTS_ENABLED = str(os.environ.get("RERANK_EVENTS_ENABLED", "1")).strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -49,7 +50,7 @@ def _get_write_lock(file_key: str) -> threading.Lock:
 
 def _ensure_events_dir() -> Path:
     """Ensure events directory exists."""
-    events_dir = Path(RERANK_EVENTS_DIR)
+    events_dir = _get_events_dir()
     events_dir.mkdir(parents=True, exist_ok=True)
     return events_dir
 

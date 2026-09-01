@@ -122,7 +122,7 @@ from scripts.mcp_impl.toon import (
 # Import implementations from extracted modules
 from scripts.mcp_impl.context_search import _context_search_impl
 from scripts.mcp_impl.query_expand import _expand_query_impl
-from scripts.mcp_impl.search import _repo_search_impl
+from scripts.mcp_impl.search import _repo_search_impl, enrich_feedback_rating
 from scripts.mcp_impl.admin_tools import _collection_map_impl
 from scripts.mcp_impl.search_history import (
     _search_commits_for_impl,
@@ -132,7 +132,6 @@ from scripts.mcp_impl.symbol_graph import (
     _symbol_graph_impl,
     _format_symbol_graph_toon,
 )
-from scripts.mcp_impl.pattern_search import _pattern_search_impl
 
 # Global lock to guard temporary env toggles used during ReFRAG retrieval/decoding
 _ENV_LOCK = threading.Lock()
@@ -1478,80 +1477,144 @@ async def expand_query(
     return await _expand_query_impl(query=query, max_new=max_new, session=session)
 
 
-# ---------------------------------------------------------------------------
-# Pattern Search - Structural code similarity (conditional on PATTERN_VECTORS=1)
-# ---------------------------------------------------------------------------
-_PATTERN_SEARCH_ENABLED = str(os.environ.get("PATTERN_VECTORS", "")).strip().lower() in {
-    "1", "true", "yes", "on"
-}
+@mcp.tool()
+async def rate_search_results(
+    query: str,
+    ratings: list,
+    collection: Optional[str] = None,
+    session: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Provide relevance feedback on search results to improve future rankings.
 
-if _PATTERN_SEARCH_ENABLED:
-    @mcp.tool()
-    async def pattern_search(
-        query: Any = None,
-        language: Any = None,
-        limit: Any = None,
-        min_score: Any = None,
-        include_snippet: Any = None,
-        context_lines: Any = None,
-        target_languages: Any = None,
-        output_format: Any = None,
-        compact: Any = None,
-        aroma_rerank: Any = None,
-        aroma_alpha: Any = None,
-        query_mode: Any = None,
-    ) -> Dict[str, Any]:
-        """Find structurally similar code patterns across all languages.
+    Call this after using repo_search to tell the system which results were useful.
+    The system learns per-collection ranking weights from your feedback.
 
-        Accepts EITHER code examples OR natural language descriptions - auto-detects which.
+    Parameters:
+    - query: str. The original search query these ratings apply to.
+    - ratings: list of {result_id, relevance}. Each entry rates one search result.
+        - result_id: str. The result_id from a repo_search result entry.
+        - relevance: int. 0=not used, 1=glanced/relevant, 2=directly used/excellent match.
+        - target_id, impression_id, path, container_path, symbol, kind, repo, file_hash:
+          optional. Usually omitted; the server fills them from recent repo_search results.
+        - related_symbols: list[str] (optional). Logged for future graph experiments; not used by the current trainer.
+    - collection: str (optional). Target collection; defaults to workspace state.
+    - session: str (optional). Auth session token.
 
-        When to use:
-        - Find code with similar control flow (retry loops, error handling, etc.)
-        - Cross-language pattern matching (Python pattern → Go/Rust/Java matches)
-        - Detect code duplication based on structure, not syntax
-        - Search by pattern description ("retry with backoff", "resource cleanup")
+    Returns:
+    - {ok: true, rated: N} on success
+    - {ok: false, error: "..."} on failure
 
-        Key parameters:
-        - query: str. Code snippet OR natural language description of pattern.
-        - query_mode: str. "code", "description", or "auto" (default). Explicit override for detection.
-        - language: str. Language hint for code examples (also triggers code mode in auto).
-        - limit: int (default 10). Maximum results to return.
-        - min_score: float (default 0.3). Minimum similarity score threshold.
-        - include_snippet: bool (default false). Include code snippets in results.
-        - target_languages: list[str]. Filter to specific target languages.
-        - output_format: "json" (default) or "toon" for token-efficient format.
-        - compact: bool. If true with TOON, use minimal fields.
-        - aroma_rerank: bool (default true). Enable AROMA-style pruning and reranking.
-        - aroma_alpha: float (default 0.6). Weight for pruned similarity vs original score.
-
-        Returns:
-        - {ok, results: [{path, start_line, end_line, score, language, ...}], total, query_signature}
-
-        Examples:
-        - pattern_search(query="for i in range(3): try: ... except: time.sleep(2**i)")
-        - pattern_search(query="retry with exponential backoff", query_mode="description")
-        - pattern_search(query="if err != nil { return err }", language="go")
-        """
-        return await _pattern_search_impl(
-            query=query,
-            language=language,
-            limit=limit,
-            min_score=min_score,
-            include_snippet=include_snippet,
-            context_lines=context_lines,
-            hybrid=None,
-            semantic_weight=None,
-            collection=None,
-            target_languages=target_languages,
-            output_format=output_format,
-            compact=compact,
-            aroma_rerank=aroma_rerank,
-            aroma_alpha=aroma_alpha,
-            query_mode=query_mode,
-            coerce_bool_fn=_coerce_bool,
-            coerce_int_fn=_coerce_int,
-            coerce_float_fn=lambda v, d: safe_float(v, default=d, logger=logger, context="pattern_search"),
+    Example:
+        repo_search returns result_id "abc123"
+        rate_search_results(
+            query="process events",
+            ratings=[{
+                "result_id": "abc123",
+                "relevance": 2
+            }]
         )
+        → rates abc123 at 2 for this collection's future searches.
+    """
+    import json as _json
+    import time as _time
+
+    sess = _require_auth_session(session)
+
+    if not query or not str(query).strip():
+        return {"ok": False, "error": "query is required"}
+
+    if not ratings or not isinstance(ratings, list):
+        return {"ok": False, "error": "ratings must be a non-empty list"}
+
+    try:
+        _c = (collection or "").strip()
+    except Exception:
+        _c = ""
+    if _c:
+        coll = _c
+    else:
+        try:
+            from scripts.workspace_state import (
+                get_collection_name as _ws_get_collection_name,
+                is_multi_repo_mode as _ws_is_multi_repo_mode,
+            )
+            if _ws_is_multi_repo_mode():
+                coll = _default_collection()
+            else:
+                coll = _ws_get_collection_name(None) or _default_collection()
+        except Exception:
+            coll = _default_collection()
+
+    _require_collection_access((sess or {}).get("user_id") if sess else None, coll, "write")
+
+    validated_ratings = []
+    for r in ratings:
+        if not isinstance(r, dict):
+            continue
+        r = enrich_feedback_rating(r, coll)
+        result_id = str(r.get("result_id", "")).strip()
+        relevance = r.get("relevance")
+        if not result_id or relevance is None:
+            continue
+        try:
+            relevance = int(relevance)
+        except (ValueError, TypeError):
+            continue
+        if relevance not in (0, 1, 2):
+            continue
+        entry = {"result_id": result_id, "relevance": relevance}
+        for key in (
+            "target_id",
+            "impression_id",
+            "path",
+            "host_path",
+            "container_path",
+            "symbol",
+            "kind",
+            "repo",
+            "file_hash",
+            "symbol_content_hash",
+        ):
+            val = r.get(key)
+            if val is not None and str(val).strip():
+                entry[key] = str(val).strip()
+        related = r.get("related_symbols")
+        if isinstance(related, list) and len(related) > 0:
+            entry["related_symbols"] = [str(s) for s in related[:10]]
+        validated_ratings.append(entry)
+
+    if not validated_ratings:
+        return {"ok": False, "error": "no valid ratings provided"}
+
+    try:
+        from scripts.rerank_tools.events import _ensure_events_dir, _get_write_lock
+        from datetime import datetime as _datetime
+
+        events_dir = _ensure_events_dir()
+        safe_coll = "".join(c if c.isalnum() or c in "-_" else "_" for c in coll)
+        hour_suffix = _datetime.now(tz=None).strftime("%Y%m%d%H")
+        events_file = events_dir / f"events_{safe_coll}_{hour_suffix}.ndjson"
+
+        event = {
+            "ts": _time.time(),
+            "type": "relevance_feedback",
+            "query": str(query).strip(),
+            "collection": coll,
+            "ratings": validated_ratings,
+            "source": "mcp_tool",
+        }
+        if sess:
+            event["session_user"] = (sess or {}).get("user_id", "anonymous")
+
+        file_key = str(events_file)
+        lock = _get_write_lock(file_key)
+        with lock:
+            with open(events_file, "a") as f:
+                f.write(_json.dumps(event) + "\n")
+
+        return {"ok": True, "rated": len(validated_ratings), "collection": coll}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to log feedback: {e}"}
 
 
 _relax_var_kwarg_defaults()
@@ -1591,7 +1654,7 @@ if __name__ == "__main__":
     logger.info(f"  Reranker Enabled: {os.environ.get('RERANKER_ENABLED', '0')}")
     logger.info(f"  Rerank Top N: {os.environ.get('RERANK_TOP_N', '20')}")
     logger.info(f"  Rerank Timeout MS: {os.environ.get('RERANK_TIMEOUT_MS', '500')}")
-    logger.info(f"  Pattern Search: {'enabled' if _PATTERN_SEARCH_ENABLED else 'disabled (set PATTERN_VECTORS=1)'}")
+    logger.info(f"  TOON Enabled: {os.environ.get('TOON_ENABLED', '0')}")
     logger.info("=" * 60)
 
     # Optional warmups: gated by env flags to avoid delaying readiness on fresh containers

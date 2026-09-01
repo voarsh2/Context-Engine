@@ -50,8 +50,7 @@ class CollectionNeedsRecreateError(Exception):
     pass
 
 
-PATTERN_VECTOR_NAME = "pattern_vector"
-PATTERN_VECTOR_DIM = 64  # Structural pattern embedding dimension
+
 
 PAYLOAD_INDEX_FIELDS = (
     "metadata.language",
@@ -139,11 +138,7 @@ def _desired_vector_configs(
     except Exception:
         pass
     try:
-        if os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            vectors_cfg[PATTERN_VECTOR_NAME] = models.VectorParams(
-                size=PATTERN_VECTOR_DIM,
-                distance=models.Distance.COSINE,
-            )
+        pass  # pattern vectors removed
     except Exception:
         pass
 
@@ -378,22 +373,6 @@ def ensure_collection(
                         distance=models.Distance.COSINE,
                     )
 
-                # Check for pattern vector
-                try:
-                    pattern_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {
-                        "1", "true", "yes", "on",
-                    }
-                    has_pattern = PATTERN_VECTOR_NAME in cfg
-                except Exception:
-                    pattern_on = False
-                    has_pattern = False
-
-                if pattern_on and not has_pattern:
-                    missing[PATTERN_VECTOR_NAME] = models.VectorParams(
-                        size=PATTERN_VECTOR_DIM,
-                        distance=models.Distance.COSINE,
-                    )
-
                 if missing:
                     try:
                         update_cfg = _prepare_vector_update_config(missing)
@@ -429,11 +408,7 @@ def ensure_collection(
     except Exception:
         pass
     try:
-        if os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            vectors_cfg[PATTERN_VECTOR_NAME] = models.VectorParams(
-                size=PATTERN_VECTOR_DIM,
-                distance=models.Distance.COSINE,
-            )
+        pass  # pattern vectors removed
     except Exception:
         pass
 
@@ -569,11 +544,7 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
     except Exception:
         pass
     try:
-        if os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            vectors_cfg[PATTERN_VECTOR_NAME] = models.VectorParams(
-                size=PATTERN_VECTOR_DIM,
-                distance=models.Distance.COSINE,
-            )
+        pass  # pattern vectors removed
     except Exception:
         pass
     sparse_cfg = None

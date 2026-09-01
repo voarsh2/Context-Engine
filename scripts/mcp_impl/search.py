@@ -14,6 +14,7 @@ from __future__ import annotations
 
 __all__ = [
     "_repo_search_impl",
+    "enrich_feedback_rating",
 ]
 
 import json
@@ -23,6 +24,7 @@ import logging
 import asyncio
 import subprocess
 import hashlib
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,7 @@ from scripts.mcp_auth import require_collection_access as _require_collection_ac
 from scripts.path_scope import (
     normalize_under as _normalize_under_scope,
 )
+from scripts.relevance_feedback import enrich_recent_rating, remember_recent_results
 
 # Constants
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -55,6 +58,23 @@ SNIPPET_MAX_BYTES = safe_int(
     default=8192,
     logger=logger,
     context="MCP_SNIPPET_MAX_BYTES",
+)
+
+_RECENT_RESULT_META: dict[str, tuple[float, dict]] = {}
+_RECENT_RESULT_META_TTL = 3600
+_RECENT_RESULT_META_MAX = 4096
+_RECENT_RESULT_META_KEYS = (
+    "result_id",
+    "target_id",
+    "impression_id",
+    "path",
+    "host_path",
+    "container_path",
+    "symbol",
+    "kind",
+    "repo",
+    "file_hash",
+    "symbol_content_hash",
 )
 
 
@@ -70,6 +90,15 @@ _DEBUG_RESULT_FIELDS = {
     "related_paths",  # Optional related file paths
     "budget_tokens_used",  # Internal token accounting
     "fname_boost",  # Internal boost value (already applied to score)
+    "relevance_boost",  # Internal feedback boost value (already applied to score)
+    "feedback_prior",  # Internal feedback metadata
+    "feedback_recall",  # Internal feedback recall marker
+    "feedback_graph_recall",  # Internal graph recall marker
+    "feedback_weight_id",  # Internal source weight identity after reconciliation
+    "pseudo",  # Internal retrieval enrichment; debug-only by default
+    "tags",  # Internal retrieval enrichment; debug-only by default
+    "file_hash",  # Internal feedback/reindex metadata
+    "symbol_content_hash",  # Internal feedback/reindex metadata
     "host_path",  # Internal dual-path (host side) - use path/client_path instead
     "container_path",  # Internal dual-path (container side) - use path/client_path instead
 }
@@ -96,6 +125,414 @@ def _strip_debug_fields(item: dict, keep_paths: bool = True) -> dict:
         strip_fields = _DEBUG_RESULT_FIELDS - {"host_path", "container_path"}
     result = {k: v for k, v in item.items() if k not in strip_fields}
     return result
+
+
+def _result_content_hash(result: dict) -> str:
+    """Best-effort indexed content hash for feedback identity."""
+    if not isinstance(result, dict):
+        return ""
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    return str(
+        result.get("file_hash")
+        or result.get("content_hash")
+        or payload.get("file_hash")
+        or payload.get("content_hash")
+        or metadata.get("file_hash")
+        or metadata.get("content_hash")
+        or ""
+    )
+
+
+def _result_target_key(result: dict) -> str:
+    """Stable feedback target: prefer repo+symbol identity, fall back to file."""
+    if not isinstance(result, dict):
+        return ""
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    relations = result.get("relations") if isinstance(result.get("relations"), dict) else {}
+
+    repo = str(
+        result.get("repo")
+        or metadata.get("repo")
+        or payload.get("repo")
+        or ""
+    ).strip()
+    kind = str(
+        result.get("kind")
+        or metadata.get("kind")
+        or payload.get("kind")
+        or ""
+    ).strip()
+    symbol_path = str(
+        result.get("symbol_path")
+        or relations.get("symbol_path")
+        or metadata.get("symbol_path")
+        or payload.get("symbol_path")
+        or result.get("symbol")
+        or metadata.get("symbol")
+        or payload.get("symbol")
+        or ""
+    ).strip()
+    path = str(
+        result.get("container_path")
+        or metadata.get("container_path")
+        or result.get("path")
+        or metadata.get("path")
+        or payload.get("path")
+        or ""
+    ).strip()
+
+    if repo and symbol_path:
+        return f"symbol\x00{repo}\x00{kind}\x00{symbol_path}"
+    if symbol_path:
+        return f"symbol\x00{kind}\x00{symbol_path}"
+    if repo and path:
+        return f"file\x00{repo}\x00{path}"
+    if path:
+        return f"file\x00{path}"
+    return ""
+
+
+def _inject_result_ids(results: list[dict], canonical_query: str) -> None:
+    """Attach stable target IDs plus query/content-specific impression IDs."""
+    for r in results:
+        _path = str(r.get("path") or "")
+        _start = int(r.get("start_line") or 0)
+        _end = int(r.get("end_line") or 0)
+        _content_hash = _result_content_hash(r)
+        _target_key = _result_target_key(r)
+        if not _target_key:
+            _target_key = f"span\x00{_path}\x00{_start}\x00{_end}"
+        _impression_key = f"{canonical_query}\x00{_target_key}\x00{_path}\x00{_start}\x00{_end}\x00{_content_hash}"
+        _target_id = hashlib.sha256(_target_key.encode("utf-8")).hexdigest()[:12]
+        r["target_id"] = _target_id
+        r["result_id"] = _target_id
+        r["impression_id"] = hashlib.sha256(_impression_key.encode("utf-8")).hexdigest()[:12]
+
+
+def _remember_result_metadata(results: list[dict], collection: str = "") -> None:
+    """Keep recent metadata in process and shared storage for hands-off rating."""
+    now = time.time()
+    expired_before = now - _RECENT_RESULT_META_TTL
+    for key, (ts, _) in list(_RECENT_RESULT_META.items()):
+        if ts < expired_before:
+            _RECENT_RESULT_META.pop(key, None)
+    for result in results:
+        rid = str(result.get("result_id") or "").strip()
+        if not rid:
+            continue
+        meta = {}
+        for key in _RECENT_RESULT_META_KEYS:
+            val = result.get(key)
+            if val is not None and str(val).strip():
+                meta[key] = str(val).strip()
+        if meta:
+            _RECENT_RESULT_META[rid] = (now, meta)
+    while len(_RECENT_RESULT_META) > _RECENT_RESULT_META_MAX:
+        try:
+            oldest = min(_RECENT_RESULT_META.items(), key=lambda kv: kv[1][0])[0]
+            _RECENT_RESULT_META.pop(oldest, None)
+        except Exception:
+            break
+    remember_recent_results(collection, results)
+
+
+def enrich_feedback_rating(rating: dict, collection: str = "") -> dict:
+    """Fill rating metadata from shared or in-process recent search results."""
+    if not isinstance(rating, dict):
+        return {}
+    out = enrich_recent_rating(collection, rating)
+    rid = str(out.get("result_id") or "").strip()
+    if not rid:
+        return out
+    cached = _RECENT_RESULT_META.get(rid)
+    if not cached:
+        return out
+    _, meta = cached
+    for key, val in meta.items():
+        out.setdefault(key, val)
+    return out
+
+
+def _load_relevance_weights(collection: str) -> dict:
+    try:
+        from pathlib import Path as _Path
+        weights_file = _Path(os.environ.get("RERANKER_WEIGHTS_DIR", "/tmp/rerank_weights"))
+        weights_file = weights_file / f"{collection}_relevance.json"
+        if weights_file.exists():
+            with open(weights_file, "r") as f:
+                return json.loads(f.read())
+    except Exception:
+        pass
+    return {}
+
+
+def _feedback_symbol_variants(symbol: str) -> list[str]:
+    """Small symbol variant set for graph-edge callee lookups."""
+    s = str(symbol or "").strip()
+    if not s:
+        return []
+    variants = [s]
+    if "." in s:
+        base = s.split(".")[-1].strip()
+        if base:
+            variants.append(base)
+    out = []
+    seen = set()
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _point_to_feedback_item(point: Any, *, score: float, source: str, prior: dict | None = None) -> dict:
+    payload = getattr(point, "payload", None) or {}
+    md = payload.get("metadata") or {}
+    return {
+        "score": float(score),
+        "path": str(md.get("host_path") or md.get("path") or ""),
+        "host_path": str(md.get("host_path") or ""),
+        "container_path": str(md.get("container_path") or md.get("path") or ""),
+        "symbol": str(md.get("symbol_path") or md.get("symbol") or ""),
+        "kind": str(md.get("kind") or ""),
+        "repo": str(md.get("repo") or ""),
+        "start_line": int(md.get("start_line") or 0),
+        "end_line": int(md.get("end_line") or 0),
+        "relations": {
+            "imports": md.get("imports") or [],
+            "calls": md.get("calls") or [],
+            "symbol_path": str(md.get("symbol_path") or md.get("symbol") or ""),
+        },
+        "file_hash": str(md.get("file_hash") or ""),
+        "symbol_content_hash": str(md.get("symbol_content_hash") or ""),
+        source: True,
+        "feedback_prior": prior or {},
+    }
+
+
+def _scroll_main_point(
+    client: Any,
+    qmodels: Any,
+    *,
+    collection: str,
+    repo: str,
+    symbol: str = "",
+    symbol_content_hash: str = "",
+    kind: str = "",
+    path: str = "",
+) -> Any | None:
+    must = []
+    if repo:
+        must.append(qmodels.FieldCondition(key="metadata.repo", match=qmodels.MatchValue(value=repo)))
+    if symbol:
+        must.append(qmodels.FieldCondition(key="metadata.symbol_path", match=qmodels.MatchValue(value=symbol)))
+    elif path:
+        must.append(qmodels.FieldCondition(key="metadata.path", match=qmodels.MatchValue(value=path)))
+    else:
+        return None
+    if kind:
+        must.append(qmodels.FieldCondition(key="metadata.kind", match=qmodels.MatchValue(value=kind)))
+    try:
+        points, _ = client.scroll(
+            collection_name=collection,
+            scroll_filter=qmodels.Filter(must=must),
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )
+        if points:
+            return points[0]
+    except Exception:
+        pass
+    if not symbol_content_hash:
+        return None
+    hash_must = []
+    if repo:
+        hash_must.append(
+            qmodels.FieldCondition(key="metadata.repo", match=qmodels.MatchValue(value=repo))
+        )
+    if kind:
+        hash_must.append(
+            qmodels.FieldCondition(key="metadata.kind", match=qmodels.MatchValue(value=kind))
+        )
+    hash_must.append(
+        qmodels.FieldCondition(
+            key="metadata.symbol_content_hash",
+            match=qmodels.MatchValue(value=symbol_content_hash),
+        )
+    )
+    try:
+        points, _ = client.scroll(
+            collection_name=collection,
+            scroll_filter=qmodels.Filter(must=hash_must),
+            limit=2,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return points[0] if len(points or []) == 1 else None
+    except Exception:
+        return None
+
+
+def _feedback_recall_candidates(
+    *,
+    collection: str,
+    weights: dict,
+    existing_target_ids: set[str],
+    existing_paths: set[str],
+    base_score: float,
+    max_candidates: int,
+) -> list[dict]:
+    """Rehydrate positively rated targets and inverse-graph adjacent callers."""
+    if max_candidates <= 0:
+        return []
+    result_weights = weights.get("results") if isinstance(weights, dict) else {}
+    if not isinstance(result_weights, dict):
+        return []
+
+    ranked = []
+    for rid, info in result_weights.items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("superseded_by"):
+            continue
+        avg = float(info.get("avg_relevance", 0) or 0)
+        count = int(info.get("count", 0) or 0)
+        inheritance = float(info.get("inheritance_weight", 1.0) or 0)
+        target = info.get("target") if isinstance(info.get("target"), dict) else {}
+        if avg <= 0 or count <= 0 or inheritance <= 0 or not target:
+            continue
+        ranked.append((avg * inheritance, count, str(rid), target))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if not ranked:
+        return []
+
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client import models as qmodels
+    except Exception:
+        return []
+
+    try:
+        client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=os.environ.get("QDRANT_API_KEY"),
+            timeout=float(os.environ.get("QDRANT_TIMEOUT", "20") or 20),
+        )
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    seen_paths: set[str] = {p for p in existing_paths if p}
+    try:
+        graph_max = int(os.environ.get("RELEVANCE_GRAPH_RECALL_MAX", "3") or 0)
+    except Exception:
+        graph_max = 3
+    try:
+        graph_boost_factor = float(os.environ.get("RELEVANCE_GRAPH_RECALL_BOOST", "0.01") or 0.0)
+    except Exception:
+        graph_boost_factor = 0.01
+    try:
+        from scripts.ingest.graph_edges import GRAPH_COLLECTION_SUFFIX as _graph_suffix
+    except Exception:
+        _graph_suffix = "_graph"
+    graph_coll = f"{collection}{_graph_suffix}"
+
+    for effective_avg, count, rid, target in ranked:
+        if len(out) >= max_candidates:
+            break
+        repo = str(target.get("repo") or "").strip()
+        kind = str(target.get("kind") or "").strip()
+        symbol = str(target.get("symbol") or "").strip()
+        symbol_content_hash = str(target.get("symbol_content_hash") or "").strip()
+        path = str(target.get("container_path") or target.get("path") or "").strip()
+        raw_info = result_weights.get(rid) or {}
+        prior = {
+            "avg_relevance": float(raw_info.get("avg_relevance", 0) or 0),
+            "inheritance_weight": float(raw_info.get("inheritance_weight", 1.0) or 0),
+            "count": count,
+            "result_id": rid,
+        }
+
+        point = _scroll_main_point(
+            client,
+            qmodels,
+            collection=collection,
+            repo=repo,
+            symbol=symbol,
+            symbol_content_hash=symbol_content_hash,
+            kind=kind,
+            path=path,
+        )
+        if rid not in existing_target_ids and point is not None:
+            item = _point_to_feedback_item(point, score=base_score, source="feedback_recall", prior=prior)
+            item["feedback_weight_id"] = rid
+            emit_path = str(item.get("path") or item.get("container_path") or "")
+            if emit_path and emit_path not in seen_paths:
+                seen_paths.add(emit_path)
+                out.append(item)
+                if len(out) >= max_candidates:
+                    break
+
+        if graph_max <= 0 or not symbol:
+            continue
+        graph_added = 0
+        for variant in _feedback_symbol_variants(symbol):
+            if graph_added >= graph_max or len(out) >= max_candidates:
+                break
+            must = [
+                qmodels.FieldCondition(key="edge_type", match=qmodels.MatchValue(value="calls")),
+                qmodels.FieldCondition(key="callee_symbol", match=qmodels.MatchValue(value=variant)),
+            ]
+            if repo:
+                must.append(qmodels.FieldCondition(key="repo", match=qmodels.MatchValue(value=repo)))
+            try:
+                edge_points, _ = client.scroll(
+                    collection_name=graph_coll,
+                    scroll_filter=qmodels.Filter(must=must),
+                    limit=max(8, graph_max * 4),
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                continue
+            for edge in edge_points or []:
+                if graph_added >= graph_max or len(out) >= max_candidates:
+                    break
+                edge_payload = getattr(edge, "payload", None) or {}
+                caller_path = str(edge_payload.get("caller_path") or "").strip()
+                caller_repo = str(edge_payload.get("repo") or repo).strip()
+                if not caller_path:
+                    continue
+                point = _scroll_main_point(
+                    client,
+                    qmodels,
+                    collection=collection,
+                    repo=caller_repo,
+                    path=caller_path,
+                )
+                if point is None:
+                    continue
+                graph_score = (
+                    base_score
+                    + graph_boost_factor * (effective_avg / 2.0) * min(count, 10) / 10.0
+                )
+                item = _point_to_feedback_item(
+                    point,
+                    score=graph_score,
+                    source="feedback_graph_recall",
+                    prior={**prior, "callee_symbol": variant, "caller_path": caller_path},
+                )
+                item["feedback_weight_id"] = rid
+                emit_path = str(item.get("path") or item.get("container_path") or "")
+                if not emit_path or emit_path in seen_paths:
+                    continue
+                seen_paths.add(emit_path)
+                out.append(item)
+                graph_added += 1
+    return out
 
 
 async def _repo_search_impl(
@@ -1105,6 +1542,8 @@ async def _repo_search_impl(
                             "score": float(blended_s),
                             "path": obj.get("path", ""),
                             "symbol": obj.get("symbol", ""),
+                            "kind": obj.get("kind", ""),
+                            "repo": obj.get("repo", ""),
                             "start_line": int(obj.get("start_line") or 0),
                             "end_line": int(obj.get("end_line") or 0),
                             "why": why_parts,
@@ -1121,6 +1560,10 @@ async def _repo_search_impl(
                             item["host_path"] = _hostp
                         if _contp:
                             item["container_path"] = _contp
+                        if obj.get("file_hash"):
+                            item["file_hash"] = obj.get("file_hash")
+                        if obj.get("symbol_content_hash"):
+                            item["symbol_content_hash"] = obj.get("symbol_content_hash")
                         tmp.append(item)
                     if tmp:
                         results = tmp
@@ -1262,6 +1705,8 @@ async def _repo_search_impl(
                 "score": float(obj.get("score", 0.0)),
                 "path": obj.get("path", ""),
                 "symbol": obj.get("symbol", ""),
+                "kind": obj.get("kind", ""),
+                "repo": obj.get("repo", ""),
                 "start_line": int(obj.get("start_line") or 0),
                 "end_line": int(obj.get("end_line") or 0),
                 "why": obj.get("why", []),
@@ -1277,6 +1722,10 @@ async def _repo_search_impl(
                 item["host_path"] = _hostp
             if _contp:
                 item["container_path"] = _contp
+            if obj.get("file_hash"):
+                item["file_hash"] = obj.get("file_hash")
+            if obj.get("symbol_content_hash"):
+                item["symbol_content_hash"] = obj.get("symbol_content_hash")
             # Pass-through optional relation hints
             if obj.get("relations"):
                 item["relations"] = obj.get("relations")
@@ -1436,6 +1885,31 @@ async def _repo_search_impl(
     if _limit_n > 0 and len(results) > _limit_n:
         results = results[:_limit_n]
 
+    # Feedback recall: add a few positively rated targets that ordinary retrieval missed.
+    _canonical_query = queries[0] if queries else ""
+    _inject_result_ids(results, _canonical_query)
+    _remember_result_metadata(results, collection)
+    _weights = _load_relevance_weights(collection)
+    try:
+        _feedback_recall_max = int(os.environ.get("RELEVANCE_RECALL_MAX", "3") or 0)
+    except Exception:
+        _feedback_recall_max = 3
+    if _feedback_recall_max > 0 and _weights:
+        _existing_targets = {str(r.get("target_id") or r.get("result_id") or "") for r in results}
+        _scores = [float(r.get("score", 0) or 0) for r in results]
+        _base_score = min(_scores) if _scores else 0.0
+        _recalled = _feedback_recall_candidates(
+            collection=collection,
+            weights=_weights,
+            existing_target_ids=_existing_targets,
+            existing_paths={str(r.get("path") or r.get("container_path") or "") for r in results},
+            base_score=_base_score,
+            max_candidates=_feedback_recall_max,
+        )
+        if _recalled:
+            _inject_result_ids(_recalled, _canonical_query)
+            results.extend(_recalled)
+
     # Optionally add snippets (with highlighting)
     toks = _tokens_from_queries(queries)
     if include_snippet:
@@ -1519,7 +1993,7 @@ async def _repo_search_impl(
 
     # ─── Filename boost fallback ───────────────────────────────────────────────
     # Apply filename-query correlation boost for results that don't have it yet.
-    # The learning reranker applies fname_boost when enabled; this catches:
+    # Hybrid/rerank paths may already apply fname_boost; this catches:
     #   - Reranking disabled
     #   - Reranking timed out / failed
     #   - Subprocess hybrid search without reranking
@@ -1564,9 +2038,47 @@ async def _repo_search_impl(
             # Re-sort results by updated score so fname_boost affects ranking
             results = sorted(results, key=lambda x: float(x.get("score", 0)), reverse=True)
 
+    # ─── Inject result_id for relevance feedback ─────────────────────────────
+    # result_id is the stable feedback target (symbol/file). impression_id is
+    # query/content-specific and is diagnostic; boosts apply to target identity.
+    _inject_result_ids(results, _canonical_query)
+    _remember_result_metadata(results, collection)
+
+    # ─── Apply learned relevance boosts ─────────────────────────────────────
+    _relevance_boost_factor = float(os.environ.get("RELEVANCE_BOOST_FACTOR", "0.15"))
+    if _relevance_boost_factor > 0 and results:
+        try:
+            if _weights:
+                _result_weights = _weights.get("results", {})
+                for r in results:
+                    _rid = r.get("feedback_weight_id") or r.get("result_id", "")
+                    if _rid and _rid in _result_weights:
+                        _avg = float(_result_weights[_rid].get("avg_relevance", 0))
+                        _count = int(_result_weights[_rid].get("count", 0))
+                        _inheritance = float(
+                            _result_weights[_rid].get("inheritance_weight", 1.0) or 0
+                        )
+                        _boost = (
+                            _relevance_boost_factor
+                            * (_avg / 2.0)
+                            * min(_count, 10)
+                            / 10.0
+                            * _inheritance
+                        )
+                        r["score"] = float(r.get("score", 0)) + _boost
+                        r["relevance_boost"] = round(_boost, 4)
+                results.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
+                if _limit_n > 0 and len(results) > _limit_n:
+                    results = results[:_limit_n]
+        except Exception:
+            pass
+
     if compact:
         results = [
             {
+                "result_id": r.get("result_id", ""),
+                "target_id": r.get("target_id", ""),
+                "impression_id": r.get("impression_id", ""),
                 "path": r.get("path", ""),
                 "start_line": int(r.get("start_line") or 0),
                 "end_line": int(r.get("end_line") or 0),
@@ -1576,7 +2088,7 @@ async def _repo_search_impl(
     elif not debug:
         # Strip debug/internal fields from results to reduce token bloat
         # Keeps: score, path, host_path, container_path, symbol, snippet,
-        #        start_line, end_line, tags, pseudo
+        #        start_line, end_line, result_id/target_id/impression_id.
         results = [_strip_debug_fields(r) for r in results]
 
     _res_ok = bool(res.get("ok", True)) if isinstance(res, dict) else True
