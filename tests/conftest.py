@@ -18,6 +18,7 @@ os.environ.setdefault("PATTERN_VECTORS", "1")
 _INTEGRATION_TEST_FILES = {
     "test_collection_memory_backup_restore.py",
     "test_integration_qdrant.py",
+    "test_relevance_feedback.py",
     "test_subprocess_hybrid_smoke.py",
     "test_tier2_fallback.py",
 }
@@ -30,6 +31,15 @@ def pytest_addoption(parser):
         default=False,
         help="collect tests that start real services such as Qdrant",
     )
+
+
+def pytest_configure(config):
+    if not config.getoption("--run-integration", default=False):
+        return
+    # pytest.ini excludes integration tests by default. When the explicit flag is
+    # supplied, clear only that default marker expression so opt-in means opt-in.
+    if getattr(config.option, "markexpr", "") == "not integration":
+        config.option.markexpr = ""
 
 
 def pytest_ignore_collect(collection_path, config):
@@ -86,11 +96,12 @@ def _wait_for_qdrant(url: str, timeout: int = 60) -> bool:
 
 @pytest.fixture(scope="module")
 def qdrant_url():
-    """Provide Qdrant URL - uses CI service container or testcontainers (local).
+    """Provide Qdrant URL - uses CI, explicit QDRANT_URL, or testcontainers.
 
     In CI (GitHub Actions), uses the pre-configured Qdrant service at localhost:6333.
-    Locally, this fixture ALWAYS spins up a testcontainers Qdrant instance to avoid
-    accidentally polluting a developer's local Qdrant with test collections.
+    Locally, an explicit QDRANT_URL can point at the rebuilt compose stack for
+    faster opt-in integration runs. Otherwise this fixture spins up an isolated
+    testcontainers Qdrant instance.
     """
     # Only use pre-configured Qdrant in CI environment (GitHub Actions sets CI=true)
     is_ci = os.environ.get("CI", "").lower() in ("true", "1", "yes")
@@ -103,7 +114,15 @@ def qdrant_url():
         # If not reachable in CI, fail explicitly
         pytest.fail(f"CI Qdrant service not reachable at {ci_url}")
 
-    # Local development: ALWAYS use testcontainers (safe isolation)
+    explicit_url = os.environ.get("QDRANT_URL", "").strip()
+    if explicit_url:
+        if _wait_for_qdrant(explicit_url, timeout=10):
+            yield explicit_url
+            return
+        pytest.fail(f"QDRANT_URL is set but Qdrant is not reachable at {explicit_url}")
+
+    # Local development fallback: testcontainers keeps isolation when no explicit
+    # Qdrant service is requested.
     os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
     os.environ.setdefault("TESTCONTAINERS_RYUK_TIMEOUT", "0")
 
