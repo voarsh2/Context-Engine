@@ -71,7 +71,7 @@ from scripts.ingest.metadata import (
     _get_imports_calls,
     _compute_host_and_container_paths,
 )
-from scripts.ingest.vectors import project_mini, extract_pattern_vector
+from scripts.ingest.vectors import project_mini
 from scripts.ingest.qdrant import (
     ensure_collection,
     ensure_collection_and_indexes_once,
@@ -83,7 +83,10 @@ from scripts.ingest.qdrant import (
     upsert_points,
     hash_id,
     embed_batch,
-    PATTERN_VECTOR_NAME,
+)
+from scripts.relevance_feedback import (
+    build_symbol_reconciliations,
+    reconcile_collection_weights,
 )
 
 # Import utility functions
@@ -589,12 +592,8 @@ def _index_single_file_inner(
 
     allow_lex = allowed_vectors is None or LEX_VECTOR_NAME in allowed_vectors
     allow_mini = allowed_vectors is None or MINI_VECTOR_NAME in allowed_vectors
-    allow_pattern = allowed_vectors is None or PATTERN_VECTOR_NAME in allowed_vectors
     allow_sparse = allowed_sparse is None or LEX_SPARSE_NAME in allowed_sparse
 
-    # Check if pattern vectors are enabled
-    pattern_vectors_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-    pattern_vectors_on = pattern_vectors_on and allow_pattern
     refrag_on = os.environ.get("REFRAG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     use_mini = refrag_on and allow_mini
     use_sparse = LEX_SPARSE_MODE and allow_sparse
@@ -609,14 +608,7 @@ def _index_single_file_inner(
                     vecs[MINI_VECTOR_NAME] = project_mini(list(dense_vec), MINI_VEC_DIM)
             except Exception:
                 pass
-            # Add pattern vector for structural similarity search
-            if pattern_vectors_on and code_text:
-                try:
-                    pv = extract_pattern_vector(code_text, language)
-                    if pv:
-                        vecs[PATTERN_VECTOR_NAME] = pv
-                except Exception:
-                    pass
+            # Pattern vectors removed
             if use_sparse and lex_text:
                 sparse_vec = _lex_sparse_vector_text(lex_text)
                 if sparse_vec.get("indices"):
@@ -627,6 +619,22 @@ def _index_single_file_inner(
 
     pseudo_batch_concurrency = int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1)
     use_batch_pseudo = pseudo_batch_concurrency > 1 and pseudo_mode == "full"
+
+    def _full_index_symbol_content_hash(kind: str, symbol_name: str) -> str:
+        matches = [
+            sym_info
+            for sym_info in symbols
+            if str(sym_info.get("kind") or "") == str(kind)
+            and str(sym_info.get("name") or "") == str(symbol_name)
+        ]
+        if len(matches) != 1:
+            return ""
+        sym_info = matches[0]
+        lines = text.splitlines()
+        start = max(1, int(sym_info.get("start") or 1))
+        end = max(start, int(sym_info.get("end") or start))
+        content = "\n".join(lines[start - 1 : end])
+        return hashlib.sha1(content.encode("utf-8", errors="ignore")).hexdigest()
 
     chunk_data: list[dict] = []
     for ch in chunks:
@@ -667,6 +675,7 @@ def _index_single_file_inner(
                 "end_line": ch["end"],
                 "code": ch["text"],
                 "file_hash": file_hash,
+                "symbol_content_hash": _full_index_symbol_content_hash(kind, sym),
                 "imports": imports,
                 "calls": calls,
                 "ingested_at": int(time.time()),
@@ -936,12 +945,6 @@ def index_repo(
                 f"[COLLECTION_WARNING] Collection {collection} lacks mini vector '{MINI_VECTOR_NAME}'. "
                 "ReFRAG vectors will be skipped for this run."
             )
-        pattern_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-        if pattern_on and PATTERN_VECTOR_NAME not in allowed_vectors:
-            print(
-                f"[COLLECTION_WARNING] Collection {collection} lacks pattern vector '{PATTERN_VECTOR_NAME}'. "
-                "Pattern vectors will be skipped for this run."
-            )
         if LEX_VECTOR_NAME not in allowed_vectors:
             print(
                 f"[COLLECTION_WARNING] Collection {collection} lacks lexical vector '{LEX_VECTOR_NAME}'. "
@@ -1083,11 +1086,8 @@ def process_file_with_smart_reindexing(
 
     allow_lex = allowed_vectors is None or LEX_VECTOR_NAME in allowed_vectors
     allow_mini = allowed_vectors is None or MINI_VECTOR_NAME in allowed_vectors
-    allow_pattern = allowed_vectors is None or PATTERN_VECTOR_NAME in allowed_vectors
     allow_sparse = allowed_sparse is None or LEX_SPARSE_NAME in allowed_sparse
 
-    pattern_vectors_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-    pattern_vectors_on = pattern_vectors_on and allow_pattern
     refrag_on = os.environ.get("REFRAG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     use_mini = refrag_on and allow_mini
     use_sparse = LEX_SPARSE_MODE and allow_sparse
@@ -1297,6 +1297,19 @@ def process_file_with_smart_reindexing(
         target["pseudo"] = pseudo_text
         target["tags"] = list(pseudo_tags or [])
 
+    def _symbol_content_hash(kind: str, symbol_name: str) -> str:
+        if not kind or not symbol_name:
+            return ""
+        matches = [
+            info
+            for info in symbol_meta.values()
+            if str(info.get("type") or "") == str(kind)
+            and str(info.get("name") or "") == str(symbol_name)
+        ]
+        if len(matches) == 1:
+            return str(matches[0].get("content_hash") or "")
+        return ""
+
     chunk_data_sr: list[dict] = []
     for ch in chunks:
         info = build_information(
@@ -1336,6 +1349,7 @@ def process_file_with_smart_reindexing(
                 "end_line": ch["end"],
                 "code": ch["text"],
                 "file_hash": file_hash,
+                "symbol_content_hash": _symbol_content_hash(kind, sym),
                 "imports": imports,
                 "calls": calls,
                 "ingested_at": int(time.time()),
@@ -1562,14 +1576,7 @@ def process_file_with_smart_reindexing(
                         vecs[MINI_VECTOR_NAME] = project_mini(list(v), MINI_VEC_DIM)
                 except Exception:
                     pass
-                # Add pattern vector for structural similarity search
-                if pattern_vectors_on and ct:
-                    try:
-                        pv = extract_pattern_vector(ct, language)
-                        if pv:
-                            vecs[PATTERN_VECTOR_NAME] = pv
-                    except Exception:
-                        pass
+                # Pattern vectors removed
                 if use_sparse and lt:
                     sparse_vec = _lex_sparse_vector_text(lt)
                     if sparse_vec.get("indices"):
@@ -1600,6 +1607,27 @@ def process_file_with_smart_reindexing(
         calls,
         imports,
     )
+
+    try:
+        reconciliations = build_symbol_reconciliations(
+            cached_symbols,
+            symbol_meta,
+            repo=str(per_file_repo or ""),
+            path=fp,
+            split_min_overlap=float(
+                os.environ.get("RELEVANCE_SPLIT_MIN_OVERLAP", "0.45") or 0.45
+            ),
+            split_min_coverage=float(
+                os.environ.get("RELEVANCE_SPLIT_MIN_COVERAGE", "0.75") or 0.75
+            ),
+        )
+        migrated = reconcile_collection_weights(current_collection, reconciliations)
+        if migrated:
+            print(
+                f"[SMART_REINDEX] Reconciled {migrated} feedback target(s) for {file_path}"
+            )
+    except Exception as e:
+        print(f"[SMART_REINDEX] Feedback reconciliation skipped for {file_path}: {e}")
 
     try:
         if set_cached_symbols:
