@@ -66,6 +66,34 @@ def test_result_id_survives_line_shifts_for_same_symbol():
     assert before["impression_id"] != after["impression_id"]
 
 
+def test_same_named_symbols_in_distinct_files_have_distinct_targets():
+    first = _result("same-hash")
+    second = _result("same-hash")
+    second["path"] = "/repo/pkg/other.py"
+    second["container_path"] = "/work/repo/pkg/other.py"
+
+    _inject_result_ids([first, second], "authenticate user")
+
+    assert first["target_id"] != second["target_id"]
+    assert first["result_id"] != second["result_id"]
+
+
+def test_target_identity_normalizes_host_and_container_paths():
+    from scripts.relevance_feedback import stable_target_id
+
+    assert stable_target_id(
+        repo="repo",
+        kind="function",
+        symbol="authenticate",
+        path="/repo/pkg/auth.py",
+    ) == stable_target_id(
+        repo="repo",
+        kind="function",
+        symbol="authenticate",
+        path="/work/repo/pkg/auth.py",
+    )
+
+
 def test_trainer_preserves_target_metadata_for_recall():
     result = _result("same-hash")
     _inject_result_ids([result], "authenticate user")
@@ -181,6 +209,63 @@ def test_exact_content_rename_reconciles_feedback_weight(tmp_path, monkeypatch):
         if rid != before["result_id"] and entry.get("target", {}).get("symbol") == "verify_user"
     )
     assert successor["inheritance_weight"] == 1.0
+    assert successor["lineage"][0]["reason"] == "rename_exact_content"
+
+
+def test_qualified_symbol_rename_reconciles_feedback_weight(tmp_path, monkeypatch):
+    monkeypatch.setenv("RERANKER_WEIGHTS_DIR", str(tmp_path))
+    old = {
+        "function_authenticate_10": {
+            "name": "authenticate",
+            "path": "AuthService.authenticate",
+            "type": "function",
+            "content_hash": "same-body",
+        }
+    }
+    new = {
+        "function_verify_user_20": {
+            "name": "verify_user",
+            "path": "AuthService.verify_user",
+            "type": "function",
+            "content_hash": "same-body",
+        }
+    }
+    before = _result("file-hash")
+    before["symbol"] = "AuthService.authenticate"
+    _inject_result_ids([before], "authenticate")
+    weights_file = tmp_path / "repo-collection_relevance.json"
+    weights_file.write_text(json.dumps({
+        "results": {
+            before["result_id"]: {
+                "total_relevance": 2,
+                "count": 1,
+                "avg_relevance": 2.0,
+                "target": {
+                    "target_id": before["result_id"],
+                    "repo": "repo",
+                    "kind": "function",
+                    "symbol": "AuthService.authenticate",
+                    "path": "/repo/pkg/auth.py",
+                },
+            }
+        }
+    }))
+
+    mappings = build_symbol_reconciliations(
+        old,
+        new,
+        repo="repo",
+        path="/repo/pkg/auth.py",
+    )
+    assert reconcile_collection_weights("repo-collection", mappings) == 1
+
+    data = json.loads(weights_file.read_text())
+    successor = next(
+        entry
+        for rid, entry in data["results"].items()
+        if rid != before["result_id"]
+    )
+    assert successor["target"]["symbol"] == "AuthService.verify_user"
     assert successor["lineage"][0]["reason"] == "rename_exact_content"
 
 

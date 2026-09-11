@@ -1587,7 +1587,7 @@ async def rate_search_results(
         return {"ok": False, "error": "no valid ratings provided"}
 
     try:
-        from scripts.rerank_tools.events import _ensure_events_dir, _get_write_lock
+        from scripts.rerank_tools.events import _ensure_events_dir, append_event_line
         from datetime import datetime as _datetime
 
         events_dir = _ensure_events_dir()
@@ -1606,11 +1606,7 @@ async def rate_search_results(
         if sess:
             event["session_user"] = (sess or {}).get("user_id", "anonymous")
 
-        file_key = str(events_file)
-        lock = _get_write_lock(file_key)
-        with lock:
-            with open(events_file, "a") as f:
-                f.write(_json.dumps(event) + "\n")
+        append_event_line(events_file, _json.dumps(event))
 
         return {"ok": True, "rated": len(validated_ratings), "collection": coll}
     except Exception as e:

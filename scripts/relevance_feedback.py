@@ -42,20 +42,40 @@ def _safe_name(value: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
 
 
-def stable_target_id(*, repo: str = "", kind: str = "", symbol: str = "", path: str = "") -> str:
+def _target_path_key(path: str, repo: str = "") -> str:
+    """Normalize host/container paths to a stable repo-relative identity."""
+    value = str(path or "").strip().replace("\\", "/")
+    if not value:
+        return ""
+    parts = [part for part in value.split("/") if part]
+    repo_value = str(repo or "").strip().replace("\\", "/").strip("/")
+    if repo_value:
+        for index in range(len(parts) - 1, -1, -1):
+            if parts[index] == repo_value:
+                parts = parts[index + 1 :]
+                break
+    return "/".join(parts)
+
+
+def stable_target_key(*, repo: str = "", kind: str = "", symbol: str = "", path: str = "") -> str:
     repo = str(repo or "").strip()
     kind = str(kind or "").strip()
     symbol = str(symbol or "").strip()
-    path = str(path or "").strip()
+    path_key = _target_path_key(path, repo)
     if repo and symbol:
-        key = f"symbol\x00{repo}\x00{kind}\x00{symbol}"
+        return f"symbol\x00{repo}\x00{path_key}\x00{kind}\x00{symbol}"
     elif symbol:
-        key = f"symbol\x00{kind}\x00{symbol}"
-    elif repo and path:
-        key = f"file\x00{repo}\x00{path}"
-    elif path:
-        key = f"file\x00{path}"
-    else:
+        return f"symbol\x00{path_key}\x00{kind}\x00{symbol}"
+    elif repo and path_key:
+        return f"file\x00{repo}\x00{path_key}"
+    elif path_key:
+        return f"file\x00{path_key}"
+    return ""
+
+
+def stable_target_id(*, repo: str = "", kind: str = "", symbol: str = "", path: str = "") -> str:
+    key = stable_target_key(repo=repo, kind=kind, symbol=symbol, path=path)
+    if not key:
         return ""
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
@@ -166,7 +186,7 @@ def _symbol_tokens(info: dict) -> set[str]:
 
 
 def _symbol_target(info: dict, *, repo: str, path: str) -> dict:
-    symbol = str(info.get("name") or "").strip()
+    symbol = str(info.get("path") or info.get("symbol_path") or info.get("name") or "").strip()
     kind = str(info.get("type") or "").strip()
     target_id = stable_target_id(repo=repo, kind=kind, symbol=symbol, path=path)
     return {
@@ -176,6 +196,7 @@ def _symbol_target(info: dict, *, repo: str, path: str) -> dict:
         "repo": str(repo or ""),
         "kind": kind,
         "symbol": symbol,
+        "symbol_path": symbol,
         "symbol_content_hash": str(info.get("content_hash") or ""),
     }
 
@@ -192,27 +213,37 @@ def build_symbol_reconciliations(
     """Map removed feedback targets to conservative rename/split successors."""
     old_symbols = old_symbols or {}
     new_symbols = new_symbols or {}
-    new_by_name_kind: dict[tuple[str, str], list[dict]] = {}
+    new_by_symbol_kind: dict[tuple[str, str], list[dict]] = {}
     new_by_hash_kind: dict[tuple[str, str], list[dict]] = {}
     for info in new_symbols.values():
         kind = str(info.get("type") or "")
-        name = str(info.get("name") or "")
+        name = str(
+            info.get("path")
+            or info.get("symbol_path")
+            or info.get("name")
+            or ""
+        )
         content_hash = str(info.get("content_hash") or "")
-        new_by_name_kind.setdefault((kind, name), []).append(info)
+        new_by_symbol_kind.setdefault((kind, name), []).append(info)
         if kind and content_hash:
             new_by_hash_kind.setdefault((kind, content_hash), []).append(info)
 
     mappings: dict[str, list[dict]] = {}
     for old_info in old_symbols.values():
         kind = str(old_info.get("type") or "")
-        name = str(old_info.get("name") or "")
+        name = str(
+            old_info.get("path")
+            or old_info.get("symbol_path")
+            or old_info.get("name")
+            or ""
+        )
         old_hash = str(old_info.get("content_hash") or "")
         old_id = stable_target_id(repo=repo, kind=kind, symbol=name, path=path)
         if not old_id:
             continue
 
         # Same logical symbol persists; its stable target ID already survives edits.
-        if new_by_name_kind.get((kind, name)):
+        if new_by_symbol_kind.get((kind, name)):
             continue
 
         exact = new_by_hash_kind.get((kind, old_hash)) or []

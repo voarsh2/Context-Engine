@@ -47,9 +47,14 @@ from scripts.mcp_impl.search_profiles import append_profile_globs, normalize_pro
 from scripts.mcp_impl.toon import _should_use_toon, _format_results_as_toon
 from scripts.mcp_auth import require_collection_access as _require_collection_access
 from scripts.path_scope import (
+    metadata_matches_under as _metadata_matches_under,
     normalize_under as _normalize_under_scope,
 )
-from scripts.relevance_feedback import enrich_recent_rating, remember_recent_results
+from scripts.relevance_feedback import (
+    enrich_recent_rating,
+    remember_recent_results,
+    stable_target_key,
+)
 
 # Constants
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -183,15 +188,7 @@ def _result_target_key(result: dict) -> str:
         or ""
     ).strip()
 
-    if repo and symbol_path:
-        return f"symbol\x00{repo}\x00{kind}\x00{symbol_path}"
-    if symbol_path:
-        return f"symbol\x00{kind}\x00{symbol_path}"
-    if repo and path:
-        return f"file\x00{repo}\x00{path}"
-    if path:
-        return f"file\x00{path}"
-    return ""
+    return stable_target_key(repo=repo, kind=kind, symbol=symbol_path, path=path)
 
 
 def _inject_result_ids(results: list[dict], canonical_query: str) -> None:
@@ -287,6 +284,155 @@ def _feedback_symbol_variants(symbol: str) -> list[str]:
     return out
 
 
+def _feedback_path_variants(path: str, repo: str = "") -> list[str]:
+    """Return equivalent path spellings used by indexed metadata."""
+    raw = str(path or "").strip().replace("\\", "/")
+    if not raw:
+        return []
+    raw = "/" + raw.strip("/") if raw.startswith("/") else raw.strip("/")
+    variants = [raw, raw.strip("/")]
+    repo_name = str(repo or "").strip().replace("\\", "/").strip("/")
+    raw_no_slash = raw.strip("/")
+    if raw_no_slash.startswith("work/"):
+        work_prefix = "/work/"
+        rest = raw_no_slash[len("work/") :]
+        if rest:
+            variants.extend((rest, "/" + rest))
+            if repo_name and rest.casefold().startswith(repo_name.casefold() + "/"):
+                tail = rest[len(repo_name) + 1 :]
+                variants.extend((tail, "/" + tail))
+    if repo_name:
+        marker = f"/{repo_name.casefold()}/"
+        raw_cf = f"/{raw.strip('/').casefold()}/"
+        marker_at = raw_cf.find(marker)
+        if marker_at >= 0:
+            tail_start = max(0, marker_at + len(marker) - 1)
+            tail = raw.strip("/")[tail_start:].strip("/")
+            variants.extend((tail, "/" + tail))
+    out: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        value = variant if variant.startswith("/") else variant.strip("/")
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _feedback_point_matches_filters(
+    point: Any,
+    *,
+    repo_filter: Any = "*",
+    language: str = "",
+    under: str | None = None,
+    kind: str = "",
+    symbol: str = "",
+    ext: str = "",
+    not_: str = "",
+    path_regex: str = "",
+    path_globs: list[str] | None = None,
+    not_globs: list[str] | None = None,
+    case_sensitive: bool = False,
+) -> bool:
+    """Apply the same explicit filters to feedback-recalled points as search."""
+    payload = getattr(point, "payload", None) or {}
+    md = payload.get("metadata") or {}
+    if not isinstance(md, dict):
+        md = {}
+
+    candidate_repo = str(md.get("repo") or "").strip()
+    if repo_filter != "*" and repo_filter:
+        allowed_repos = (
+            {str(value).strip() for value in repo_filter if str(value).strip()}
+            if isinstance(repo_filter, (list, tuple, set))
+            else {str(repo_filter).strip()}
+        )
+        if candidate_repo not in allowed_repos:
+            return False
+    if language and str(md.get("language") or "").strip() != language:
+        return False
+    if kind and str(md.get("kind") or "").strip() != kind:
+        return False
+    if symbol:
+        requested = str(symbol).strip()
+        candidate_symbols = {
+            str(md.get("symbol") or "").strip(),
+            str(md.get("symbol_path") or "").strip(),
+        }
+        if requested not in candidate_symbols:
+            return False
+    if under and not _metadata_matches_under(md, under):
+        return False
+
+    path_values = []
+    for key in (
+        "path",
+        "repo_rel_path",
+        "host_path",
+        "container_path",
+        "file_path",
+        "client_path",
+    ):
+        value = md.get(key)
+        if value is not None and str(value).strip():
+            path_values.append(str(value).strip().replace("\\", "/"))
+    if not path_values:
+        return False
+    if not case_sensitive:
+        normalized_paths = [value.lower() for value in path_values]
+    else:
+        normalized_paths = path_values
+
+    def _contains(value: str) -> bool:
+        return value if case_sensitive else value.lower()
+
+    if not_ and any(_contains(not_) in value for value in normalized_paths):
+        return False
+    if ext:
+        ext_value = str(ext).lower().lstrip(".")
+        if not any(value.lower().endswith("." + ext_value) for value in path_values):
+            return False
+    if path_regex:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            if not any(re.search(path_regex, value, flags=flags) for value in path_values):
+                return False
+        except re.error:
+            return False
+
+    def _match_glob(pattern: str, value: str) -> bool:
+        import fnmatch
+
+        pattern_value = pattern if case_sensitive else pattern.lower()
+        path_value = value if case_sensitive else value.lower()
+        path_value = path_value.strip("/")
+        if fnmatch.fnmatchcase(path_value, pattern_value):
+            return True
+        if not pattern_value.startswith("/") and "/" in path_value:
+            parts = [segment for segment in path_value.split("/") if segment]
+            return any(
+                fnmatch.fnmatchcase("/".join(parts[index:]), pattern_value)
+                for index in range(1, len(parts))
+            )
+        return False
+
+    normalized_path_globs = list(path_globs or [])
+    if normalized_path_globs and not any(
+        _match_glob(pattern, value)
+        for pattern in normalized_path_globs
+        for value in path_values
+    ):
+        return False
+    normalized_not_globs = list(not_globs or [])
+    if normalized_not_globs and any(
+        _match_glob(pattern, value)
+        for pattern in normalized_not_globs
+        for value in path_values
+    ):
+        return False
+    return True
+
+
 def _point_to_feedback_item(point: Any, *, score: float, source: str, prior: dict | None = None) -> dict:
     payload = getattr(point, "payload", None) or {}
     md = payload.get("metadata") or {}
@@ -323,29 +469,53 @@ def _scroll_main_point(
     kind: str = "",
     path: str = "",
 ) -> Any | None:
-    must = []
+    base_must = []
     if repo:
-        must.append(qmodels.FieldCondition(key="metadata.repo", match=qmodels.MatchValue(value=repo)))
+        base_must.append(qmodels.FieldCondition(key="metadata.repo", match=qmodels.MatchValue(value=repo)))
     if symbol:
-        must.append(qmodels.FieldCondition(key="metadata.symbol_path", match=qmodels.MatchValue(value=symbol)))
-    elif path:
-        must.append(qmodels.FieldCondition(key="metadata.path", match=qmodels.MatchValue(value=path)))
-    else:
+        base_must.append(qmodels.FieldCondition(key="metadata.symbol_path", match=qmodels.MatchValue(value=symbol)))
+    elif not path:
         return None
     if kind:
-        must.append(qmodels.FieldCondition(key="metadata.kind", match=qmodels.MatchValue(value=kind)))
-    try:
-        points, _ = client.scroll(
-            collection_name=collection,
-            scroll_filter=qmodels.Filter(must=must),
-            limit=1,
-            with_payload=True,
-            with_vectors=False,
-        )
-        if points:
-            return points[0]
-    except Exception:
-        pass
+        base_must.append(qmodels.FieldCondition(key="metadata.kind", match=qmodels.MatchValue(value=kind)))
+
+    path_variants = _feedback_path_variants(path, repo)
+    path_keys = ("metadata.path", "metadata.container_path", "metadata.host_path")
+
+    def _scroll_with(must: list[Any], limit: int = 1) -> list[Any]:
+        try:
+            points, _ = client.scroll(
+                collection_name=collection,
+                scroll_filter=qmodels.Filter(must=must),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+            return list(points or [])
+        except Exception:
+            return []
+
+    if symbol or path:
+        if path_variants:
+            for path_value in path_variants:
+                for path_key in path_keys:
+                    points = _scroll_with(
+                        base_must
+                        + [
+                            qmodels.FieldCondition(
+                                key=path_key,
+                                match=qmodels.MatchValue(value=path_value),
+                            )
+                        ]
+                    )
+                    if points:
+                        return points[0]
+        elif symbol:
+            points = _scroll_with(base_must)
+            if points:
+                return points[0]
+    else:
+        return None
     if not symbol_content_hash:
         return None
     hash_must = []
@@ -363,17 +533,23 @@ def _scroll_main_point(
             match=qmodels.MatchValue(value=symbol_content_hash),
         )
     )
-    try:
-        points, _ = client.scroll(
-            collection_name=collection,
-            scroll_filter=qmodels.Filter(must=hash_must),
-            limit=2,
-            with_payload=True,
-            with_vectors=False,
-        )
-        return points[0] if len(points or []) == 1 else None
-    except Exception:
-        return None
+    if path_variants:
+        for path_value in path_variants:
+            for path_key in path_keys:
+                points = _scroll_with(
+                    hash_must
+                    + [
+                        qmodels.FieldCondition(
+                            key=path_key,
+                            match=qmodels.MatchValue(value=path_value),
+                        )
+                    ],
+                    limit=2,
+                )
+                if len(points) == 1:
+                    return points[0]
+    points = _scroll_with(hash_must, limit=2)
+    return points[0] if len(points) == 1 else None
 
 
 def _feedback_recall_candidates(
@@ -384,6 +560,17 @@ def _feedback_recall_candidates(
     existing_paths: set[str],
     base_score: float,
     max_candidates: int,
+    repo_filter: Any = "*",
+    language: str = "",
+    under: str | None = None,
+    kind_filter: str = "",
+    symbol_filter: str = "",
+    ext: str = "",
+    not_: str = "",
+    path_regex: str = "",
+    path_globs: list[str] | None = None,
+    not_globs: list[str] | None = None,
+    case_sensitive: bool = False,
 ) -> list[dict]:
     """Rehydrate positively rated targets and inverse-graph adjacent callers."""
     if max_candidates <= 0:
@@ -444,7 +631,7 @@ def _feedback_recall_candidates(
         if len(out) >= max_candidates:
             break
         repo = str(target.get("repo") or "").strip()
-        kind = str(target.get("kind") or "").strip()
+        target_kind = str(target.get("kind") or "").strip()
         symbol = str(target.get("symbol") or "").strip()
         symbol_content_hash = str(target.get("symbol_content_hash") or "").strip()
         path = str(target.get("container_path") or target.get("path") or "").strip()
@@ -463,10 +650,27 @@ def _feedback_recall_candidates(
             repo=repo,
             symbol=symbol,
             symbol_content_hash=symbol_content_hash,
-            kind=kind,
+            kind=target_kind,
             path=path,
         )
-        if rid not in existing_target_ids and point is not None:
+        if (
+            rid not in existing_target_ids
+            and point is not None
+            and _feedback_point_matches_filters(
+                point,
+                repo_filter=repo_filter,
+                language=language,
+                under=under,
+                kind=kind_filter,
+                symbol=symbol_filter,
+                ext=ext,
+                not_=not_,
+                path_regex=path_regex,
+                path_globs=path_globs,
+                not_globs=not_globs,
+                case_sensitive=case_sensitive,
+            )
+        ):
             item = _point_to_feedback_item(point, score=base_score, source="feedback_recall", prior=prior)
             item["feedback_weight_id"] = rid
             emit_path = str(item.get("path") or item.get("container_path") or "")
@@ -514,6 +718,21 @@ def _feedback_recall_candidates(
                     path=caller_path,
                 )
                 if point is None:
+                    continue
+                if not _feedback_point_matches_filters(
+                    point,
+                    repo_filter=repo_filter,
+                    language=language,
+                    under=under,
+                    kind=kind_filter,
+                    symbol=symbol_filter,
+                    ext=ext,
+                    not_=not_,
+                    path_regex=path_regex,
+                    path_globs=path_globs,
+                    not_globs=not_globs,
+                    case_sensitive=case_sensitive,
+                ):
                     continue
                 graph_score = (
                     base_score
@@ -1877,13 +2096,13 @@ async def _repo_search_impl(
                 other_code.append(it)
         results = doc_items + core_items + other_code
 
-    # Enforce user-requested limit on final result count
+    # Enforce the public result limit after feedback recall has had a chance to
+    # contribute candidates. The retrieval/rerank stages may intentionally
+    # over-fetch before this point.
     try:
         _limit_n = int(limit)
     except Exception:
         _limit_n = 0
-    if _limit_n > 0 and len(results) > _limit_n:
-        results = results[:_limit_n]
 
     # Feedback recall: add a few positively rated targets that ordinary retrieval missed.
     _canonical_query = queries[0] if queries else ""
@@ -1894,7 +2113,7 @@ async def _repo_search_impl(
         _feedback_recall_max = int(os.environ.get("RELEVANCE_RECALL_MAX", "3") or 0)
     except Exception:
         _feedback_recall_max = 3
-    if _feedback_recall_max > 0 and _weights:
+    if _feedback_recall_max > 0 and _weights and _limit_n > 0:
         _existing_targets = {str(r.get("target_id") or r.get("result_id") or "") for r in results}
         _scores = [float(r.get("score", 0) or 0) for r in results]
         _base_score = min(_scores) if _scores else 0.0
@@ -1904,11 +2123,30 @@ async def _repo_search_impl(
             existing_target_ids=_existing_targets,
             existing_paths={str(r.get("path") or r.get("container_path") or "") for r in results},
             base_score=_base_score,
-            max_candidates=_feedback_recall_max,
+            max_candidates=min(_feedback_recall_max, _limit_n),
+            repo_filter=repo_filter,
+            language=language,
+            under=under,
+            kind_filter=kind,
+            symbol_filter=symbol,
+            ext=ext,
+            not_=not_,
+            path_regex=path_regex,
+            path_globs=path_globs,
+            not_globs=not_globs,
+            case_sensitive=case_sensitive,
         )
         if _recalled:
             _inject_result_ids(_recalled, _canonical_query)
-            results.extend(_recalled)
+            # Reserve room for newly discovered feedback/graph neighbors. This
+            # is the recall feature's purpose; appending and slicing the old
+            # top-N would silently discard every recalled candidate.
+            results = results[: max(0, _limit_n - len(_recalled))] + _recalled
+
+    # Keep the public contract bounded when limit is absent/invalid as well as
+    # when a caller supplied a normal positive limit.
+    if _limit_n > 0 and len(results) > _limit_n:
+        results = results[:_limit_n]
 
     # Optionally add snippets (with highlighting)
     toks = _tokens_from_queries(queries)

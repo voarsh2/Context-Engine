@@ -1223,7 +1223,7 @@ def extract_symbols_with_tree_sitter(file_path: str) -> dict:
     """Extract functions, classes, methods from file using tree-sitter or fallback.
 
     Returns:
-        dict: {symbol_id: {name, type, start_line, end_line, content_hash, pseudo, tags}}
+        dict: {symbol_id: {name, type, path, start_line, end_line, content_hash, pseudo, tags}}
     """
     from scripts.ingest.pipeline import detect_language
     
@@ -1248,6 +1248,8 @@ def extract_symbols_with_tree_sitter(file_path: str) -> dict:
             symbols[symbol_id] = {
                 "name": sym["name"],
                 "type": sym["kind"],
+                "path": sym.get("path") or sym.get("name") or "",
+                "symbol_path": sym.get("path") or sym.get("name") or "",
                 "start_line": sym["start"],
                 "end_line": sym["end"],
                 "content_hash": content_hash,
