@@ -97,6 +97,48 @@ def test_process_bundle_background_tracks_completed_operations(monkeypatch, tmp_
 
 
 @pytest.mark.unit
+def test_process_bundle_background_does_not_advance_sequence_after_partial_failure(
+    monkeypatch, tmp_path: Path
+):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    bundle_path = tmp_path / "bundle.tar.gz"
+    bundle_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        srv,
+        "process_delta_bundle",
+        lambda *_args: {
+            "created": 1,
+            "updated": 0,
+            "deleted": 0,
+            "moved": 0,
+            "skipped": 0,
+            "skipped_hash_match": 0,
+            "failed": 1,
+        },
+    )
+    monkeypatch.setattr(srv, "log_activity", lambda *a, **k: None)
+
+    key = srv.get_workspace_key("/work/repo")
+    srv._sequence_tracker[key] = 2
+    asyncio.run(
+        srv._process_bundle_background(
+            workspace_path="/work/repo",
+            bundle_path=bundle_path,
+            manifest={"bundle_id": "bundle-partial"},
+            sequence_number=3,
+            bundle_id="bundle-partial",
+        )
+    )
+
+    assert srv._sequence_tracker[key] == 2
+    assert srv._upload_result_tracker[key]["status"] == "failed"
+    assert srv._upload_result_tracker[key]["failed_count"] == 1
+
+
+@pytest.mark.unit
 def test_delta_status_reports_processing_while_upload_in_progress(monkeypatch):
     srv = importlib.import_module("scripts.upload_service")
     srv = importlib.reload(srv)
@@ -122,6 +164,60 @@ def test_delta_status_reports_processing_while_upload_in_progress(monkeypatch):
     body = resp.json()
     assert body["status"] == "processing"
     assert body["server_info"]["last_upload_status"] == "processing"
+
+
+@pytest.mark.unit
+def test_delta_status_exposes_journal_summary(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(srv, "get_collection_name", lambda _repo=None: "test-coll")
+    monkeypatch.setattr(srv, "_extract_repo_name_from_path", lambda _path: "repo")
+    monkeypatch.setattr(
+        srv,
+        "get_index_journal_summary",
+        lambda **_: {
+            "total": 12,
+            "retryable": 7,
+            "outstanding": 9,
+            "counts": {"pending": 5, "failed": 2},
+            "sample_errors": [{"path": "/work/repo/bad.py", "error": "boom"}],
+        },
+    )
+
+    client = TestClient(srv.app)
+    resp = client.get("/api/v1/delta/status", params={"workspace_path": "/work/repo"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["pending_operations"] == 9
+    assert body["server_info"]["journal"]["total"] == 12
+    assert body["server_info"]["journal"]["sample_errors"][0]["error"] == "boom"
+
+
+@pytest.mark.unit
+def test_delta_status_aggregates_journal_for_workspace_root(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(srv, "get_collection_name", lambda repo=None: f"coll-{repo or 'root'}")
+    monkeypatch.setattr(srv, "_extract_repo_name_from_path", lambda _path: "should-not-be-used")
+    summary_calls = []
+
+    def journal_summary(**kwargs):
+        summary_calls.append(kwargs)
+        return {"total": 2, "retryable": 1, "outstanding": 1, "counts": {"pending": 1}}
+
+    monkeypatch.setattr(srv, "get_index_journal_summary", journal_summary)
+
+    client = TestClient(srv.app)
+    resp = client.get("/api/v1/delta/status", params={"workspace_path": "/work"})
+
+    assert resp.status_code == 200
+    assert resp.json()["pending_operations"] == 1
+    assert summary_calls == [{"workspace_path": "/work", "repo_name": None}]
 
 
 @pytest.mark.unit
@@ -254,6 +350,84 @@ def test_apply_ops_endpoint_returns_processed_operations(monkeypatch):
     assert body["success"] is True
     assert body["processed_operations"]["deleted"] == 1
     assert body["processing_time_ms"] is not None
+
+
+@pytest.mark.unit
+def test_apply_ops_advances_sequence_when_all_operations_match(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(
+        srv,
+        "apply_delta_operations",
+        lambda *_args, **_kwargs: {
+            "created": 0,
+            "updated": 0,
+            "deleted": 0,
+            "moved": 0,
+            "skipped": 1,
+            "skipped_hash_match": 1,
+            "failed": 0,
+        },
+    )
+
+    key = srv.get_workspace_key("/work/repo")
+    srv._sequence_tracker[key] = 4
+    client = TestClient(srv.app)
+    resp = client.post(
+        "/api/v1/delta/apply_ops",
+        json={
+            "workspace_path": "/work/repo",
+            "manifest": {"bundle_id": "b-match", "sequence_number": 5},
+            "operations": [{"operation": "moved", "path": "src/new.py"}],
+            "file_hashes": {"src/new.py": "sha1:match"},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+    assert srv._sequence_tracker[key] == 5
+
+
+@pytest.mark.unit
+def test_apply_ops_endpoint_does_not_advance_sequence_after_partial_failure(monkeypatch):
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+    _disable_auth(srv, monkeypatch)
+
+    monkeypatch.setattr(
+        srv,
+        "apply_delta_operations",
+        lambda *_args, **_kwargs: {
+            "created": 1,
+            "updated": 0,
+            "deleted": 0,
+            "moved": 0,
+            "skipped": 0,
+            "skipped_hash_match": 0,
+            "failed": 1,
+        },
+    )
+
+    key = srv.get_workspace_key("/work/repo")
+    srv._sequence_tracker[key] = 4
+    client = TestClient(srv.app)
+    resp = client.post(
+        "/api/v1/delta/apply_ops",
+        json={
+            "workspace_path": "/work/repo",
+            "manifest": {"bundle_id": "b-partial", "sequence_number": 5},
+            "operations": [{"operation": "created", "path": "src/new.py"}],
+            "file_hashes": {"src/new.py": "sha1:new"},
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "APPLY_OPS_PARTIAL_FAILURE"
+    assert srv._sequence_tracker[key] == 4
 
 
 @pytest.mark.unit

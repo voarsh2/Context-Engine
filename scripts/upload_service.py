@@ -95,6 +95,7 @@ from scripts.workspace_state import (
     update_staging_status,
     clear_staging_collection,
     clear_index_journal_entries,
+    get_index_journal_summary,
     logical_repo_reuse_enabled,
     get_collection_state_snapshot,
 )
@@ -202,6 +203,7 @@ class PlanResponse(BaseModel):
     operation_counts_preview: Dict[str, int]
     needed_size_bytes: int
     replica_targets: List[str]
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
     fallback_used: bool = False
     error: Optional[Dict[str, Any]] = None
 
@@ -495,7 +497,7 @@ async def _process_bundle_background(
             + (operations_count or {}).get("moved", 0)
         )
         status_value = "completed" if failed_count == 0 else "failed"
-        if sequence_number is not None:
+        if sequence_number is not None and failed_count == 0:
             _sequence_tracker[key] = sequence_number
         _upload_result_tracker[key] = {
             "workspace_path": workspace_path,
@@ -1467,8 +1469,32 @@ async def get_status(workspace_path: str):
     """Get upload status for workspace."""
     try:
         # Get collection name
-        repo_name = _extract_repo_name_from_path(workspace_path)
+        try:
+            is_workspace_root = Path(workspace_path).resolve() == Path(WORK_DIR).resolve()
+        except Exception:
+            is_workspace_root = False
+        repo_name = None if is_workspace_root else _extract_repo_name_from_path(workspace_path)
         collection_name = get_collection_name(repo_name)
+
+        try:
+            journal_summary = get_index_journal_summary(
+                workspace_path=workspace_path,
+                repo_name=repo_name or None,
+            )
+        except Exception as journal_exc:
+            logger.warning(
+                "[upload_service] Failed to read journal summary for %s: %s",
+                workspace_path,
+                journal_exc,
+            )
+            journal_summary = {
+                "total": 0,
+                "retryable": 0,
+                "outstanding": 0,
+                "exhausted": 0,
+                "counts": {},
+                "sample_errors": [],
+            }
 
         # Get last sequence
         last_sequence = get_last_sequence(workspace_path)
@@ -1484,7 +1510,13 @@ async def get_status(workspace_path: str):
             collection_name=collection_name,
             last_sequence=last_sequence,
             last_upload=last_upload,
-            pending_operations=0,
+            pending_operations=int(
+                journal_summary.get(
+                    "outstanding",
+                    journal_summary.get("retryable", 0),
+                )
+                or 0
+            ),
             status=workspace_status,
             server_info={
                 "version": "1.0.0",
@@ -1495,6 +1527,7 @@ async def get_status(workspace_path: str):
                 "last_processed_operations": upload_result.get("processed_operations"),
                 "last_upload_status": upload_status or None,
                 "last_error": upload_result.get("error"),
+                "journal": journal_summary,
             }
         )
 
@@ -1646,6 +1679,7 @@ async def plan_delta(request: PlanRequest):
             ),
             needed_size_bytes=int(plan.get("needed_size_bytes", 0) or 0),
             replica_targets=list(plan.get("replica_targets", []) or []),
+            diagnostics=dict(plan.get("diagnostics", {}) or {}),
             fallback_used=False,
             error=None,
         )
@@ -1668,6 +1702,7 @@ async def plan_delta(request: PlanRequest):
             },
             needed_size_bytes=0,
             replica_targets=[],
+            diagnostics={},
             fallback_used=True,
             error={
                 "code": "PLAN_ERROR",
@@ -1779,7 +1814,10 @@ async def apply_delta_ops(request: ApplyOperationsRequest):
             + (operations_count or {}).get("moved", 0)
         )
         status_value = "completed" if failed_count == 0 else "failed"
-        if applied_count > 0:
+        operation_count = int(
+            applied_count + (operations_count or {}).get("skipped_hash_match", 0)
+        )
+        if operation_count > 0 and failed_count == 0:
             _sequence_tracker[key] = sequence_number
         _upload_result_tracker[key] = {
             "workspace_path": workspace_path,

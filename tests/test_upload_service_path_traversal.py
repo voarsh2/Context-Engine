@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import tarfile
@@ -26,9 +27,21 @@ def _write_bundle(tmp_path: Path, operations: list[dict]) -> Path:
     return bundle_path
 
 
-def _write_bundle_with_moved_file(tmp_path: Path, dest_path: str, content: bytes) -> Path:
+def _write_bundle_with_moved_file(
+    tmp_path: Path,
+    dest_path: str,
+    content: bytes,
+    content_hash: str | None = None,
+) -> Path:
     bundle_path = tmp_path / "bundle.tar.gz"
-    operations = [{"operation": "moved", "path": dest_path, "source_path": "missing_src.txt"}]
+    operation = {
+        "operation": "moved",
+        "path": dest_path,
+        "source_path": "missing_src.txt",
+    }
+    if content_hash:
+        operation["content_hash"] = content_hash
+    operations = [operation]
     payload = json.dumps({"operations": operations}).encode("utf-8")
 
     with tarfile.open(bundle_path, "w:gz") as tar:
@@ -151,6 +164,37 @@ def test_process_delta_bundle_moved_falls_back_to_tar_payload_when_source_missin
 
     assert counts.get("moved") == 1
     assert (work_dir / slug / "dst.txt").read_bytes() == b"moved-payload"
+
+
+def test_process_delta_bundle_retries_already_applied_move_idempotently(
+    tmp_path, monkeypatch
+):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    content = b"moved-payload"
+    digest = hashlib.sha1(content).hexdigest()
+    target = work_dir / slug / "dst.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    bundle = _write_bundle_with_moved_file(
+        tmp_path, "dst.txt", content, content_hash=f"sha1:{digest}"
+    )
+
+    counts = us.process_delta_bundle(
+        workspace_path=f"/work/{slug}",
+        bundle_path=bundle,
+        manifest={"bundle_id": "b-moved-retry"},
+    )
+
+    assert counts["failed"] == 0
+    assert counts["skipped_hash_match"] == 1
+    assert target.read_bytes() == content
+
 
 
 def test_process_delta_bundle_slugged_workspace_creates_marker(tmp_path, monkeypatch):
@@ -723,6 +767,40 @@ def test_apply_delta_operations_moves_file_without_bundle(tmp_path, monkeypatch)
     assert counts["moved"] == 1
     assert not source.exists()
     assert (work_dir / slug / dest_rel).exists()
+
+
+def test_apply_delta_operations_retries_already_applied_move_idempotently(
+    tmp_path, monkeypatch
+):
+    import scripts.upload_delta_bundle as us
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(us, "WORK_DIR", str(work_dir))
+
+    slug = "repo-0123456789abcdef"
+    content = b"print('move')\n"
+    digest = hashlib.sha1(content).hexdigest()
+    target = work_dir / slug / "src" / "new.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+
+    counts = us.apply_delta_operations(
+        workspace_path=f"/work/{slug}",
+        operations=[
+            {
+                "operation": "moved",
+                "path": "src/new.py",
+                "source_path": "src/old.py",
+                "content_hash": f"sha1:{digest}",
+            }
+        ],
+        file_hashes={"src/new.py": f"sha1:{digest}"},
+    )
+
+    assert counts["failed"] == 0
+    assert counts["skipped_hash_match"] == 1
+    assert target.read_bytes() == content
 
 
 def test_apply_delta_operations_raises_clear_error_when_no_replica_roots(tmp_path, monkeypatch):

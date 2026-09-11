@@ -35,6 +35,17 @@ def _normalize_hash_value(value: Any) -> str:
     return raw.lower()
 
 
+def _file_matches_hash(path: Path, expected_hash: str) -> bool:
+    """Verify a destination is already the requested content for idempotent retries."""
+    expected = _normalize_hash_value(expected_hash)
+    if not expected or not path.is_file():
+        return False
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest() == expected
+    except OSError:
+        return False
+
+
 def _build_upsert_journal_entry(path: Path | str, content_hash: Optional[str]) -> Dict[str, Any]:
     entry: Dict[str, Any] = {
         "path": str(path),
@@ -261,7 +272,14 @@ def _resolve_replica_roots(workspace_path: str, *, create_missing: bool = True) 
             desired = [canonical, old_slug]
             slug_order = [s for s in desired if _SLUGGED_REPO_RE.match(s)]
     elif staging_gate and not staging_active and serving_candidate:
-        if serving_candidate in slug_order:
+        # Keep the canonical replica when serving and active are the same.
+        # A serving-only target should be removed only when a distinct active
+        # replica is available.
+        if (
+            active_slug
+            and active_slug != serving_candidate
+            and serving_candidate in slug_order
+        ):
             slug_order = [s for s in slug_order if s != serving_candidate]
 
     if staging_gate:
@@ -365,6 +383,13 @@ def plan_delta_upload(
         slug: _load_replica_cache_hashes(root, slug)
         for slug, root in replica_roots.items()
     }
+    diagnostics = {
+        "candidate_operations": len(operations or []),
+        "cache_entries": sum(len(hashes) for hashes in replica_cache_hashes.values()),
+        "cache_hash_matches": 0,
+        "hash_mismatches": 0,
+        "missing_targets": 0,
+    }
     normalized_hashes = {
         str(rel_path): _normalize_hash_value(hash_value)
         for rel_path, hash_value in (file_hashes or {}).items()
@@ -440,9 +465,17 @@ def plan_delta_upload(
                 continue
             target_key = _normalize_cache_key_path(str(target_path))
             cached_hash = replica_cache_hashes.get(slug, {}).get(target_key)
-            if cached_hash != op_content_hash:
-                needs_content = True
-                break
+            # A cache hit is only authoritative while the indexed replica file
+            # still exists. Otherwise a stale cache entry can suppress repair.
+            if cached_hash == op_content_hash and target_path.is_file():
+                continue
+
+            needs_content = True
+            if not target_path.is_file():
+                diagnostics["missing_targets"] += 1
+            else:
+                diagnostics["hash_mismatches"] += 1
+            break
 
         if needs_content:
             needed_files[op_type].append(sanitized)
@@ -451,12 +484,29 @@ def plan_delta_upload(
         else:
             operations_count["skipped"] += 1
             operations_count["skipped_hash_match"] += 1
+            diagnostics["cache_hash_matches"] += 1
+
+    diagnostics["needed_content_operations"] = sum(
+        operations_count[op_type] for op_type in ("created", "updated", "moved")
+    )
+    logger.info(
+        "[upload_service] Delta plan workspace=%s targets=%s candidates=%d "
+        "needed=%d skipped_hash_match=%d cache_entries=%d cache_matches=%d",
+        workspace_path,
+        list(replica_roots.keys()),
+        diagnostics["candidate_operations"],
+        diagnostics["needed_content_operations"],
+        operations_count["skipped_hash_match"],
+        diagnostics["cache_entries"],
+        diagnostics["cache_hash_matches"],
+    )
 
     return {
         "needed_files": needed_files,
         "operation_counts_preview": operations_count,
         "needed_size_bytes": needed_size_bytes,
         "replica_targets": list(replica_roots.keys()),
+        "diagnostics": diagnostics,
     }
 
 
@@ -546,6 +596,23 @@ def apply_delta_operations(
 
                     safe_source_path = _safe_join(root, source_rel_path or "")
                     if not safe_source_path.exists():
+                        if _file_matches_hash(target_path, op_content_hash):
+                            replica_hashes.pop(
+                                _normalize_cache_key_path(str(safe_source_path)), None
+                            )
+                            replica_hashes[target_key] = op_content_hash
+                            journal_entries_by_slug.setdefault(slug, []).extend(
+                                [
+                                    _build_delete_journal_entry(
+                                        safe_source_path, op_content_hash
+                                    ),
+                                    _build_upsert_journal_entry(
+                                        target_path, op_content_hash
+                                    ),
+                                ]
+                            )
+                            replica_results[slug] = "skipped_hash_match"
+                            continue
                         replica_results[slug] = "failed"
                         continue
 
@@ -584,16 +651,26 @@ def apply_delta_operations(
                     replica_results[slug] = "failed"
 
             applied_any = any(result == "applied" for result in replica_results.values())
-            success_all = all(result == "applied" for result in replica_results.values())
+            skipped_hash_match = bool(replica_results) and all(
+                result in {"applied", "skipped_hash_match"}
+                for result in replica_results.values()
+            )
+            success_all = skipped_hash_match
             if applied_any:
                 operations_count[op_type] += 1
                 if not success_all:
+                    # Keep the operation count as applied for reporting, but
+                    # surface the replica failure so the sequence is retried.
+                    operations_count["failed"] += 1
                     logger.debug(
                         "[upload_service] Partial metadata-only success for %s %s: %s",
                         op_type,
                         rel_path,
                         replica_results,
                     )
+            elif skipped_hash_match:
+                operations_count["skipped"] += 1
+                operations_count["skipped_hash_match"] += 1
             else:
                 operations_count["failed"] += 1
 
@@ -742,7 +819,7 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
 
                 try:
                     if op_type == "created":
-                        if op_content_hash and target_path.exists():
+                        if op_content_hash and target_path.is_file():
                             cached_hash = replica_hashes.get(target_key)
                             if cached_hash and cached_hash == op_content_hash:
                                 return "skipped_hash_match"
@@ -764,7 +841,7 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                             return "failed"
 
                     elif op_type == "updated":
-                        if op_content_hash and target_path.exists():
+                        if op_content_hash and target_path.is_file():
                             cached_hash = replica_hashes.get(target_key)
                             if cached_hash and cached_hash == op_content_hash:
                                 return "skipped_hash_match"
@@ -821,6 +898,21 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                                 ]
                             )
                             return "applied"
+                        if _file_matches_hash(target_path, op_content_hash):
+                            replica_hashes[target_key] = op_content_hash
+                            if safe_source_path:
+                                replica_hashes.pop(
+                                    _normalize_cache_key_path(str(safe_source_path)), None
+                                )
+                                journal_entries_by_slug.setdefault(slug, []).append(
+                                    _build_delete_journal_entry(
+                                        safe_source_path, op_content_hash
+                                    )
+                                )
+                            journal_entries_by_slug.setdefault(slug, []).append(
+                                _build_upsert_journal_entry(target_path, op_content_hash)
+                            )
+                            return "skipped_hash_match"
                         # Remote uploads may not have the source file on the server (e.g. staging
                         # mirrors). In that case, clients can embed the destination content under
                         # files/moved/<dest>.
@@ -888,6 +980,9 @@ def process_delta_bundle(workspace_path: str, bundle_path: Path, manifest: Dict[
                     operations_count.setdefault(op_type, 0)
                     operations_count[op_type] += 1
                     if not success_all:
+                        # A retry can skip replicas that already match while
+                        # repairing the replica that failed this attempt.
+                        operations_count["failed"] += 1
                         logger.debug(
                             f"[upload_service] Partial success for {op_type} {rel_path}: {replica_results}"
                         )
