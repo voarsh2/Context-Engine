@@ -137,11 +137,6 @@ def _desired_vector_configs(
             )
     except Exception:
         pass
-    try:
-        pass  # pattern vectors removed
-    except Exception:
-        pass
-
     sparse_cfg = None
     if LEX_SPARSE_MODE:
         sparse_cfg = {
@@ -328,7 +323,6 @@ def ensure_collection(
 
     Always includes dense (vector_name) and lexical (LEX_VECTOR_NAME).
     When REFRAG_MODE=1, also includes a compact mini vector (MINI_VECTOR_NAME).
-    When PATTERN_VECTORS=1, also includes pattern_vector for structural similarity.
     """
     mode = _normalize_schema_mode(schema_mode)
     if mode != "legacy":
@@ -407,11 +401,6 @@ def ensure_collection(
             )
     except Exception:
         pass
-    try:
-        pass  # pattern vectors removed
-    except Exception:
-        pass
-
     sparse_cfg = None
     if LEX_SPARSE_MODE:
         sparse_cfg = {
@@ -541,10 +530,6 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
                 size=int(os.environ.get("MINI_VEC_DIM", MINI_VEC_DIM) or MINI_VEC_DIM),
                 distance=models.Distance.COSINE,
             )
-    except Exception:
-        pass
-    try:
-        pass  # pattern vectors removed
     except Exception:
         pass
     sparse_cfg = None

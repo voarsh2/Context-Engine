@@ -585,7 +585,6 @@ def _index_single_file_inner(
     batch_ids: List[int] = []
     batch_lex: List[list[float]] = []
     batch_lex_text: List[str] = []
-    batch_code: List[str] = []  # Raw code for pattern vectors
 
     if allowed_vectors is None and allowed_sparse is None:
         allowed_vectors, allowed_sparse = get_collection_vector_names(client, collection)
@@ -598,7 +597,7 @@ def _index_single_file_inner(
     use_mini = refrag_on and allow_mini
     use_sparse = LEX_SPARSE_MODE and allow_sparse
 
-    def make_point(pid, dense_vec, lex_vec, payload, lex_text: str = "", code_text: str = ""):
+    def make_point(pid, dense_vec, lex_vec, payload, lex_text: str = ""):
         if vector_name:
             vecs = {vector_name: dense_vec}
             if allow_lex:
@@ -608,7 +607,6 @@ def _index_single_file_inner(
                     vecs[MINI_VECTOR_NAME] = project_mini(list(dense_vec), MINI_VEC_DIM)
             except Exception:
                 pass
-            # Pattern vectors removed
             if use_sparse and lex_text:
                 sparse_vec = _lex_sparse_vector_text(lex_text)
                 if sparse_vec.get("indices"):
@@ -774,7 +772,6 @@ def _index_single_file_inner(
         aug_lex_text = (ch.get("text") or "") + (" " + pseudo if pseudo else "") + (" " + " ".join(tags) if tags else "")
         batch_lex.append(_lex_hash_vector_text(aug_lex_text))
         batch_lex_text.append(aug_lex_text)
-        batch_code.append(ch.get("text") or "")
 
     if batch_texts:
         vectors = embed_batch(model, batch_texts)
@@ -784,8 +781,8 @@ def _index_single_file_inner(
             except Exception:
                 pass
         points = [
-            make_point(i, v, lx, m, lt, ct)
-            for i, v, lx, m, lt, ct in zip(batch_ids, vectors, batch_lex, batch_meta, batch_lex_text, batch_code)
+            make_point(i, v, lx, m, lt)
+            for i, v, lx, m, lt in zip(batch_ids, vectors, batch_lex, batch_meta, batch_lex_text)
         ]
         upsert_points(client, collection, points)
 
@@ -1576,7 +1573,6 @@ def process_file_with_smart_reindexing(
                         vecs[MINI_VECTOR_NAME] = project_mini(list(v), MINI_VEC_DIM)
                 except Exception:
                     pass
-                # Pattern vectors removed
                 if use_sparse and lt:
                     sparse_vec = _lex_sparse_vector_text(lt)
                     if sparse_vec.get("indices"):

@@ -65,7 +65,6 @@ def _patch_qdrant_models(monkeypatch, ingest_pipeline):
 
 
 def _patch_smart_side_effects(monkeypatch, ingest_pipeline):
-    monkeypatch.setenv("PATTERN_VECTORS", "0")
     monkeypatch.setenv("LEX_SPARSE_MODE", "0")
     monkeypatch.setattr(ingest_pipeline, "LEX_SPARSE_MODE", False)
     monkeypatch.setattr(

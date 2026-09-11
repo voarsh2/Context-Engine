@@ -181,9 +181,8 @@ Components:
 Key env vars: `RELEVANCE_BOOST_FACTOR`, `RELEVANCE_RECALL_MAX`,
 `RELEVANCE_GRAPH_RECALL_MAX`, `RERANKER_WEIGHTS_DIR`, `RERANK_EVENTS_DIR`
 
-Note: This replaces a previous self-supervised ML pipeline (`rerank_recursive/`,
-`learning_reranker_worker.py`) that tried to learn from ONNX reranker outputs.
-That system was removed in favor of explicit human/agent ratings.
+This replaces the former self-supervised ranking experiment with explicit
+human/agent ratings and bounded feedback recall.
 
 ## Data Flow Architecture
 

@@ -22,7 +22,6 @@ Runs evaluation against the CoSQA benchmark, computing:
 - [x] Enriched embeddings (symbols + imports + docstring + code)
 - [x] Lexical hash vectors (for hybrid search)
 - [ ] ReFRAG/micro-chunks (requires REFRAG_MODE=1, off by default)
-- [ ] Pattern vectors (requires indexed pattern vectors)
 
 **Not Applicable (CoSQA limitations):**
 - N/A Semantic chunking (snippets are atomic units)
@@ -54,7 +53,6 @@ import asyncio
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -102,11 +100,6 @@ def _load_benchmark_env() -> None:
     # Set defaults AFTER loading .env so .env takes priority
     os.environ.setdefault("RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual")
     os.environ.setdefault("RERANK_IN_PROCESS", "1")
-    # Hard-disable learning/recursive reranker for deterministic benchmarks
-    # (unless explicitly enabled via --learning-worker flag or COSQA_ENABLE_LEARNING env var)
-    if not os.environ.get("COSQA_ENABLE_LEARNING") and os.environ.get("RERANK_LEARNING") != "1":
-        os.environ["RERANK_LEARNING"] = "0"
-        os.environ["RERANK_EVENTS_ENABLED"] = "0"
     # Disable sparse vectors for CoSQA benchmarks to avoid missing lex-sparse dims
     os.environ["LEX_SPARSE_MODE"] = "0"
     # Benchmarks should not be scoped or cached by workspace repo state
@@ -555,7 +548,6 @@ async def run_cosqa_benchmark(
             # Reranker
             "RERANKER_MODEL": os.environ.get("RERANKER_MODEL", ""),
             "RERANK_IN_PROCESS": os.environ.get("RERANK_IN_PROCESS", ""),
-            "RERANK_LEARNING": os.environ.get("RERANK_LEARNING", ""),
             # Hybrid search
             "HYBRID_IN_PROCESS": os.environ.get("HYBRID_IN_PROCESS", ""),
             "HYBRID_EXPAND": os.environ.get("HYBRID_EXPAND", ""),
@@ -965,17 +957,6 @@ async def run_full_benchmark(
     return report
 
 
-def _spawn_learning_worker(collection: str, project_root: Path) -> subprocess.Popen:
-    cmd = [
-        sys.executable,
-        str(project_root / "scripts" / "learning_reranker_worker.py"),
-        "--daemon",
-        "--collection",
-        collection,
-    ]
-    return subprocess.Popen(cmd, cwd=project_root, env=os.environ.copy())
-
-
 def main():
     """CLI entrypoint for CoSQA benchmark."""
 
@@ -996,8 +977,6 @@ def main():
                         help="Disable query expansion")
     parser.add_argument("--recreate", action="store_true",
                         help="Recreate index from scratch")
-    parser.add_argument("--learning-worker", action="store_true",
-                        help="Spawn learning reranker worker during the run (enables learning + event logging)")
     parser.add_argument("--pure-semantic", action="store_true",
                         help="Disable FNAME_BOOST and other heuristics (old hardened mode)")
     parser.add_argument("--enable-llm", action="store_true",
@@ -1073,26 +1052,6 @@ def main():
     os.environ["RERANKER_ONNX_PATH"] = str(_project_root / "models" / "model_qint8_avx512_vnni.onnx")
     os.environ["RERANKER_TOKENIZER_PATH"] = str(_project_root / "models" / "tokenizer.json")
 
-    learning_proc = None
-    if args.learning_worker:
-        if args.no_rerank:
-            print("  [WARN] --learning-worker ignored because --no-rerank is set")
-        else:
-            # Pre-compute PCA initialization for projection layer (cold-start fix)
-            print("  [learning] Pre-computing PCA initialization...")
-            from scripts.benchmarks.cosqa.pca_init import compute_pca_init_for_collection
-            pca_success = compute_pca_init_for_collection(
-                collection=args.collection,
-                sample_limit=1000,
-            )
-            if not pca_success:
-                print("  [WARN] PCA initialization failed, using random init")
-
-            os.environ["RERANK_LEARNING"] = "1"
-            os.environ["RERANK_EVENTS_ENABLED"] = "1"
-            learning_proc = _spawn_learning_worker(args.collection, _project_root)
-            print(f"  [learning-worker] Started (pid {learning_proc.pid}) for {args.collection}")
-
     # Verify config compatibility BEFORE running anything
     if not args.recreate:
         try:
@@ -1100,30 +1059,20 @@ def main():
             verify_config_compatibility(get_qdrant_client(), args.collection)
         except Exception as e:
             print(f"\nCONFIGURATION ERROR: {e}")
-            if learning_proc and learning_proc.poll() is None:
-                learning_proc.kill()
             sys.exit(1)
 
-    try:
-        report = asyncio.run(run_full_benchmark(
-            split=args.split,
-            collection=args.collection,
-            limit=args.limit,
-            query_limit=args.query_limit,
-            corpus_limit=args.corpus_limit,
-            rerank_enabled=not args.no_rerank,
-            mode=args.mode,
-            recreate_index=args.recreate,
-            index_only=args.index_only,
-            skip_index=args.skip_index,
-        ))
-    finally:
-        if learning_proc and learning_proc.poll() is None:
-            learning_proc.terminate()
-            try:
-                learning_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                learning_proc.kill()
+    report = asyncio.run(run_full_benchmark(
+        split=args.split,
+        collection=args.collection,
+        limit=args.limit,
+        query_limit=args.query_limit,
+        corpus_limit=args.corpus_limit,
+        rerank_enabled=not args.no_rerank,
+        mode=args.mode,
+        recreate_index=args.recreate,
+        index_only=args.index_only,
+        skip_index=args.skip_index,
+    ))
 
     if report:
         print_report(report)

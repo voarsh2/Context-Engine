@@ -588,36 +588,6 @@ Index the entire workspace root (`/work`).
 
 **Returns:** Subprocess result with indexing status.
 
-### pattern_search()
-
-Find structurally similar code patterns across languages. Requires `PATTERN_VECTORS=1`.
-
-**Parameters:**
-- `query` (str, required): Code snippet OR natural language pattern description
-- `language` (str, default "python"): Language hint for code queries
-- `limit` (int, default 10): Maximum results
-- `min_score` (float, default 0.3): Similarity threshold
-- `include_snippet` (bool): Include code in results
-- `target_languages` (list[str]): Filter target languages
-
-**Response:**
-```json
-{
-  "ok": true,
-  "results": [{"path": "...", "start_line": 45, "score": 0.94, "control_flow_signature": "L2_2_B0_T2_M0__C_TL"}],
-  "total": 5,
-  "query_signature": "L2_2_B0_T2_M0__C_TL",
-  "query_mode": "code"
-}
-```
-
-**Signature format:** `L{loop_depth}_{count}_B{branches}_T{try}_M{match}_{flags}` where flags include `TL` (retry pattern), `BL` (filter pattern).
-
-**Example:**
-```json
-{"query": "for i in range(3): try: fetch() except: sleep(i)", "include_snippet": true}
-```
-
 ### symbol_graph()
 
 First-class symbol graph navigation using indexed metadata fields:

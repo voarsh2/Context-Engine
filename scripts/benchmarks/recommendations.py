@@ -181,26 +181,6 @@ TUNABLE_KNOBS = {
         "category": "expansion",
     },
     
-    # === Learning Reranker ===
-    "RERANK_LLM_TEACHER": {
-        "description": "Enable LLM teacher for learning reranker",
-        "default": 1, "type": "bool", "range": (0, 1),
-        "impacts": ["learning_quality"],
-        "category": "learning",
-    },
-    "RERANK_LLM_SAMPLE_RATE": {
-        "description": "Sample rate for LLM teacher feedback",
-        "default": 1.0, "type": "float", "range": (0.0, 1.0),
-        "impacts": ["learning_speed", "cost"],
-        "category": "learning",
-    },
-    "RERANK_VICREG_WEIGHT": {
-        "description": "Weight for VICReg regularization loss",
-        "default": 0.1, "type": "float", "range": (0.0, 1.0),
-        "impacts": ["embedding_diversity"],
-        "category": "learning",
-    },
-    
     # === Limits / Defaults ===
     "REPO_SEARCH_DEFAULT_LIMIT": {
         "description": "Default result limit for repo_search",
@@ -285,19 +265,15 @@ def generate_recommendations(
     # Extract metrics
     eval_metrics = components.get("eval_harness", {}).get("metrics", {})
     eval_latency = components.get("eval_harness", {}).get("latency", {})
-    trm_metrics = components.get("trm_reranker", {}).get("metrics", {})
     refrag_metrics = components.get("refrag", {}).get("metrics", {})
-    expand_metrics = components.get("query_expansion", {}).get("metrics", {})
     
     mrr = eval_metrics.get("mrr", 0)
     recall_5 = eval_metrics.get("recall@5", 0)
     recall_10 = eval_metrics.get("recall@10", 0)
-    precision_5 = eval_metrics.get("precision@5", 0)
     # Note: eval harness emits p90_ms, not p90
-    p90_latency = eval_latency.get("p90_ms", 0) or trm_metrics.get("p90_latency_ms", 0)
+    p90_latency = eval_latency.get("p90_ms", 0)
     grounding = refrag_metrics.get("grounding_rate", 1.0)
     citations = refrag_metrics.get("avg_citations", 0)
-    kendall_tau = trm_metrics.get("kendall_tau", 0)
     
     # =========================================================================
     # MRR Recommendations
@@ -437,25 +413,6 @@ def generate_recommendations(
                 "expected_impact": "-200-500ms per query",
                 "confidence": "medium",
                 "rationale": "PRF adds an extra retrieval round-trip.",
-            })
-    
-    # =========================================================================
-    # Learning Reranker Recommendations
-    # =========================================================================
-    if kendall_tau > 0.9:
-        # High correlation = learning is working well
-        if current_config.get("RERANK_LLM_SAMPLE_RATE", 1.0) > 0.5:
-            recommendations.append({
-                "priority": "low",
-                "component": "learning",
-                "metric": "kendall_tau",
-                "current_value": kendall_tau,
-                "target_value": 0.95,
-                "action": "Reduce RERANK_LLM_SAMPLE_RATE to save cost",
-                "config_changes": {"RERANK_LLM_SAMPLE_RATE": 0.3},
-                "expected_impact": "-70% teacher API calls, minimal quality loss",
-                "confidence": "medium",
-                "rationale": "High tau indicates model has learned well; less feedback needed.",
             })
     
     # Sort by priority

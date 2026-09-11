@@ -5,7 +5,7 @@
 # Core search functionality
 hybrid search RRF ranking implementation
 memory store implementation details
-recursive reranker learning workflow
+relevance feedback graph recall workflow
 
 # Embeddings and models
 embedder model loading and caching

@@ -107,9 +107,9 @@ GROUNDING_TEST_QUERIES = [
         "expected_files": ["hybrid_search.py", "ranking.py"],
     },
     {
-        "query": "What is the purpose of the recursive reranker's latent state z?",
-        "expected_topics": ["latent", "state", "refinement", "TRM", "iteration"],
-        "expected_files": ["rerank_recursive", "core.py"],
+        "query": "How does relevance feedback recall adjacent code?",
+        "expected_topics": ["feedback", "ratings", "graph", "caller", "relevance"],
+        "expected_files": ["relevance_feedback.py", "search.py"],
     },
     {
         "query": "How does context_answer handle insufficient context?",

@@ -10,7 +10,7 @@ Key features:
 - Config fingerprinting for smart collection reuse
 - Batch processing with progress tracking
 - AST-aware symbol extraction
-- Multi-vector support (dense, lexical, mini, pattern, sparse)
+- Multi-vector support (dense, lexical, mini, sparse)
 """
 from __future__ import annotations
 
@@ -154,7 +154,6 @@ def get_config_fingerprint() -> str:
         f"mini_dim:{MINI_VEC_DIM}",
         f"mini_seed:{os.environ.get('MINI_VEC_SEED', '1337')}",
         f"lex_sparse:{os.environ.get('LEX_SPARSE_MODE', '0')}",
-        f"pattern_vectors:{os.environ.get('PATTERN_VECTORS', '0')}",
         f"index_micro:{os.environ.get('INDEX_MICRO_CHUNKS', '0')}",
         f"micro_tokens:{os.environ.get('MICRO_CHUNK_TOKENS', '16')}",
         f"micro_stride:{os.environ.get('MICRO_CHUNK_STRIDE', '')}",
@@ -682,4 +681,3 @@ def index_benchmark_corpus(
         "duration_sec": duration,
         "reused": False,
     }
-

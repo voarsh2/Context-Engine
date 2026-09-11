@@ -6,7 +6,6 @@ export DOCKER_HOST =
 
 .PHONY: help up down logs ps restart rebuild index reindex watch watch-remote env hybrid bootstrap history rerank-local setup-reranker prune warm health test test-full test-integration test-e2e
 .PHONY: venv venv-install dev-remote-up dev-remote-down dev-remote-logs dev-remote-restart dev-remote-bootstrap dev-remote-test dev-remote-client dev-remote-clean
-.PHONY: rerank-eval rerank-eval-ablations rerank-benchmark
 
 venv: ## create local virtualenv .venv
 	python3 -m venv .venv && . .venv/bin/activate && pip install -U pip
@@ -315,14 +314,3 @@ ctx: ## enhance a prompt with repo context: make ctx Q="your question" [ARGS='--
 	  exit 1; \
 	fi; \
 	python3 scripts/ctx.py "$(Q)" $(ARGS)
-
-
-# --- Reranker Evaluation ---
-rerank-eval: ## run offline reranker evaluation (fixed queries, MRR/Recall/latency)
-	python3 -m scripts.rerank_tools.eval --output rerank_eval_results.json
-
-rerank-eval-ablations: ## run full ablation study (baseline, recursive, learning, onnx)
-	python3 -m scripts.rerank_tools.eval --ablations --output rerank_eval_ablations.json
-
-rerank-benchmark: ## run production benchmark on real codebase
-	python3 -m scripts.rerank_tools.benchmark

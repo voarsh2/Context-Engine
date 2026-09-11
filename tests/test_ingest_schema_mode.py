@@ -61,12 +61,10 @@ class FakeClient:
 
 
 def test_schema_mode_validate_errors_on_missing_vectors(monkeypatch):
-    monkeypatch.setenv("PATTERN_VECTORS", "1")
     monkeypatch.setattr(ingq, "LEX_SPARSE_MODE", False)
 
     existing_vectors = {
         "code": object(),
-        ingq.LEX_VECTOR_NAME: object(),
     }
     payload_schema = {field: object() for field in ingq.PAYLOAD_INDEX_FIELDS}
     client = FakeClient(
@@ -89,13 +87,11 @@ def test_schema_mode_validate_errors_on_missing_vectors(monkeypatch):
 
 
 def test_schema_mode_migrate_adds_missing_vectors_and_indexes(monkeypatch):
-    monkeypatch.setenv("PATTERN_VECTORS", "1")
     monkeypatch.setattr(ingq, "LEX_SPARSE_MODE", False)
     ingq.ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard("test-collection")
 
     existing_vectors = {
         "code": object(),
-        ingq.LEX_VECTOR_NAME: object(),
     }
     client = FakeClient(
         collection_exists=True,
@@ -114,14 +110,13 @@ def test_schema_mode_migrate_adds_missing_vectors_and_indexes(monkeypatch):
     assert client.create_calls == []
     assert client.update_calls
     updated_vectors = client.update_calls[0]["vectors_config"]
-    assert ingq.PATTERN_VECTOR_NAME in updated_vectors
+    assert ingq.LEX_VECTOR_NAME in updated_vectors
     assert any(
         c["field_name"] == "metadata.language" for c in client.payload_index_calls
     )
 
 
 def test_schema_mode_create_creates_collection_only(monkeypatch):
-    monkeypatch.setenv("PATTERN_VECTORS", "0")
     monkeypatch.setattr(ingq, "LEX_SPARSE_MODE", False)
     ingq.ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard("test-collection")
 

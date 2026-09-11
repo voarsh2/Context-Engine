@@ -242,7 +242,7 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
             {"tool": "repo_search", "query": "embedder", "profile": "code"},
             {"tool": "repo_search", "query": "embedding dimension vector size"},
         ],
-        "expected_paths": ["embedder.py", "rerank_recursive"],
+        "expected_paths": ["embedder.py"],
     },
     "documentation": {
         "description": "Generate explanation of a module",

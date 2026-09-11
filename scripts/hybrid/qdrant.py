@@ -243,8 +243,7 @@ def _ensure_collection(client, collection: str, dim: int, vec_name: str):
     """Cached wrapper for ensure_collection - only calls once per (endpoint, collection, vec_name) pair.
 
     IMPORTANT: This is called during SEARCH operations. We must NOT delete/recreate collections
-    that already exist with data. The ensure_collection in ingest_code can trigger recreation
-    when PATTERN_VECTORS=1 or LEX_SPARSE_MODE=1 if the collection lacks those vectors.
+    that already exist with data. Schema changes belong to the ingestion path, not search.
 
     For search, we only need to verify the collection exists - not modify its schema.
     """

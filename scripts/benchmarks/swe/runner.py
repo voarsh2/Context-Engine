@@ -22,7 +22,6 @@ modified in the ground-truth patch.
 - [x] Lexical hash vectors (for hybrid search)
 - [x] Git metadata (commit, author, date)
 - [ ] ReFRAG micro-chunks (enable with REFRAG_MODE=1)
-- [ ] Pattern vectors (enable with INDEX_PATTERN_VECTORS=1)
 
 **Search Pipeline (via mcp_indexer_server.repo_search):**
 - [x] Hybrid search (dense + lexical RRF fusion)
@@ -60,8 +59,6 @@ Reranking:
     RERANK_IN_PROCESS=1          # Run reranker in-process (required for reliability)
     RERANKER_TOPN=50             # Number of candidates to rerank
     RERANKER_RETURN_M=20         # Number of results to return after rerank
-    RERANK_LEARNING=0            # Disable learning reranker (default: off for benchmarks)
-    RERANK_EVENTS_ENABLED=0      # Disable event logging (default: off for benchmarks)
 
 Hybrid Search Weights:
     HYBRID_RRF_K=30              # RRF constant (higher = more uniform)
@@ -122,12 +119,10 @@ if "DEFAULT_COLLECTION" in os.environ:
 
 # Disable features that trigger collection recreation or add extra vectors:
 # - LEX_SPARSE_MODE: Requires sparse vectors, triggers recreation if missing
-# - PATTERN_VECTORS: Requires pattern_vector, triggers recreation if missing
 # - REFRAG_MODE: Adds mini vector, causes schema mismatch with existing collections
 # - INDEX_MICRO_CHUNKS: Uses token-based micro chunking, different schema
 # These can destroy indexed data when ensure_collection is called during search!
 os.environ["LEX_SPARSE_MODE"] = "0"
-os.environ["PATTERN_VECTORS"] = "0"
 os.environ["REFRAG_MODE"] = "0"
 os.environ["INDEX_MICRO_CHUNKS"] = "0"
 
@@ -178,10 +173,6 @@ def _apply_swe_env_config(
     os.environ["RERANKER_ENABLED"] = "1" if rerank_enabled else "0"
     os.environ["RERANK_ENABLED"] = "1" if rerank_enabled else "0"
     os.environ.setdefault("RERANK_IN_PROCESS", "1")
-
-    # Disable learning reranker for reproducible benchmarks
-    os.environ.setdefault("RERANK_LEARNING", "0")
-    os.environ.setdefault("RERANK_EVENTS_ENABLED", "0")
 
     # Set reranker model paths (relative to project root)
     _project_root = Path(__file__).parent.parent.parent.parent

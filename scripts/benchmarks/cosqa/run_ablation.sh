@@ -26,7 +26,6 @@ run_one() {
   local refrag="$2"
   local micro="$3"
   local rerank="$4"
-  local learning="$5"
   local collection="${COLL_PREFIX}-${label}-${RUN_TAG}"
   local output="${OUT_DIR}/cosqa_${label}.json"
   local log="${LOG_DIR}/cosqa_${label}.log"
@@ -48,17 +47,11 @@ run_one() {
   if [ "${rerank}" = "0" ]; then
     args+=("--no-rerank")
   fi
-  if [ "${learning}" = "1" ]; then
-    args+=("--learning-worker")
-  fi
-
   mkdir -p "${OUT_DIR}" "${LOG_DIR}"
   (
     export "${BASE_ENV[@]}"
     export REFRAG_MODE="${refrag}"
     export INDEX_MICRO_CHUNKS="${micro}"
-    export RERANK_LEARNING="${learning}"
-    export RERANK_EVENTS_ENABLED="${learning}"
     "${PYTHON_BIN}" "${args[@]}"
   ) > "${log}" 2>&1
 
@@ -66,9 +59,7 @@ run_one() {
   echo "     log: ${log}"
 }
 
-run_one "norerank_norefrag" 0 0 0 0
-run_one "norerank_refrag" 1 1 0 0
-run_one "rerank_norefrag" 0 0 1 0
-run_one "rerank_refrag" 1 1 1 0
-run_one "rerank_norefrag_learning" 0 0 1 1
-run_one "rerank_refrag_learning" 1 1 1 1
+run_one "norerank_norefrag" 0 0 0
+run_one "norerank_refrag" 1 1 0
+run_one "rerank_norefrag" 0 0 1
+run_one "rerank_refrag" 1 1 1

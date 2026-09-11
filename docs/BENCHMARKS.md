@@ -83,12 +83,11 @@ python -m scripts.benchmarks.cosqa.runner --limit 500 --enable-llm
 | `--debug` | Print detailed per-query debug output |
 | `--output FILE` | Output JSON report path |
 
-#### CoSQA ablation runs (refrag/mini, rerank, learning)
+#### CoSQA ablation runs (refrag/mini and reranking)
 
 Use the helper script to run a consistent matrix across:
 - rerank vs no rerank
 - ReFRAG/mini vectors vs no ReFRAG
-- learning vs no learning
 
 ```bash
 # Default: 50/50 subset per run, new collection per variant
@@ -107,7 +106,6 @@ Outputs:
 Useful knobs (env):
 - `QDRANT_URL`, `LEX_VECTOR_DIM`, `HYBRID_EXPAND`, `SEMANTIC_EXPANSION_ENABLED`
 - `RUN_TAG`, `COLL_PREFIX`, `OUT_DIR`, `LOG_DIR`
-- `COSQA_ENABLE_LEARNING` - Enable learning reranker (default: off for determinism)
 - `EMBEDDING_SEED` - Seed for deterministic embeddings
 
 #### Quick subset runs (smoke tests)
@@ -131,7 +129,6 @@ QDRANT_URL=http://localhost:6333 python3.11 -m scripts.benchmarks.cosqa.runner \
 
 CoSQA benchmarks are hardened for reproducibility:
 
-- **Learning reranker disabled** by default (`RERANK_LEARNING=0`) to avoid score drift
 - **Content-hash deduplication** prevents duplicate corpus entries across runs
 - **Schema validation** fails fast on LEX_DIM mismatches (avoids silent scoring bugs)
 - **Warmup query** runs before timing loop to exclude cold-start latency

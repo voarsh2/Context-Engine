@@ -134,8 +134,8 @@ GROUND_TRUTH_QUERIES = [
         "expected_files": ["hybrid/ranking.py", "hybrid_search.py", "hybrid/__init__.py"],
     },
     {
-        "query": "recursive reranker TRM learning",
-        "expected_files": ["rerank_recursive/core.py", "rerank_recursive/learning.py", "rerank_tools/recursive_reranker.py"],
+        "query": "relevance feedback graph recall",
+        "expected_files": ["relevance_feedback.py", "mcp_impl/search.py"],
     },
     {
         "query": "context_answer grounding citations",

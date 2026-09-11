@@ -11,10 +11,6 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Enable pattern vectors for pattern search tests
-os.environ.setdefault("PATTERN_VECTORS", "1")
-
-
 _INTEGRATION_TEST_FILES = {
     "test_collection_memory_backup_restore.py",
     "test_integration_qdrant.py",
