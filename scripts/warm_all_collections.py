@@ -5,6 +5,7 @@ Script to warm all collections in Qdrant
 import os
 import sys
 import subprocess
+from pathlib import Path
 from qdrant_client import QdrantClient
 
 def main():
@@ -12,6 +13,7 @@ def main():
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     ef = os.environ.get("EF", "256")
     limit = os.environ.get("LIMIT", "3")
+    script_dir = Path(__file__).resolve().parent
 
     print(f"Connecting to Qdrant at {qdrant_url}")
 
@@ -37,8 +39,8 @@ def main():
 
             result = subprocess.run(
                 [
-                    "python",
-                    "/app/scripts/warm_start.py",
+                    sys.executable or "python",
+                    str(script_dir / "warm_start.py"),
                     "--ef", ef,
                     "--limit", limit
                 ],

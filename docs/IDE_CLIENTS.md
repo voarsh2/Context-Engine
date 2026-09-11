@@ -229,7 +229,7 @@ url = "http://127.0.0.1:8003/mcp"
       "args": ["mcp-server-qdrant"],
       "env": {
         "QDRANT_URL": "http://localhost:6333",
-        "COLLECTION_NAME": "my-collection",
+        "COLLECTION_NAME": "codebase",
         "EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5"
       },
       "disabled": false
@@ -282,7 +282,7 @@ scripts/remote_upload_client.py --server http://context.yourcompany.com:9090 --p
 
 - **Do not send null values** to MCP tools. Omit the field or pass an empty string "" instead.
 - **qdrant-index examples:**
-  - `{"subdir":"","recreate":false,"collection":"my-collection","repo_name":"workspace"}`
+  - `{"subdir":"","recreate":false,"collection":"codebase","repo_name":"workspace"}`
   - `{"subdir":"scripts","recreate":true}`
 - For indexing repo root with no params, use `qdrant_index_root` (zero-arg) or call `qdrant-index` with `subdir:""`.
 
@@ -292,7 +292,7 @@ scripts/remote_upload_client.py --server http://context.yourcompany.com:9090 --p
 
 After configuring, you should see tools from both servers:
 - `store`, `find` (Memory)
-- `repo_search`, `code_search`, `context_search`, `context_answer` (Indexer)
+- `repo_search`, `context_search`, `context_answer` (Indexer)
 - `qdrant_list`, `qdrant_index`, `qdrant_prune`, `qdrant_status` (Indexer)
 
 Test connectivity:
@@ -327,4 +327,3 @@ When using `@context-engine-bridge/context-engine-mcp-bridge`, ensure you set `C
 ```
 
 The default collection name is `codebase` unless you've configured a different one during indexing.
-

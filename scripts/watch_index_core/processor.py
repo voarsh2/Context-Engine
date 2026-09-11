@@ -3,28 +3,47 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
+import atexit
+import threading
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from qdrant_client import models
+
 import scripts.ingest_code as idx
+from scripts.pseudo_config import effective_pseudo_mode
+from scripts.ingest.graph_edges import (
+    normalize_caller_path as _normalize_graph_caller_path,
+)
 from scripts.workspace_state import (
+    _normalize_cache_key_path,
     _extract_repo_name_from_path,
     get_cached_file_hash,
+    list_pending_index_journal_entries,
     get_workspace_state,
     is_staging_enabled,
     log_watcher_activity as _log_activity,
     persist_indexing_config,
     remove_cached_file,
+    set_cached_file_hash,
     set_indexing_progress as _update_progress,
     set_indexing_started as _set_status_indexing,
+    update_index_journal_entries_status,
+    update_index_journal_entry_status,
     update_indexing_status,
 )
+from . import config as watch_config
+from .rename import _rename_in_store
+from .paths import is_internal_metadata_path
 
-from .config import QDRANT_URL, ROOT, ROOT_DIR, LOGGER as logger
 from .utils import (
     _detect_repo_for_file, 
     _get_collection_for_file,
@@ -33,9 +52,332 @@ from .utils import (
     safe_log_error,
 )
 
+logger = watch_config.LOGGER
+
+_JOURNAL_STATUS_BATCH_LOCAL = threading.local()
+
+
+def _active_journal_status_batch() -> Optional[List[Dict[str, object]]]:
+    return getattr(_JOURNAL_STATUS_BATCH_LOCAL, "current", None)
+
+
+def _queue_journal_status(
+    path: Path,
+    repo_key: str,
+    repo_name: Optional[str],
+    *,
+    status: str,
+    error: Optional[str] = None,
+    remove_on_done: bool = True,
+) -> bool:
+    batch = _active_journal_status_batch()
+    if batch is None:
+        return False
+    batch.append(
+        {
+            "repo_key": repo_key,
+            "repo_name": repo_name,
+            "path": _normalize_cache_key_path(str(path)),
+            "status": status,
+            "error": error,
+            "remove_on_done": remove_on_done,
+        }
+    )
+    return True
+
+
+def _flush_journal_status_batch(updates: List[Dict[str, object]]) -> None:
+    if not updates:
+        return
+    grouped: Dict[tuple[str, Optional[str]], List[Dict[str, object]]] = {}
+    for update in updates:
+        key = (str(update["repo_key"]), update.get("repo_name"))
+        grouped.setdefault(key, []).append(update)
+
+    for (repo_key, repo_name), grouped_updates in grouped.items():
+        payload = [
+            {
+                "path": update["path"],
+                "status": update["status"],
+                "error": update.get("error"),
+                "remove_on_done": update.get("remove_on_done", True),
+            }
+            for update in grouped_updates
+        ]
+        try:
+            update_index_journal_entries_status(
+                payload,
+                workspace_path=repo_key,
+                repo_name=repo_name,
+            )
+            continue
+        except Exception:
+            logger.exception(
+                "watch_index::journal_bulk_status_failed",
+                extra={"repo_key": repo_key, "repo_name": repo_name, "count": len(payload)},
+            )
+
+        for update in payload:
+            try:
+                update_index_journal_entry_status(
+                    str(update["path"]),
+                    status=str(update["status"]),
+                    error=update.get("error"),
+                    workspace_path=repo_key,
+                    repo_name=repo_name,
+                    remove_on_done=bool(update.get("remove_on_done", True)),
+                )
+            except Exception:
+                pass
+
 
 class _SkipUnchanged(Exception):
     """Sentinel exception to skip unchanged files in the watch loop."""
+
+    def __init__(self, *, text: Optional[str] = None, file_hash: str = "") -> None:
+        super().__init__("unchanged")
+        self.text = text
+        self.file_hash = file_hash
+
+
+def _is_internal_ignored_path(path: Path) -> bool:
+    return is_internal_metadata_path(path)
+
+
+def _staging_requires_subprocess(state: Optional[Dict[str, object]]) -> bool:
+    """Return True only when dual-root staging is actually active for this repo."""
+    if not (is_staging_enabled() and isinstance(state, dict)):
+        return False
+
+    staging = state.get("staging")
+    if isinstance(staging, dict) and staging:
+        return True
+
+    active_slug = str(state.get("active_repo_slug") or "").strip()
+    serving_slug = str(state.get("serving_repo_slug") or "").strip()
+    if serving_slug.endswith("_old"):
+        return True
+    if active_slug and serving_slug and active_slug != serving_slug:
+        return True
+    return False
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = str(os.environ.get(name, str(default))).strip()
+        val = int(raw)
+        return val if val > 0 else default
+    except Exception:
+        return default
+
+
+_GIT_HISTORY_MAX_WORKERS = _env_int("WATCH_GIT_HISTORY_MAX_WORKERS", 1)
+_GIT_HISTORY_TIMEOUT_SECONDS = _env_int("WATCH_GIT_HISTORY_TIMEOUT_SECONDS", 0)
+_GIT_HISTORY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_GIT_HISTORY_MAX_WORKERS,
+    thread_name_prefix="git-history",
+)
+
+
+def _shutdown_git_history_executor() -> None:
+    try:
+        _GIT_HISTORY_EXECUTOR.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_git_history_executor)
+_GIT_HISTORY_INFLIGHT: set[str] = set()
+_GIT_HISTORY_INFLIGHT_LOCK = threading.Lock()
+
+
+def _manifest_key(p: Path) -> str:
+    try:
+        return str(p.resolve())
+    except Exception:
+        return str(p)
+
+
+def _manifest_stats(p: Path) -> tuple[str, int]:
+    run_id = "unknown"
+    commit_count = -1
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            commits = data.get("commits") or []
+            if isinstance(commits, list):
+                commit_count = len(commits)
+            name = p.name
+            run_id = name[:-5] if name.endswith(".json") else name
+    except Exception:
+        pass
+    return run_id, commit_count
+
+
+def _run_git_history_ingest(
+    p: Path,
+    collection: str,
+    repo_name: Optional[str],
+    env_snapshot: Optional[Dict[str, str]] = None,
+) -> None:
+    script = watch_config.ROOT_DIR / "scripts" / "ingest_history.py"
+    if not script.exists():
+        raise RuntimeError(f"[git_history_manifest] ingest script missing: {script}")
+
+    cmd = [sys.executable or "python3", "-m", "scripts.ingest_history", "--manifest-json", str(p)]
+    env = _build_subprocess_env(collection, repo_name, env_snapshot)
+    started = time.monotonic()
+    timeout = _GIT_HISTORY_TIMEOUT_SECONDS if _GIT_HISTORY_TIMEOUT_SECONDS > 0 else None
+    stdout_tail: deque[str] = deque(maxlen=20)
+    stderr_tail: deque[str] = deque(maxlen=20)
+    tail_lock = threading.Lock()
+
+    def _tail_snapshot(tail: deque[str], limit: int = 5) -> str:
+        with tail_lock:
+            return " | ".join(list(tail)[-limit:])
+
+    def _stream_pipe(pipe, label: str, tail: deque[str], lock: threading.Lock) -> None:
+        try:
+            for raw in iter(pipe.readline, ""):
+                line = (raw or "").rstrip()
+                if not line:
+                    continue
+                with lock:
+                    tail.append(line)
+                logger.info("[git_history_manifest][%s] %s", label, line)
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    proc: Optional[subprocess.Popen] = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(watch_config.ROOT_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        t_out = threading.Thread(
+            target=_stream_pipe,
+            args=(proc.stdout, "stdout", stdout_tail, tail_lock),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_stream_pipe,
+            args=(proc.stderr, "stderr", stderr_tail, tail_lock),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+
+        deadline = (started + timeout) if timeout else None
+        timed_out = False
+        while True:
+            code = proc.poll()
+            if code is not None:
+                break
+            if deadline and time.monotonic() >= deadline:
+                timed_out = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+            time.sleep(0.2)
+
+        # Ensure threads flush trailing output after process exit/kill.
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+
+        if timed_out:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            error_msg = (
+                f"[git_history_manifest] ingest_history.py timeout for {p} after {elapsed_ms}ms "
+                f"(timeout={_GIT_HISTORY_TIMEOUT_SECONDS}s)"
+            )
+            if stderr_tail:
+                error_msg += f" stderr={_tail_snapshot(stderr_tail)}"
+            logger.warning(error_msg)
+            raise RuntimeError(error_msg)
+
+        returncode = proc.wait(timeout=1.0)
+    except Exception as e:
+        logger.warning("[git_history_manifest] subprocess error for %s: %s", p, e)
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError(f"[git_history_manifest] subprocess error for {p}: {e}") from e
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if returncode != 0:
+        error_msg = (
+            f"[git_history_manifest] ingest_history.py failed for {p}: exit={returncode} "
+            f"elapsed_ms={elapsed_ms} stderr={_tail_snapshot(stderr_tail)}"
+        )
+        logger.warning(error_msg)
+        raise RuntimeError(error_msg)
+
+    logger.info(
+        "[git_history_manifest] completed for %s: exit=0 elapsed_ms=%d",
+        p,
+        elapsed_ms,
+    )
+    if stdout_tail:
+        logger.info(
+            "[git_history_manifest] stdout tail for %s: %s",
+            p,
+            _tail_snapshot(stdout_tail),
+        )
+    if stderr_tail:
+        logger.warning(
+            "[git_history_manifest] stderr tail for %s: %s",
+            p,
+            _tail_snapshot(stderr_tail),
+        )
+
+
+def _on_git_history_done(manifest_path: Path, collection: str, repo_name: Optional[str], future: Future) -> None:
+    manifest_key = _manifest_key(manifest_path)
+    with _GIT_HISTORY_INFLIGHT_LOCK:
+        _GIT_HISTORY_INFLIGHT.discard(manifest_key)
+        remaining = len(_GIT_HISTORY_INFLIGHT)
+    logger.info("[git_history_manifest] in-flight remaining=%d", remaining)
+    try:
+        future.result()
+        # Mark journal as done after successful completion
+        repo_path = _detect_repo_for_file(manifest_path)
+        if repo_path:
+            repo_key = str(repo_path)
+            _mark_journal_done(manifest_path, repo_key, repo_name)
+            logger.info("[git_history_manifest] marked journal as done: %s", manifest_path)
+    except Exception as e:
+        repo_path = _detect_repo_for_file(manifest_path)
+        repo_key = str(repo_path) if repo_path else ""
+        if repo_key:
+            _mark_journal_failed(
+                manifest_path,
+                repo_key,
+                repo_name,
+                f"git history worker failed for collection '{collection}': {e}",
+            )
+        logger.warning(
+            "[git_history_manifest] worker crashed for %s (collection=%s, repo_key=%s): %s",
+            manifest_key,
+            collection,
+            repo_key or "<unknown>",
+            e,
+            exc_info=True,
+        )
 
 
 def _process_git_history_manifest(
@@ -44,32 +386,36 @@ def _process_git_history_manifest(
     repo_name: Optional[str],
     env_snapshot: Optional[Dict[str, str]] = None,
 ) -> None:
-    try:
-        script = ROOT_DIR / "scripts" / "ingest_history.py"
-        if not script.exists():
+    key = _manifest_key(p)
+    run_id, commit_count = _manifest_stats(p)
+    queued = 0
+    with _GIT_HISTORY_INFLIGHT_LOCK:
+        if key in _GIT_HISTORY_INFLIGHT:
+            logger.info(
+                "[git_history_manifest] skip duplicate in-flight manifest: %s run_id=%s",
+                p,
+                run_id,
+            )
             return
-        cmd = [sys.executable or "python3", str(script), "--manifest-json", str(p)]
-        env = _build_subprocess_env(collection, repo_name, env_snapshot)
-        try:
-            print(
-                f"[git_history_manifest] launching ingest_history.py for {p} "
-                f"collection={collection} repo={repo_name}"
-            )
-        except Exception:
-            pass
-        # Use subprocess.run for better error observability.
-        # NOTE: This blocks until ingest_history.py completes. If history ingestion
-        # is slow, this may need revisiting (e.g., revert to Popen fire-and-forget
-        # or run in a separate thread) to avoid blocking the watcher.
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            logger.warning(
-                "[git_history_manifest] ingest_history.py failed for %s: exit=%d stderr=%s",
-                p, result.returncode, (result.stderr or "")[:500],
-            )
-    except Exception as e:
-        logger.warning("[git_history_manifest] error processing %s: %s", p, e)
-        return
+        _GIT_HISTORY_INFLIGHT.add(key)
+        queued = len(_GIT_HISTORY_INFLIGHT)
+    logger.info(
+        "[git_history_manifest] queued ingest_history.py for %s run_id=%s commits=%d collection=%s repo=%s in_flight=%d",
+        p,
+        run_id,
+        commit_count,
+        collection,
+        repo_name,
+        queued,
+    )
+    future = _GIT_HISTORY_EXECUTOR.submit(
+        _run_git_history_ingest,
+        p,
+        collection,
+        repo_name,
+        env_snapshot,
+    )
+    future.add_done_callback(lambda fut, manifest_path=p, coll=collection, rn=repo_name: _on_git_history_done(manifest_path, coll, rn, fut))
 
 
 def _advance_progress(
@@ -92,6 +438,227 @@ def _advance_progress(
         pass
 
 
+def _mark_journal_done(path: Path, repo_key: str, repo_name: Optional[str]) -> None:
+    if _queue_journal_status(path, repo_key, repo_name, status="done"):
+        return
+    try:
+        update_index_journal_entry_status(
+            str(path),
+            status="done",
+            workspace_path=repo_key,
+            repo_name=repo_name,
+        )
+    except Exception:
+        pass
+
+
+def _mark_journal_failed(
+    path: Path,
+    repo_key: str,
+    repo_name: Optional[str],
+    error: str,
+) -> None:
+    if _queue_journal_status(
+        path,
+        repo_key,
+        repo_name,
+        status="failed",
+        error=error,
+        remove_on_done=False,
+    ):
+        return
+    try:
+        update_index_journal_entry_status(
+            str(path),
+            status="failed",
+            error=error,
+            workspace_path=repo_key,
+            repo_name=repo_name,
+            remove_on_done=False,
+        )
+    except Exception:
+        pass
+
+
+def _path_has_indexed_points(client, collection: str, path: Path) -> Optional[bool]:
+    try:
+        filt = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="metadata.path", match=models.MatchValue(value=str(path))
+                )
+            ]
+        )
+        points, _ = client.scroll(
+            collection_name=collection,
+            scroll_filter=filt,
+            with_payload=False,
+            with_vectors=False,
+            limit=1,
+        )
+        return bool(points)
+    except Exception:
+        return None
+
+
+def _verify_delete_committed(client, collection: str, path: Path) -> bool:
+    has_points = _path_has_indexed_points(client, collection, path)
+    return has_points is False
+
+
+def _path_has_graph_edges(client, collection: str, path: Path) -> Optional[bool]:
+    graph_collection = f"{collection}_graph"
+    try:
+        # Graph edges normalize paths (Windows -> POSIX separators). Verification must
+        # query using the same normalization to avoid false "deleted" reports.
+        raw_path = str(path)
+        candidates: list[str] = []
+        try:
+            norm_path = str(_normalize_graph_caller_path(raw_path) or "").strip()
+            if norm_path:
+                candidates.append(norm_path)
+        except Exception:
+            pass
+        # Back-compat: also consider the raw string and a slash-normalized form in case
+        # older data was written without normalization.
+        raw_slash = raw_path.replace("\\", "/").strip()
+        for v in (raw_slash, raw_path.strip()):
+            if v and v not in candidates:
+                candidates.append(v)
+
+        match_obj = (
+            models.MatchAny(any=candidates)
+            if len(candidates) > 1
+            else models.MatchValue(value=(candidates[0] if candidates else raw_path))
+        )
+        filt = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="caller_path", match=match_obj
+                )
+            ]
+        )
+        points, _ = client.scroll(
+            collection_name=graph_collection,
+            scroll_filter=filt,
+            with_payload=False,
+            with_vectors=False,
+            limit=1,
+        )
+        return bool(points)
+    except Exception as e:
+        # Missing graph collection means there are no graph edges to verify.
+        err = str(e).lower()
+        if "404" in err or "not found" in err or "doesn't exist" in err:
+            return False
+        return None
+
+
+def _verify_graph_delete_committed(client, collection: str, path: Path) -> bool:
+    has_edges = _path_has_graph_edges(client, collection, path)
+    return has_edges is False
+
+
+def _verify_upsert_committed(
+    client,
+    collection: str,
+    path: Path,
+    repo_name: Optional[str],
+    expected_file_hash: Optional[str],
+    source_text: Optional[str] = None,
+) -> bool:
+    indexed_hash = str(
+        idx.get_indexed_file_hash(client, collection, str(path)) or ""
+    ).strip()
+    expected_hash = str(expected_file_hash or "").strip()
+    if expected_hash:
+        if bool(indexed_hash) and indexed_hash == expected_hash:
+            return True
+        # Empty/whitespace-only files can legitimately have no indexed points/hash.
+        try:
+            if source_text is not None and not source_text.strip():
+                has_points = _path_has_indexed_points(client, collection, path)
+                return has_points is False
+        except Exception:
+            pass
+        return False
+    has_points = _path_has_indexed_points(client, collection, path)
+    return has_points is True
+
+
+def _verify_and_update_journal_for_upsert(
+    p: Path,
+    client,
+    collection: str,
+    repo_key: str,
+    repo_name: Optional[str],
+    journal_content_hash: str,
+    *,
+    text: Optional[str] = None,
+    file_hash: Optional[str] = None,
+) -> None:
+    source_text = text
+    expected_hash = str(file_hash or "").strip()
+    if source_text is None or not expected_hash:
+        read_text, read_hash = _read_text_and_sha1(p)
+        if source_text is None:
+            source_text = read_text
+        if not expected_hash:
+            expected_hash = read_hash
+    expected_hash = expected_hash or journal_content_hash
+    if _verify_upsert_committed(
+        client,
+        collection,
+        p,
+        repo_name,
+        expected_hash or None,
+        source_text=source_text,
+    ):
+        _mark_journal_done(p, repo_key, repo_name)
+    else:
+        _mark_journal_failed(
+            p,
+            repo_key,
+            repo_name,
+            "upsert_verification_failed",
+        )
+
+
+def _finalize_journal_after_index_attempt(
+    path: Path,
+    client,
+    collection: str | None,
+    repo_key: str,
+    repo_name: Optional[str],
+    *,
+    force_upsert: bool,
+    journal_content_hash: str,
+    text: Optional[str] = None,
+    file_hash: Optional[str] = None,
+    default_error: Optional[str] = None,
+    skip_verify_reason: Optional[str] = None,
+) -> None:
+    if force_upsert and client is not None and collection is not None:
+        # If another worker currently owns this file lock, leave the journal entry
+        # pending for retry instead of recording a false verification failure.
+        if skip_verify_reason == "file_locked":
+            return
+        _verify_and_update_journal_for_upsert(
+            path,
+            client,
+            collection,
+            repo_key,
+            repo_name,
+            journal_content_hash,
+            text=text,
+            file_hash=file_hash,
+        )
+    elif default_error:
+        _mark_journal_failed(path, repo_key, repo_name, default_error)
+    else:
+        _mark_journal_done(path, repo_key, repo_name)
+
+
 def _build_subprocess_env(
     collection: str | None,
     repo_name: str | None,
@@ -105,8 +672,8 @@ def _build_subprocess_env(
         pass
     if collection:
         env["COLLECTION_NAME"] = collection
-    if QDRANT_URL:
-        env["QDRANT_URL"] = QDRANT_URL
+    if watch_config.QDRANT_URL:
+        env["QDRANT_URL"] = watch_config.QDRANT_URL
     if repo_name:
         env["REPO_NAME"] = repo_name
     return env
@@ -114,6 +681,7 @@ def _build_subprocess_env(
 
 def _maybe_handle_staging_file(
     path: Path,
+    client,
     collection: str | None,
     repo_name: str | None,
     repo_key: str,
@@ -121,27 +689,46 @@ def _maybe_handle_staging_file(
     state_env: Optional[Dict[str, str]],
     repo_progress: Dict[str, int],
     started_at: str,
+    *,
+    force_upsert: bool = False,
+    journal_content_hash: str = "",
 ) -> bool:
-    if not (is_staging_enabled() and state_env and collection):
+    if not (state_env and collection):
         return False
 
-    _text, file_hash = _read_text_and_sha1(path)
+    source_text, file_hash = _read_text_and_sha1(path)
     if file_hash:
         try:
             cached_hash = get_cached_file_hash(str(path), repo_name) if repo_name else None
         except Exception:
             cached_hash = None
         if cached_hash and cached_hash == file_hash:
+            if force_upsert and client is not None:
+                if _verify_upsert_committed(
+                    client,
+                    collection,
+                    path,
+                    repo_name,
+                    file_hash or journal_content_hash or None,
+                    source_text=source_text,
+                ):
+                    safe_print(f"[skip_unchanged] {path} (hash match)")
+                    _log_activity(repo_key, "skipped", path, {"reason": "hash_unchanged"})
+                    _mark_journal_done(path, repo_key, repo_name)
+                    _advance_progress(repo_progress, repo_key, repo_files, started_at, path)
+                    return True
             # Fast path: skip if content hash matches cached hash (file unchanged)
             # Safety: startup health check clears stale cache per-repo
-            safe_print(f"[skip_unchanged] {path} (hash match)")
-            _log_activity(repo_key, "skipped", path, {"reason": "hash_unchanged"})
-            _advance_progress(repo_progress, repo_key, repo_files, started_at, path)
-            return True
+            if not force_upsert:
+                safe_print(f"[skip_unchanged] {path} (hash match)")
+                _log_activity(repo_key, "skipped", path, {"reason": "hash_unchanged"})
+                _advance_progress(repo_progress, repo_key, repo_files, started_at, path)
+                return True
 
     cmd = [
         sys.executable or "python3",
-        str(ROOT_DIR / "scripts" / "ingest_code.py"),
+        "-m",
+        "scripts.ingest_code",
         "--root",
         str(path),
         "--no-skip-unchanged",
@@ -178,11 +765,24 @@ def _maybe_handle_staging_file(
             )
     else:
         safe_print(f"[indexed_subprocess] {path} -> {collection}")
+        _finalize_journal_after_index_attempt(
+            path,
+            client,
+            collection,
+            repo_key,
+            repo_name,
+            force_upsert=force_upsert,
+            journal_content_hash=journal_content_hash,
+            text=source_text,
+            file_hash=file_hash,
+        )
+    if result.returncode != 0 and force_upsert:
+        _mark_journal_failed(path, repo_key, repo_name, "subprocess_index_failed")
     _advance_progress(repo_progress, repo_key, repo_files, started_at, path)
     return True
 
 
-def _process_paths(
+def _process_paths_impl(
     paths,
     client,
     model,
@@ -218,18 +818,92 @@ def _process_paths(
             pass
 
     repo_progress: Dict[str, int] = {key: 0 for key in repo_groups.keys()}
+    repo_pending_journal_ops: Dict[str, Dict[str, Dict[str, str]]] = {}
+    repo_move_source_for_dest: Dict[str, Dict[str, str]] = {}
+    move_dest_keys: set[str] = set()
+    move_source_keys: set[str] = set()
+    for repo_path in repo_groups.keys():
+        try:
+            repo_name = _extract_repo_name_from_path(repo_path)
+            entries = list_pending_index_journal_entries(repo_path, repo_name)
+            repo_pending_journal_ops[repo_path] = {}
+            upserts_by_hash: Dict[str, List[str]] = {}
+            deletes_by_hash: Dict[str, List[str]] = {}
+            for rec in entries:
+                path_key = _normalize_cache_key_path(str(rec.get("path") or ""))
+                op_type = str(rec.get("op_type") or "").strip().lower()
+                content_hash = str(rec.get("content_hash") or "").strip().lower()
+                if not path_key:
+                    continue
+                repo_pending_journal_ops[repo_path][path_key] = {
+                    "op_type": op_type,
+                    "content_hash": content_hash,
+                }
+                if not content_hash:
+                    continue
+                if op_type == "upsert":
+                    upserts_by_hash.setdefault(content_hash, []).append(path_key)
+                elif op_type == "delete":
+                    deletes_by_hash.setdefault(content_hash, []).append(path_key)
+            pairs: Dict[str, str] = {}
+            for content_hash, dest_paths in upserts_by_hash.items():
+                src_paths = deletes_by_hash.get(content_hash) or []
+                if not src_paths:
+                    continue
+                src_idx = 0
+                for dest_key in dest_paths:
+                    while src_idx < len(src_paths) and src_paths[src_idx] == dest_key:
+                        src_idx += 1
+                    if src_idx >= len(src_paths):
+                        break
+                    src_key = src_paths[src_idx]
+                    src_idx += 1
+                    pairs[dest_key] = src_key
+                    move_dest_keys.add(dest_key)
+                    move_source_keys.add(src_key)
+            repo_move_source_for_dest[repo_path] = pairs
+        except Exception:
+            repo_pending_journal_ops[repo_path] = {}
+            repo_move_source_for_dest[repo_path] = {}
+
+    unique_paths = sorted(
+        unique_paths,
+        key=lambda p: (
+            0
+            if _normalize_cache_key_path(str(p)) in move_dest_keys
+            else (2 if _normalize_cache_key_path(str(p)) in move_source_keys else 1),
+            str(p),
+        ),
+    )
+    completed_move_sources: set[str] = set()
 
     for p in unique_paths:
         repo_path = _detect_repo_for_file(p) or Path(workspace_path)
         repo_key = str(repo_path)
         repo_files = repo_groups.get(repo_key, [])
         repo_name = _extract_repo_name_from_path(repo_key)
+        path_key = _normalize_cache_key_path(str(p))
+        if path_key in completed_move_sources:
+            _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
+            continue
+        journal_rec = repo_pending_journal_ops.get(repo_key, {}).get(path_key, {})
+        journal_op = str(journal_rec.get("op_type") or "").strip().lower()
+        force_delete = journal_op == "delete"
+        force_upsert = journal_op == "upsert"
+        journal_content_hash = str(journal_rec.get("content_hash") or "").strip().lower()
+        if _is_internal_ignored_path(p):
+            _log_activity(repo_key, "skipped", p, {"reason": "internal_ignored_path"})
+            # Internal metadata paths should never drive indexing or collection creation.
+            # If they entered the journal via drift repair, mark done and drop.
+            _mark_journal_done(p, repo_key, repo_name)
+            _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
+            continue
         collection = _get_collection_for_file(p)
         state_env: Optional[Dict[str, str]] = None
         try:
             st = get_workspace_state(repo_key, repo_name) if get_workspace_state else None
             if isinstance(st, dict):
-                if is_staging_enabled():
+                if _staging_requires_subprocess(st):
                     state_env = st.get("indexing_env")
         except Exception:
             state_env = None
@@ -240,31 +914,118 @@ def _process_paths(
                     p,
                     collection,
                     repo_name,
-                    env_snapshot=(state_env if is_staging_enabled() else None),
+                    env_snapshot=state_env,
                 )
             except Exception as exc:
                 safe_print(f"[commit_ingest_error] {p}: {exc}")
             _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
             continue
 
-        if not p.exists():
+        if force_upsert and not p.exists():
+            _log_activity(repo_key, "skipped", p, {"reason": "upsert_missing_file"})
+            _mark_journal_failed(
+                p,
+                repo_key,
+                repo_name,
+                "upsert_missing_file",
+            )
+            _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
+            continue
+
+        if force_upsert and client is not None and collection is not None:
+            move_src_key = repo_move_source_for_dest.get(repo_key, {}).get(path_key)
+            if move_src_key:
+                move_src_path = Path(move_src_key)
+                src_collection = _get_collection_for_file(move_src_path)
+                try:
+                    moved_count, renamed_hash = _rename_in_store(
+                        client,
+                        src_collection,
+                        move_src_path,
+                        p,
+                        collection,
+                    )
+                except Exception:
+                    moved_count, renamed_hash = -1, None
+                if moved_count and moved_count > 0:
+                    try:
+                        if repo_name:
+                            remove_cached_file(str(move_src_path), repo_name)
+                    except Exception:
+                        pass
+                    final_hash = renamed_hash or journal_content_hash
+                    try:
+                        if repo_name and final_hash:
+                            set_cached_file_hash(str(p), final_hash, repo_name)
+                    except Exception:
+                        pass
+                    _log_activity(
+                        repo_key,
+                        "moved",
+                        p,
+                        {"from": str(move_src_path), "chunks": int(moved_count)},
+                    )
+                    _mark_journal_done(p, repo_key, repo_name)
+                    _mark_journal_done(move_src_path, repo_key, repo_name)
+                    completed_move_sources.add(move_src_key)
+                    _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
+                    continue
+
+        if force_delete or not p.exists():
+            deleted_ok = False
             if client is not None:
                 try:
                     idx.delete_points_by_path(client, collection, str(p))
+                    try:
+                        idx.delete_graph_edges_by_path(
+                            client,
+                            collection,
+                            caller_path=str(p),
+                            repo=repo_name,
+                        )
+                        # Repo tags can drift over time, so always follow a repo-scoped
+                        # delete with a path-only sweep to remove any stale rows left under
+                        # an older/default repo tag.
+                        if repo_name:
+                            idx.delete_graph_edges_by_path(
+                                client,
+                                collection,
+                                caller_path=str(p),
+                                repo=None,
+                            )
+                    except Exception as graph_exc:
+                        safe_print(f"[deleted:graph_failed] {p} -> {collection}: {graph_exc}")
                     safe_print(f"[deleted] {p} -> {collection}")
+                    deleted_ok = True
                 except Exception:
-                    pass
+                    deleted_ok = False
+            if deleted_ok and client is not None and collection is not None:
+                deleted_ok = _verify_delete_committed(client, collection, p)
+            if deleted_ok and client is not None and collection is not None:
+                verify_graph_delete = get_boolean_env("WATCH_VERIFY_GRAPH_DELETE", True)
+                if verify_graph_delete:
+                    deleted_ok = _verify_graph_delete_committed(client, collection, p)
             try:
                 if repo_name:
                     remove_cached_file(str(p), repo_name)
             except Exception:
                 pass
             _log_activity(repo_key, "deleted", p)
+            if deleted_ok:
+                _mark_journal_done(p, repo_key, repo_name)
+            else:
+                _mark_journal_failed(
+                    p,
+                    repo_key,
+                    repo_name,
+                    "delete_points_or_graph_failed",
+                )
             _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
             continue
 
         if _maybe_handle_staging_file(
             p,
+            client,
             collection,
             repo_name,
             repo_key,
@@ -272,17 +1033,39 @@ def _process_paths(
             state_env,
             repo_progress,
             started_at,
+            force_upsert=force_upsert,
+            journal_content_hash=journal_content_hash,
         ):
             continue
         if client is not None and model is not None:
             try:
+                verify_context: Dict[str, Optional[str]] = {}
                 ok = _run_indexing_strategy(
-                    p, client, model, collection, vector_name, model_dim, repo_name
+                    p,
+                    client,
+                    model,
+                    collection,
+                    vector_name,
+                    model_dim,
+                    repo_name,
+                    force_upsert=force_upsert,
+                    verify_context=verify_context if force_upsert else None,
                 )
-            except _SkipUnchanged:
+            except _SkipUnchanged as exc:
                 status = "skipped"
                 safe_print(f"[{status}] {p} -> {collection}")
                 _log_activity(repo_key, "skipped", p, {"reason": "hash_unchanged"})
+                _finalize_journal_after_index_attempt(
+                    p,
+                    client,
+                    collection,
+                    repo_key,
+                    repo_name,
+                    force_upsert=force_upsert,
+                    journal_content_hash=journal_content_hash,
+                    text=exc.text,
+                    file_hash=exc.file_hash,
+                )
                 _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
                 continue
             except Exception:
@@ -295,6 +1078,7 @@ def _process_paths(
                         "file": str(p),
                     },
                 )
+                _mark_journal_failed(p, repo_key, repo_name, "indexing_error")
                 _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
                 continue
 
@@ -306,9 +1090,34 @@ def _process_paths(
                 except Exception:
                     size = None
                 _log_activity(repo_key, "indexed", p, {"file_size": size})
+                _finalize_journal_after_index_attempt(
+                    p,
+                    client,
+                    collection,
+                    repo_key,
+                    repo_name,
+                    force_upsert=force_upsert,
+                    journal_content_hash=journal_content_hash,
+                    text=verify_context.get("text"),
+                    file_hash=verify_context.get("file_hash"),
+                    skip_verify_reason=verify_context.get("skip_verify_reason"),
+                )
             else:
                 _log_activity(
                     repo_key, "skipped", p, {"reason": "no-change-or-error"}
+                )
+                _finalize_journal_after_index_attempt(
+                    p,
+                    client,
+                    collection,
+                    repo_key,
+                    repo_name,
+                    force_upsert=force_upsert,
+                    journal_content_hash=journal_content_hash,
+                    text=verify_context.get("text"),
+                    file_hash=verify_context.get("file_hash"),
+                    default_error="no_change_or_error",
+                    skip_verify_reason=verify_context.get("skip_verify_reason"),
                 )
             _advance_progress(repo_progress, repo_key, repo_files, started_at, p)
         else:
@@ -328,12 +1137,44 @@ def _process_paths(
             pass
 
 
+def _process_paths(
+    paths,
+    client,
+    model,
+    vector_name: str,
+    model_dim: int,
+    workspace_path: str,
+) -> None:
+    """Process a watcher batch and persist journal status updates efficiently."""
+    previous_batch = getattr(_JOURNAL_STATUS_BATCH_LOCAL, "current", None)
+    batch: List[Dict[str, object]] = []
+    _JOURNAL_STATUS_BATCH_LOCAL.current = batch
+    try:
+        _process_paths_impl(
+            paths,
+            client,
+            model,
+            vector_name,
+            model_dim,
+            workspace_path,
+        )
+    finally:
+        if previous_batch is None:
+            try:
+                delattr(_JOURNAL_STATUS_BATCH_LOCAL, "current")
+            except AttributeError:
+                pass
+        else:
+            _JOURNAL_STATUS_BATCH_LOCAL.current = previous_batch
+        _flush_journal_status_batch(batch)
+
+
 def _read_text_and_sha1(path: Path) -> tuple[Optional[str], str]:
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         text = None
-    if not text:
+    if text is None:
         return text, ""
     try:
         file_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
@@ -350,69 +1191,111 @@ def _run_indexing_strategy(
     vector_name: str,
     model_dim: int,
     repo_name: str | None,
+    force_upsert: bool = False,
+    *,
+    verify_context: Optional[Dict[str, Optional[str]]] = None,
 ) -> bool:
     if collection is None:
         return False
-    try:
-        idx.ensure_collection_and_indexes_once(client, collection, model_dim, vector_name)
-    except Exception:
-        pass
 
     text, file_hash = _read_text_and_sha1(path)
+    if verify_context is not None:
+        verify_context["text"] = text
+        verify_context["file_hash"] = file_hash
+        verify_context["skip_verify_reason"] = None
     ok = False
     if text is not None:
         try:
             language = idx.detect_language(path)
         except Exception:
             language = ""
+        try:
+            is_text_like = bool(idx.is_text_like_language(language))
+        except Exception:
+            is_text_like = False
         if file_hash:
             try:
                 cached_hash = get_cached_file_hash(str(path), repo_name) if repo_name else None
             except Exception:
                 cached_hash = None
-            if cached_hash and cached_hash == file_hash:
+            if cached_hash and cached_hash == file_hash and not force_upsert:
                 ok = True
-                raise _SkipUnchanged()
-            try:
-                use_smart, smart_reason = idx.should_use_smart_reindexing(str(path), file_hash)
-            except Exception:
-                use_smart, smart_reason = False, "smart_check_failed"
-            # Bootstrap: if we have no symbol cache yet, still run smart path once
-            bootstrap = smart_reason == "no_cached_symbols"
-            if use_smart or bootstrap:
-                msg_kind = (
-                    "smart reindexing"
-                    if use_smart
-                    else "bootstrap (no_cached_symbols) for smart reindex"
-                )
-                safe_print(
-                    f"[SMART_REINDEX][watcher] Using {msg_kind} for {path} ({smart_reason})"
-                )
+                raise _SkipUnchanged(text=text, file_hash=file_hash)
+
+            # Repair upserts must materialize points when a path is missing in Qdrant.
+            # Smart reindex can return "skipped" for unchanged symbols, which is valid
+            # only when points already exist.
+            force_full_reindex = False
+            if force_upsert and client is not None:
                 try:
-                    status = idx.process_file_with_smart_reindexing(
-                        path,
-                        text,
-                        language,
-                        client,
-                        collection,
-                        repo_name,
-                        model,
-                        vector_name,
+                    existing_hash = str(
+                        idx.get_indexed_file_hash(client, collection, str(path)) or ""
+                    ).strip()
+                except Exception:
+                    existing_hash = ""
+                if not existing_hash:
+                    has_points = _path_has_indexed_points(client, collection, path)
+                    if has_points is not True:
+                        force_full_reindex = True
+
+            if not is_text_like:
+                try:
+                    use_smart, smart_reason = idx.should_use_smart_reindexing(str(path), file_hash)
+                except Exception:
+                    use_smart, smart_reason = False, "smart_check_failed"
+                # Bootstrap: if we have no symbol cache yet, still run smart path once
+                bootstrap = smart_reason == "no_cached_symbols"
+                if (use_smart or bootstrap) and not force_full_reindex:
+                    msg_kind = (
+                        "smart reindexing"
+                        if use_smart
+                        else "bootstrap (no_cached_symbols) for smart reindex"
                     )
-                    ok = status in ("success", "skipped")
-                except Exception as exc:
                     safe_print(
-                        f"[SMART_REINDEX][watcher] Smart reindexing failed for {path}: {exc}"
+                        f"[SMART_REINDEX][watcher] Using {msg_kind} for {path} ({smart_reason})"
                     )
-                    ok = False
-            else:
-                safe_print(
-                    f"[SMART_REINDEX][watcher] Using full reindexing for {path} ({smart_reason})"
-                )
-                # Fallback: full single-file reindex. Pseudo/tags are inlined by default;
-                # when PSEUDO_DEFER_TO_WORKER=1 we run base-only and rely on backfill.
+                    try:
+                        status = idx.process_file_with_smart_reindexing(
+                            path,
+                            text,
+                            language,
+                            client,
+                            collection,
+                            repo_name,
+                            model,
+                            vector_name,
+                            model_dim=model_dim,
+                        )
+                        ok = status in ("success", "skipped")
+                    except Exception as exc:
+                        safe_print(
+                            f"[SMART_REINDEX][watcher] Smart reindexing failed for {path}: {exc}"
+                        )
+                        ok = False
+                else:
+                    if force_full_reindex:
+                        safe_print(
+                            f"[SMART_REINDEX][watcher] Forcing full reindex for {path} "
+                            "(force_upsert_missing_points)"
+                        )
+                    safe_print(
+                        f"[SMART_REINDEX][watcher] Using full reindexing for {path} ({smart_reason})"
+                    )
+                    # Fallback: full single-file reindex. Pseudo/tags are inlined by default;
+                    # when PSEUDO_DEFER_TO_WORKER=1 we run base-only and rely on backfill.
     if not ok:
-        pseudo_mode = "off" if get_boolean_env("PSEUDO_DEFER_TO_WORKER") else "full"
+        try:
+            idx.ensure_collection_and_indexes_once(
+                client, collection, model_dim, vector_name
+            )
+        except Exception:
+            pass
+        # PSEUDO_DEFER_TO_WORKER is a foreground/background semantics knob; it should
+        # only disable inline pseudo/tags generation when the backfill worker is enabled.
+        pseudo_mode = effective_pseudo_mode(
+            defer_to_worker=get_boolean_env("PSEUDO_DEFER_TO_WORKER"),
+            backfill_enabled=get_boolean_env("PSEUDO_BACKFILL_ENABLED"),
+        )
         ok = idx.index_single_file(
             client,
             model,
@@ -423,7 +1306,16 @@ def _run_indexing_strategy(
             skip_unchanged=False,
             pseudo_mode=pseudo_mode,
             repo_name_for_cache=repo_name,
+            preloaded_text=text,
+            preloaded_file_hash=file_hash,
+            preloaded_language=language if text is not None else None,
         )
+        if force_upsert and not ok and verify_context is not None:
+            try:
+                if idx.is_file_locked(str(path)):
+                    verify_context["skip_verify_reason"] = "file_locked"
+            except Exception:
+                pass
     return ok
 
 

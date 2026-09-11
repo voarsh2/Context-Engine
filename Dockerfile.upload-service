@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy application code
 COPY scripts/ ./scripts/
 COPY . .
+RUN chmod -R a+rX /app/scripts
 
 # Create work dir, non-root user, and set ownership in single layer
 RUN mkdir -p /work && chmod 755 /work \
@@ -50,4 +51,6 @@ ENV UPLOAD_SERVICE_HOST=0.0.0.0 \
     UPLOAD_TIMEOUT_SECS=300
 
 # Run the upload service
-CMD ["python", "scripts/upload_service.py"]
+WORKDIR /app
+
+CMD ["python", "-m", "scripts.upload_service"]

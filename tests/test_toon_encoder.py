@@ -20,6 +20,10 @@ from scripts.toon_encoder import (
     _encode_value,
     _is_uniform_array_of_objects,
 )
+from scripts.mcp_impl.toon import (
+    _format_context_results_as_toon,
+    _format_results_as_toon,
+)
 
 
 class TestFeatureFlags:
@@ -256,12 +260,7 @@ class TestMCPIntegration:
 
     def test_should_use_toon_explicit_param(self, monkeypatch):
         """Test explicit output_format parameter takes precedence."""
-        # Import the helpers from mcp_indexer_server
         monkeypatch.delenv("TOON_ENABLED", raising=False)
-
-        # We need to test the helper functions directly
-        # Since they're in mcp_indexer_server, we'll test the logic here
-        from scripts.toon_encoder import is_toon_enabled
 
         # When TOON_ENABLED is not set, default is False
         assert is_toon_enabled() is False
@@ -290,13 +289,17 @@ class TestMCPIntegration:
         assert "/src/main.py,10,20" in toon_output
         assert "/src/utils.py,5,15" in toon_output
 
-    def test_toon_replaces_results_array(self):
-        """Test that TOON formatting replaces JSON array with TOON string."""
+        formatted = _format_results_as_toon(response.copy(), compact=True)
+        assert formatted["results"] == response["results"]
+        assert formatted["output_format"] == "toon"
+        assert formatted["text"] == toon_output
+
+    def test_toon_encoder_returns_string(self):
+        """Test that the low-level TOON encoder returns a string."""
         results = [
             {"path": "/src/main.py", "start_line": 10, "end_line": 20},
         ]
 
-        # When TOON is applied, results becomes a string
         toon_output = encode_search_results(results, compact=True)
         assert isinstance(toon_output, str)
         assert "results[1]{path,start_line,end_line}:" in toon_output
@@ -416,19 +419,16 @@ class TestFormatContextResultsAsToon:
 
     def test_format_empty_results_adds_marker(self):
         """Test that empty results still get output_format marker."""
-        from scripts.mcp_indexer_server import _format_context_results_as_toon
-
         response = {"results": [], "total": 0}
         result = _format_context_results_as_toon(response.copy())
 
         assert result["output_format"] == "toon"
+        assert result["results"] == []
         # Empty array per spec: key[0]:
-        assert result["results"] == "results[0]:"
+        assert result["text"] == "results[0]:"
 
     def test_format_mixed_results(self):
         """Test formatting mixed code/memory results."""
-        from scripts.mcp_indexer_server import _format_context_results_as_toon
-
         response = {
             "results": [
                 {"source": "code", "path": "/src/api.py", "start_line": 1, "end_line": 10},
@@ -439,14 +439,13 @@ class TestFormatContextResultsAsToon:
         result = _format_context_results_as_toon(response.copy())
 
         assert result["output_format"] == "toon"
-        assert isinstance(result["results"], str)
-        assert "code[1]" in result["results"]
-        assert "memory[1]" in result["results"]
+        assert isinstance(result["results"], list)
+        assert isinstance(result["text"], str)
+        assert "code[1]" in result["text"]
+        assert "memory[1]" in result["text"]
 
     def test_format_preserves_other_fields(self):
         """Test that formatting preserves non-results fields."""
-        from scripts.mcp_indexer_server import _format_context_results_as_toon
-
         response = {
             "results": [{"source": "code", "path": "/a.py", "start_line": 1, "end_line": 5}],
             "total": 1,
@@ -476,7 +475,7 @@ class TestDynamicFieldInclusion:
         assert "def main()" in output
 
     def test_encode_with_information_field(self):
-        """Test that info_request's information field is included."""
+        """Test that the information field is included."""
         results = [
             {"path": "/src/auth.py", "start_line": 1, "end_line": 50,
              "score": 0.9, "information": "Authentication handler at /src/auth.py:1-50",
@@ -529,4 +528,3 @@ class TestDynamicFieldInclusion:
         assert "id" in output
         assert "created_at" in output
         assert "tags" in output
-

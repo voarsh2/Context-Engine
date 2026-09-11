@@ -55,7 +55,8 @@ def test_hybrid_cli_runs_basic(tmp_path, qdrant_container):
     env["EMBEDDING_MODEL"] = "BAAI/bge-base-en-v1.5"
     cmd = [
         sys.executable,
-        "scripts/hybrid_search.py",
+        "-m",
+        "scripts.hybrid_search",
         "--query",
         "test",
         "--limit",

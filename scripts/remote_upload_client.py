@@ -46,6 +46,48 @@ from scripts.upload_auth_utils import get_auth_session
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+_git_history_skip_log_key: Optional[str] = None
+
+
+def _is_usable_delta_status(status: Any) -> bool:
+    if not isinstance(status, dict):
+        return False
+    state = str(status.get("status") or "").strip().lower()
+    return (
+        bool(status.get("success")) and
+        "workspace_path" in status and
+        "collection_name" in status and
+        state in {"ready", "processing", "completed"}
+    )
+
+
+def _server_status_error_message(status: Any) -> str:
+    if isinstance(status, dict):
+        error = status.get("error")
+        if isinstance(error, dict):
+            msg = str(error.get("message") or "").strip()
+            if msg:
+                return msg
+        state = str(status.get("status") or "").strip()
+        if state:
+            return f"Server status is {state}"
+    return "Invalid server status response"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _log_git_history_skip_once(reason: str, key: str) -> None:
+    global _git_history_skip_log_key
+    marker = f"{reason}:{key}"
+    if _git_history_skip_log_key == marker:
+        return
+    _git_history_skip_log_key = marker
+    logger.info("[git_history] skip (%s): %s", reason, key)
 
 DEFAULT_MAX_TEMP_CLEAN_ATTEMPTS = 3
 DEFAULT_TEMP_CLEAN_SLEEP = 1.0
@@ -54,32 +96,27 @@ DEFAULT_TEMP_CLEAN_SLEEP = 1.0
 from scripts.workspace_state import (
     get_cached_file_hash,
     set_cached_file_hash,
-    get_collection_name,
     _extract_repo_name_from_path,
     remove_cached_file,
 )
-
-# Import existing hash function
-import scripts.ingest_code as idx
+from scripts.ingest.config import CODE_EXTS, EXTENSIONLESS_FILES
 
 
-def _cache_missing_stats(file_hashes: Dict[str, Any]) -> Tuple[bool, int, int]:
-    """Return (is_stale, missing_count, checked_count) for cached paths."""
-    if not file_hashes:
-        return (False, 0, 0)
-    missing = 0
-    checked = 0
-    for path_str in file_hashes.keys():
-        try:
-            if not Path(path_str).exists():
-                missing += 1
-        except Exception:
-            missing += 1
-        checked += 1
-    if checked == 0:
-        return (False, 0, 0)
-    missing_ratio = missing / checked
-    return (missing_ratio >= 0.25, missing, checked)
+def hash_id(text: str, path: str, start: int, end: int) -> int:
+    h = hashlib.sha1(
+        f"{path}:{start}-{end}\n{text}".encode("utf-8", errors="ignore")
+    ).hexdigest()
+    return int(h[:16], 16)
+
+
+def _path_is_within_workspace(path_str: str, workspace_path: str) -> bool:
+    """Keep local cache entries scoped to the workspace being uploaded."""
+    try:
+        path = Path(path_str).resolve()
+        workspace = Path(workspace_path).resolve()
+        return path == workspace or workspace in path.parents
+    except Exception:
+        return False
 
 
 def _find_git_root(start: Path) -> Optional[Path]:
@@ -134,6 +171,24 @@ def _compute_logical_repo_id(workspace_path: str) -> str:
     return f"{prefix}{h}"
 
 
+def _derive_metadata_root(workspace_path: str) -> Path:
+    """Infer host-side metadata root that corresponds to container `/work`."""
+    try:
+        p = Path(workspace_path).resolve()
+    except Exception:
+        p = Path(workspace_path)
+
+    if p.name == "dev-workspace":
+        return p.parent
+    if p.parent.name == "dev-workspace":
+        return p.parent.parent
+    if (p / ".codebase").exists():
+        return p
+    if (p.parent / ".codebase").exists():
+        return p.parent
+    return p.parent
+
+
 def _redact_emails(text: str) -> str:
     """Redact email addresses from commit messages for privacy."""
     try:
@@ -167,10 +222,12 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
     }
 
     if max_commits <= 0:
+        _log_git_history_skip_once("disabled", f"max_commits={max_commits}")
         return None
 
     root = _find_git_root(Path(workspace_path))
     if not root:
+        _log_git_history_skip_once("no_repo", workspace_path)
         return None
 
     # Git history cache: avoid emitting identical manifests when HEAD/settings are unchanged
@@ -204,6 +261,7 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
             cache = {}
 
         if current_head and cache.get("last_head") == current_head and cache.get("max_commits") == max_commits and str(cache.get("since") or "") == since:
+            _log_git_history_skip_once("cache_hit", f"head={current_head[:10]} since={since or '-'} max={max_commits}")
             return None
 
     base_head = ""
@@ -254,12 +312,20 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
             errors="replace",
         )
         if proc.returncode != 0 or not proc.stdout.strip():
+            _log_git_history_skip_once(
+                "rev_list_empty",
+                f"head={current_head[:10] if current_head else '-'} rc={proc.returncode}",
+            )
             return None
         commits = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
     except Exception:
         return None
 
     if not commits:
+        _log_git_history_skip_once(
+            "no_commits",
+            f"head={current_head[:10] if current_head else '-'}",
+        )
         return None
     if len(commits) > max_commits:
         commits = commits[:max_commits]
@@ -333,6 +399,10 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
             continue
 
     if not records:
+        _log_git_history_skip_once(
+            "no_records",
+            f"commits={len(commits)} head={current_head[:10] if current_head else '-'}",
+        )
         return None
 
     try:
@@ -352,6 +422,14 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
         "since": since,
         "commits": records,
     }
+    logger.info(
+        "[git_history] prepared manifest mode=%s commits=%d head=%s prev=%s base=%s",
+        manifest["mode"],
+        len(records),
+        (current_head[:10] if current_head else "-"),
+        (prev_head[:10] if prev_head else "-"),
+        (base_head[:10] if base_head else "-"),
+    )
 
     # Update git history cache with the HEAD and settings used for this manifest
     try:
@@ -370,7 +448,12 @@ def _collect_git_history_for_workspace(workspace_path: str) -> Optional[Dict[str
     return manifest
 
 
-def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str]) -> Dict[str, str]:
+def _load_local_cache_file_hashes(
+    workspace_path: str,
+    repo_name: Optional[str],
+    *,
+    metadata_root: Optional[str] = None,
+) -> Dict[str, str]:
     """Best-effort read of the local cache.json file_hashes map.
 
     This mirrors the layout used by workspace_state without introducing new
@@ -378,7 +461,13 @@ def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str])
     lookups still go through get_cached_file_hash.
     """
     try:
-        base = Path(os.environ.get("WORKSPACE_PATH") or workspace_path).resolve()
+        base = Path(
+            metadata_root
+            or os.environ.get("CTXCE_METADATA_ROOT")
+            or os.environ.get("WATCH_ROOT")
+            or os.environ.get("WORKSPACE_PATH")
+            or workspace_path
+        ).resolve()
         multi_repo = os.environ.get("MULTI_REPO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
         if multi_repo and repo_name:
             cache_path = base / ".codebase" / "repos" / repo_name / "cache.json"
@@ -395,27 +484,38 @@ def _load_local_cache_file_hashes(workspace_path: str, repo_name: Optional[str])
         file_hashes = data.get("file_hashes", {})
         if not isinstance(file_hashes, dict):
             return {}
-        is_stale, missing, checked = _cache_missing_stats(file_hashes)
-        if is_stale:
+        scoped_hashes = {
+            str(path): value
+            for path, value in file_hashes.items()
+            if _path_is_within_workspace(str(path), workspace_path)
+        }
+        ignored_count = len(file_hashes) - len(scoped_hashes)
+        if ignored_count:
             logger.warning(
-                "[remote_upload] Detected stale local cache (%d/%d missing); clearing %s",
-                missing,
-                checked,
+                "[remote_upload] Ignoring %d local cache entries outside workspace %s: %s",
+                ignored_count,
+                workspace_path,
                 cache_path,
             )
-            try:
-                cache_path.unlink(missing_ok=True)  # type: ignore[arg-type]
-            except TypeError:
-                try:
-                    cache_path.unlink()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            return {}
-        return file_hashes
+        return scoped_hashes
     except Exception:
         return {}
+
+
+def get_all_cached_paths(
+    repo_name: Optional[str] = None,
+    metadata_root: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> List[str]:
+    """Return cached file paths from the local workspace cache."""
+    effective_workspace = workspace_path or os.environ.get("WORKSPACE_PATH") or os.getcwd()
+    return list(
+        _load_local_cache_file_hashes(
+            effective_workspace,
+            repo_name,
+            metadata_root=metadata_root,
+        ).keys()
+    )
 
 
 class RemoteUploadClient:
@@ -451,33 +551,29 @@ class RemoteUploadClient:
 
         return host_path.replace('\\', '/').replace(':', '')
 
-    def __init__(self, upload_endpoint: str, workspace_path: str, collection_name: str,
+    def __init__(self, upload_endpoint: str, workspace_path: str, collection_name: Optional[str] = None,
                  max_retries: int = 3, timeout: int = 30, metadata_path: Optional[str] = None,
                  logical_repo_id: Optional[str] = None):
         """Initialize remote upload client."""
         self.upload_endpoint = upload_endpoint.rstrip('/')
         self.workspace_path = workspace_path
+        self.metadata_root = str(_derive_metadata_root(workspace_path))
         self.collection_name = collection_name
         self.max_retries = max_retries
         self.timeout = timeout
         self.temp_dir = None
         self.logical_repo_id = logical_repo_id
 
-        # Set environment variables for cache functions
-        os.environ["WORKSPACE_PATH"] = workspace_path
+        from scripts.workspace_state import _extract_repo_name_from_path
 
-        # Get repo name for cache operations
-        try:
-            from scripts.workspace_state import _extract_repo_name_from_path
-            self.repo_name = _extract_repo_name_from_path(workspace_path)
-            # Fallback to directory name if repo detection fails (for non-git repos)
-            if not self.repo_name:
-                self.repo_name = Path(workspace_path).name
-        except ImportError:
+        self.repo_name = _extract_repo_name_from_path(workspace_path)
+        # Fallback to directory name if repo detection fails (for non-git repos)
+        if not self.repo_name:
             self.repo_name = Path(workspace_path).name
 
         # In-memory stat cache to avoid rehashing unchanged files on every watch iteration
         self._stat_cache: Dict[str, Tuple[int, int]] = {}
+        self._content_hash_cache: Dict[str, Tuple[int, int, str]] = {}
 
         # Setup HTTP session with simple retry
         self.session = requests.Session()
@@ -485,6 +581,122 @@ class RemoteUploadClient:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        self.last_upload_result: Dict[str, Any] = {"outcome": "idle"}
+        self._last_plan_payload: Optional[Dict[str, Any]] = None
+        self._last_expected_hashes: Dict[str, str] = {}
+
+    def _get_cached_file_hash(self, file_path: str) -> str:
+        return get_cached_file_hash(
+            file_path,
+            self.repo_name,
+            metadata_root=self.metadata_root,
+        )
+
+    def _set_cached_file_hash(self, file_path: str, file_hash: str) -> None:
+        set_cached_file_hash(
+            file_path,
+            file_hash,
+            self.repo_name,
+            metadata_root=self.metadata_root,
+        )
+
+    def _finalize_file_hash(self, path: Path, expected_hash: Optional[str] = None) -> bool:
+        abs_path = str(path.resolve())
+        stat = path.stat()
+        current_hash = hashlib.sha1(path.read_bytes()).hexdigest()
+        expected = str(expected_hash or "").strip().lower()
+        if ":" in expected:
+            expected = expected.partition(":")[2].strip()
+        if expected and current_hash != expected:
+            self._content_hash_cache.pop(abs_path, None)
+            return False
+        self._set_cached_file_hash(abs_path, current_hash)
+        self._stat_cache[abs_path] = (
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            stat.st_size,
+        )
+        self._content_hash_cache[abs_path] = (
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            stat.st_size,
+            current_hash,
+        )
+        return True
+
+    def _remove_cached_file(self, file_path: str) -> None:
+        remove_cached_file(
+            file_path,
+            self.repo_name,
+            metadata_root=self.metadata_root,
+        )
+
+    def _get_all_cached_paths(self) -> List[str]:
+        return get_all_cached_paths(
+            self.repo_name,
+            metadata_root=self.metadata_root,
+            workspace_path=self.workspace_path,
+        )
+
+    def _set_last_upload_result(self, outcome: str, **details: Any) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"outcome": outcome}
+        result.update(details)
+        self.last_upload_result = result
+        return result
+
+    def _read_current_file_hash(self, path: Path) -> Tuple[str, int]:
+        """Read a file hash once per current size/mtime pair during one pass."""
+        stat = path.stat()
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)))
+        size = int(stat.st_size)
+        key = str(path.resolve())
+        cached = self._content_hash_cache.get(key)
+        if cached and cached[:2] == (mtime_ns, size):
+            return cached[2], size
+        file_hash = hashlib.sha1(path.read_bytes()).hexdigest()
+        self._content_hash_cache[key] = (mtime_ns, size, file_hash)
+        return file_hash, size
+
+    def log_watch_upload_result(self) -> None:
+        outcome = str((self.last_upload_result or {}).get("outcome") or "")
+        if outcome == "skipped_by_plan":
+            logger.info("[watch] No upload needed after plan")
+        elif outcome == "queued":
+            logger.info("[watch] Upload request accepted; server processing asynchronously")
+        elif outcome == "uploaded":
+            logger.info("[watch] Successfully uploaded changes")
+        elif outcome == "no_changes":
+            logger.info("[watch] No meaningful changes to upload")
+        else:
+            logger.info("[watch] Upload handling completed")
+
+    def _finalize_successful_changes(self, changes: Dict[str, List]) -> None:
+        expected_hashes = self._last_expected_hashes
+        for path in changes.get("created", []) + changes.get("updated", []):
+            try:
+                rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+                self._finalize_file_hash(path, expected_hashes.get(rel_path))
+            except Exception:
+                continue
+        for path in changes.get("deleted", []):
+            try:
+                abs_path = str(path.resolve())
+                self._remove_cached_file(abs_path)
+                self._stat_cache.pop(abs_path, None)
+                self._content_hash_cache.pop(abs_path, None)
+            except Exception:
+                continue
+        for source_path, dest_path in changes.get("moved", []):
+            try:
+                source_abs_path = str(source_path.resolve())
+                self._remove_cached_file(source_abs_path)
+                self._stat_cache.pop(source_abs_path, None)
+                self._content_hash_cache.pop(source_abs_path, None)
+            except Exception:
+                pass
+            try:
+                dest_rel_path = dest_path.relative_to(Path(self.workspace_path)).as_posix()
+                self._finalize_file_hash(dest_path, expected_hashes.get(dest_rel_path))
+            except Exception:
+                continue
 
     def __enter__(self):
         """Context manager entry."""
@@ -505,7 +717,7 @@ class RemoteUploadClient:
         container_path = self._translate_to_container_path(self.workspace_path)
         return {
             "repo_name": self.repo_name,
-            "collection_name": self.collection_name,
+            "collection_name": self.collection_name or "<server-owned>",
             "source_path": self.workspace_path,
             "container_path": container_path,
             "upload_endpoint": self.upload_endpoint,
@@ -519,6 +731,65 @@ class RemoteUploadClient:
         logger.info(f"  collection_name: {info['collection_name']}")
         logger.info(f"  source_path: {info['source_path']}")
         logger.info(f"  container_path: {info['container_path']}")
+
+    def _excluded_dirnames(self) -> frozenset:
+        # Keep in sync with standalone_upload_client exclusions.
+        # NOTE: This caches the exclusion set per RemoteUploadClient instance.
+        # Runtime changes to DEV_REMOTE_MODE/REMOTE_UPLOAD_MODE won't be reflected
+        # until a new client is created (typically via process restart), which is
+        # acceptable for the upload client use case.
+        cached = getattr(self, "_excluded_dirnames_cache", None)
+        if cached is not None:
+            return cached
+        excluded = {
+            "node_modules", "vendor", "dist", "build", "target", "out",
+            ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
+            "__pycache__", ".pytest_cache", ".mypy_cache", ".cache",
+            ".context-engine", ".context-engine-uploader", ".codebase",
+        }
+        dev_remote = os.environ.get("DEV_REMOTE_MODE") == "1" or os.environ.get("REMOTE_UPLOAD_MODE") == "development"
+        if dev_remote:
+            excluded.add("dev-workspace")
+        cached = frozenset(excluded)
+        self._excluded_dirnames_cache = cached
+        return cached
+
+    def _is_ignored_path(self, path: Path) -> bool:
+        """Return True when path is outside workspace or under excluded dirs."""
+        try:
+            workspace_root = Path(self.workspace_path).resolve()
+            rel = path.resolve().relative_to(workspace_root)
+        except Exception:
+            return True
+
+        dir_parts = set(rel.parts[:-1]) if len(rel.parts) > 1 else set()
+        if dir_parts & self._excluded_dirnames():
+            return True
+        # Ignore hidden directories anywhere under the workspace, but allow
+        # extensionless dotfiles like `.gitignore` that we explicitly support.
+        if any(p.startswith(".") for p in rel.parts[:-1]):
+            return True
+        try:
+            extensionless = set((EXTENSIONLESS_FILES or {}).keys())
+        except Exception:
+            extensionless = set()
+        if rel.name.startswith(".") and rel.name.lower() not in extensionless:
+            return True
+        return False
+
+    def _is_watchable_path(self, path: Path) -> bool:
+        """Return True when a filesystem event path is eligible for upload processing."""
+        if self._is_ignored_path(path):
+            return False
+        suffix = path.suffix.lower()
+        if CODE_EXTS.get(suffix, "unknown") != "unknown":
+            return True
+        name = path.name.lower()
+        try:
+            extensionless_names = {k.lower() for k in (EXTENSIONLESS_FILES or {}).keys()}
+        except Exception:
+            extensionless_names = set()
+        return name in extensionless_names or name.startswith("dockerfile")
 
     def _get_temp_bundle_dir(self) -> Path:
         """Get or create temporary directory for bundle creation."""
@@ -547,6 +818,19 @@ class RemoteUploadClient:
         }
 
         for path in changed_paths:
+            if self._is_ignored_path(path):
+                try:
+                    abs_path = str(path.resolve())
+                except Exception:
+                    continue
+                cached_hash = self._get_cached_file_hash(abs_path)
+                if cached_hash:
+                    changes["deleted"].append(path)
+                    try:
+                        self._stat_cache.pop(abs_path, None)
+                    except Exception:
+                        pass
+                continue
             # Resolve to an absolute path for stable cache keys
             try:
                 abs_path = str(path.resolve())
@@ -554,7 +838,7 @@ class RemoteUploadClient:
                 # Skip paths that cannot be resolved
                 continue
 
-            cached_hash = get_cached_file_hash(abs_path, self.repo_name)
+            cached_hash = self._get_cached_file_hash(abs_path)
 
             if not path.exists():
                 # File was deleted
@@ -588,9 +872,7 @@ class RemoteUploadClient:
 
             # Stat changed or no prior entry – hash content to classify change
             try:
-                with open(path, 'rb') as f:
-                    content = f.read()
-                current_hash = hashlib.sha1(content).hexdigest()
+                current_hash, _ = self._read_current_file_hash(path)
             except Exception:
                 # Skip files that can't be read
                 continue
@@ -610,8 +892,6 @@ class RemoteUploadClient:
                 self._stat_cache[abs_path] = (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)), stat.st_size)
             except Exception:
                 pass
-            set_cached_file_hash(abs_path, current_hash, self.repo_name)
-
         # Detect moves by looking for files with same content hash
         # but different paths (requires additional tracking)
         changes["moved"] = self._detect_moves(changes["created"], changes["deleted"])
@@ -636,7 +916,7 @@ class RemoteUploadClient:
         for deleted_path in deleted_files:
             try:
                 # Try to get cached hash first, fallback to file content
-                cached_hash = get_cached_file_hash(str(deleted_path), self.repo_name)
+                cached_hash = self._get_cached_file_hash(str(deleted_path))
                 if cached_hash:
                     deleted_hashes[cached_hash] = deleted_path
                     continue
@@ -720,7 +1000,7 @@ class RemoteUploadClient:
 
                     # Get file info
                     stat = path.stat()
-                    language = idx.CODE_EXTS.get(path.suffix.lower(), "unknown")
+                    language = CODE_EXTS.get(path.suffix.lower(), "unknown")
 
                     operation = {
                         "operation": "created",
@@ -729,7 +1009,7 @@ class RemoteUploadClient:
                         "absolute_path": str(path.resolve()),
                         "size_bytes": stat.st_size,
                         "content_hash": content_hash,
-                        "file_hash": f"sha1:{idx.hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
+                        "file_hash": f"sha1:{hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
                         "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                         "language": language
                     }
@@ -749,7 +1029,7 @@ class RemoteUploadClient:
                         content = f.read()
                     file_hash = hashlib.sha1(content).hexdigest()
                     content_hash = f"sha1:{file_hash}"
-                    previous_hash = get_cached_file_hash(str(path.resolve()), self.repo_name)
+                    previous_hash = self._get_cached_file_hash(str(path.resolve()))
 
                     # Write file to bundle
                     bundle_file_path = files_dir / "updated" / rel_path
@@ -758,7 +1038,7 @@ class RemoteUploadClient:
 
                     # Get file info
                     stat = path.stat()
-                    language = idx.CODE_EXTS.get(path.suffix.lower(), "unknown")
+                    language = CODE_EXTS.get(path.suffix.lower(), "unknown")
 
                     operation = {
                         "operation": "updated",
@@ -768,7 +1048,7 @@ class RemoteUploadClient:
                         "size_bytes": stat.st_size,
                         "content_hash": content_hash,
                         "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
-                        "file_hash": f"sha1:{idx.hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
+                        "file_hash": f"sha1:{hash_id(content.decode('utf-8', errors='ignore'), rel_path, 1, len(content.splitlines()))}",
                         "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                         "language": language
                     }
@@ -797,7 +1077,7 @@ class RemoteUploadClient:
 
                     # Get file info
                     stat = dest_path.stat()
-                    language = idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown")
+                    language = CODE_EXTS.get(dest_path.suffix.lower(), "unknown")
 
                     operation = {
                         "operation": "moved",
@@ -809,7 +1089,7 @@ class RemoteUploadClient:
                         "source_absolute_path": str(source_path.resolve()),
                         "size_bytes": stat.st_size,
                         "content_hash": content_hash,
-                        "file_hash": f"sha1:{idx.hash_id(content.decode('utf-8', errors='ignore'), dest_rel_path, 1, len(content.splitlines()))}",
+                        "file_hash": f"sha1:{hash_id(content.decode('utf-8', errors='ignore'), dest_rel_path, 1, len(content.splitlines()))}",
                         "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                         "language": language
                     }
@@ -825,7 +1105,7 @@ class RemoteUploadClient:
             for path in changes["deleted"]:
                 rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
                 try:
-                    previous_hash = get_cached_file_hash(str(path.resolve()), self.repo_name)
+                    previous_hash = self._get_cached_file_hash(str(path.resolve()))
 
                     operation = {
                         "operation": "deleted",
@@ -835,16 +1115,9 @@ class RemoteUploadClient:
                         "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
                         "file_hash": None,
                         "modified_time": datetime.now().isoformat(),
-                        "language": idx.CODE_EXTS.get(path.suffix.lower(), "unknown")
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown")
                     }
                     operations.append(operation)
-
-                    # Once a delete operation has been recorded, drop the cache entry
-                    # so subsequent scans do not keep re-reporting the same deletion.
-                    try:
-                        remove_cached_file(str(path.resolve()), self.repo_name)
-                    except Exception:
-                        pass
 
                 except Exception as e:
                     print(f"[bundle_create] Error processing deleted file {path}: {e}")
@@ -855,7 +1128,6 @@ class RemoteUploadClient:
                 "version": "1.0",
                 "bundle_id": bundle_id,
                 "workspace_path": self.workspace_path,
-                "collection_name": self.collection_name,
                 "created_at": created_at,
                 # CLI is stateless - server handles sequence numbers
                 "sequence_number": None,  # Server will assign
@@ -907,7 +1179,291 @@ class RemoteUploadClient:
             with tarfile.open(bundle_path, "w:gz") as tar:
                 tar.add(temp_path, arcname=f"{bundle_id}")
 
+            self._last_expected_hashes.update(file_hashes)
             return str(bundle_path), manifest
+
+    def _build_plan_payload(self, changes: Dict[str, List]) -> Dict[str, Any]:
+        created_at = datetime.now().isoformat()
+        bundle_id = str(uuid.uuid4())
+        operations: List[Dict[str, Any]] = []
+        file_hashes: Dict[str, str] = {}
+        total_size = 0
+
+        for path in changes["created"]:
+            rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                file_hash, size = self._read_current_file_hash(path)
+                operations.append(
+                    {
+                        "operation": "created",
+                        "path": rel_path,
+                        "size_bytes": size,
+                        "content_hash": f"sha1:{file_hash}",
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                    }
+                )
+                file_hashes[rel_path] = f"sha1:{file_hash}"
+                total_size += size
+            except Exception as e:
+                logger.warning("[remote_upload] Failed to prepare created plan entry for %s: %s", path, e)
+
+        for path in changes["updated"]:
+            rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                file_hash, size = self._read_current_file_hash(path)
+                previous_hash = self._get_cached_file_hash(str(path.resolve()))
+                operations.append(
+                    {
+                        "operation": "updated",
+                        "path": rel_path,
+                        "size_bytes": size,
+                        "content_hash": f"sha1:{file_hash}",
+                        "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                    }
+                )
+                file_hashes[rel_path] = f"sha1:{file_hash}"
+                total_size += size
+            except Exception as e:
+                logger.warning("[remote_upload] Failed to prepare updated plan entry for %s: %s", path, e)
+
+        for source_path, dest_path in changes["moved"]:
+            dest_rel_path = dest_path.relative_to(Path(self.workspace_path)).as_posix()
+            source_rel_path = source_path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                file_hash, size = self._read_current_file_hash(dest_path)
+                operations.append(
+                    {
+                        "operation": "moved",
+                        "path": dest_rel_path,
+                        "source_path": source_rel_path,
+                        "size_bytes": size,
+                        "content_hash": f"sha1:{file_hash}",
+                        "language": CODE_EXTS.get(dest_path.suffix.lower(), "unknown"),
+                    }
+                )
+                file_hashes[dest_rel_path] = f"sha1:{file_hash}"
+                total_size += size
+            except Exception as e:
+                logger.warning(
+                    "[remote_upload] Failed to prepare moved plan entry for %s -> %s: %s",
+                    source_path,
+                    dest_path,
+                    e,
+                )
+
+        for path in changes["deleted"]:
+            rel_path = path.relative_to(Path(self.workspace_path)).as_posix()
+            try:
+                previous_hash = self._get_cached_file_hash(str(path.resolve()))
+                operations.append(
+                    {
+                        "operation": "deleted",
+                        "path": rel_path,
+                        "previous_hash": f"sha1:{previous_hash}" if previous_hash else None,
+                        "language": CODE_EXTS.get(path.suffix.lower(), "unknown"),
+                    }
+                )
+            except Exception as e:
+                logger.warning("[remote_upload] Failed to prepare deleted plan entry for %s: %s", path, e)
+
+        manifest = {
+            "version": "1.0",
+            "bundle_id": bundle_id,
+            "workspace_path": self.workspace_path,
+            "created_at": created_at,
+            "sequence_number": None,
+            "parent_sequence": None,
+            "operations": {
+                "created": len(changes["created"]),
+                "updated": len(changes["updated"]),
+                "deleted": len(changes["deleted"]),
+                "moved": len(changes["moved"]),
+            },
+            "total_files": len(operations),
+            "total_size_bytes": total_size,
+            "compression": "gzip",
+            "encoding": "utf-8",
+        }
+        return {
+            "manifest": manifest,
+            "operations": operations,
+            "file_hashes": file_hashes,
+        }
+
+    def _plan_delta_upload(self, changes: Dict[str, List]) -> Optional[Dict[str, Any]]:
+        if not _env_flag("CTXCE_REMOTE_UPLOAD_PLAN_ENABLED", True):
+            return None
+        try:
+            payload = self._build_plan_payload(changes)
+            self._last_plan_payload = payload
+            self._last_expected_hashes = dict(payload.get("file_hashes", {}))
+            # Indexed hashes are server-owned; the client submits candidates
+            # and uses only the returned plan.
+            data = {
+                "workspace_path": self._translate_to_container_path(self.workspace_path),
+                "source_path": self.workspace_path,
+                "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
+                "manifest": payload["manifest"],
+                "operations": payload["operations"],
+                "file_hashes": payload["file_hashes"],
+            }
+            sess = get_auth_session(self.upload_endpoint)
+            if sess:
+                data["session"] = sess
+            if getattr(self, "logical_repo_id", None):
+                data["logical_repo_id"] = self.logical_repo_id
+
+            response = self.session.post(
+                f"{self.upload_endpoint}/api/v1/delta/plan",
+                json=data,
+                timeout=min(self.timeout, 60),
+            )
+            if response.status_code in {404, 405}:
+                logger.info("[remote_upload] Plan endpoint unavailable; falling back to full bundle upload")
+                return None
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("success", False):
+                logger.warning("[remote_upload] Plan request failed; falling back: %s", body.get("error"))
+                return None
+            return body
+        except Exception as e:
+            logger.warning("[remote_upload] Plan request failed; falling back to full bundle upload: %s", e)
+            return None
+
+    def _build_apply_only_payload(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._last_plan_payload or self._build_plan_payload(changes)
+        needed = plan.get("needed_files", {}) if isinstance(plan, dict) else {}
+        created_needed = set(needed.get("created", []) or [])
+        updated_needed = set(needed.get("updated", []) or [])
+        moved_needed = set(needed.get("moved", []) or [])
+
+        # Check if ALL operations are hash-matched (nothing needs content at all)
+        # This happens when all needed_files lists are empty and there are no actual changes requiring content
+        has_changes_needing_content = bool(created_needed or updated_needed or moved_needed)
+        has_deletes = bool(changes.get("deleted", []))
+
+        # Only skip apply-only if there are NO operations needing content AND NO deletes
+        if not has_changes_needing_content and not has_deletes:
+            return {
+                "manifest": payload.get("manifest", {}),
+                "operations": [],
+                "file_hashes": {},
+            }
+
+        filtered_ops: List[Dict[str, Any]] = []
+        filtered_hashes: Dict[str, str] = {}
+        for operation in payload.get("operations", []):
+            op_type = str(operation.get("operation") or "")
+            rel_path = str(operation.get("path") or "")
+            # Determine if this operation needs content (only those skip filtered_hashes)
+            needs_content = (
+                (op_type == "created" and rel_path in created_needed)
+                or (op_type == "updated" and rel_path in updated_needed)
+                or (op_type == "moved" and rel_path in moved_needed)
+            )
+            if needs_content:
+                # Skip operations that need content - they'll be uploaded separately
+                continue
+            # IMPORTANT: server-side apply_delta_operations() only accepts "deleted" and "moved"
+            # operations. Hash-matched "created" and "updated" operations must NOT be routed
+            # through apply_ops since the server will reject them.
+            if op_type not in {"deleted", "moved"}:
+                continue
+            # Preserve all other operations so server advances state
+            filtered_ops.append(operation)
+            # Include hash for non-deleted operations
+            if op_type != "deleted":
+                hash_value = payload.get("file_hashes", {}).get(rel_path)
+                if hash_value:
+                    filtered_hashes[rel_path] = hash_value
+        return {
+            "manifest": payload.get("manifest", {}),
+            "operations": filtered_ops,
+            "file_hashes": filtered_hashes,
+        }
+
+    def _apply_operations_without_content(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Optional[bool]:
+        payload = self._build_apply_only_payload(changes, plan)
+        operations = payload.get("operations", [])
+        if not operations:
+            return None
+        try:
+            data = {
+                "workspace_path": self._translate_to_container_path(self.workspace_path),
+                "source_path": self.workspace_path,
+                "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
+                "manifest": payload["manifest"],
+                "operations": operations,
+                "file_hashes": payload["file_hashes"],
+            }
+            sess = get_auth_session(self.upload_endpoint)
+            if sess:
+                data["session"] = sess
+            if getattr(self, "logical_repo_id", None):
+                data["logical_repo_id"] = self.logical_repo_id
+
+            logger.info(
+                "[remote_upload] Applying metadata-only operations without bundle: deleted=%s moved=%s",
+                sum(1 for op in operations if op.get("operation") == "deleted"),
+                sum(1 for op in operations if op.get("operation") == "moved"),
+            )
+            response = self.session.post(
+                f"{self.upload_endpoint}/api/v1/delta/apply_ops",
+                json=data,
+                timeout=min(self.timeout, 60),
+            )
+            if response.status_code in {404, 405}:
+                logger.info("[remote_upload] apply_ops endpoint unavailable; falling back to bundle upload")
+                return None
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("success", False):
+                logger.warning("[remote_upload] apply_ops failed; falling back to bundle upload: %s", body.get("error"))
+                return None
+            processed_ops = body.get("processed_operations") or {}
+            self._set_last_upload_result(
+                "uploaded",
+                bundle_id=body.get("bundle_id"),
+                sequence_number=body.get("sequence_number"),
+                processed_operations=processed_ops,
+            )
+            logger.info(
+                "[remote_upload] Metadata-only operations applied: %s",
+                processed_ops,
+            )
+            return True
+        except Exception as e:
+            logger.warning("[remote_upload] apply_ops failed; falling back to bundle upload: %s", e)
+            return None
+
+    def _filter_changes_by_plan(self, changes: Dict[str, List], plan: Dict[str, Any]) -> Dict[str, List]:
+        needed = plan.get("needed_files", {}) if isinstance(plan, dict) else {}
+        created_needed = set(needed.get("created", []) or [])
+        updated_needed = set(needed.get("updated", []) or [])
+        moved_needed = set(needed.get("moved", []) or [])
+
+        filtered_created = [
+            path for path in changes["created"]
+            if path.relative_to(Path(self.workspace_path)).as_posix() in created_needed
+        ]
+        filtered_updated = [
+            path for path in changes["updated"]
+            if path.relative_to(Path(self.workspace_path)).as_posix() in updated_needed
+        ]
+        filtered_moved = [
+            (source_path, dest_path)
+            for source_path, dest_path in changes["moved"]
+            if dest_path.relative_to(Path(self.workspace_path)).as_posix() in moved_needed
+        ]
+        return {
+            "created": filtered_created,
+            "updated": filtered_updated,
+            "deleted": list(changes["deleted"]),
+            "moved": filtered_moved,
+            "unchanged": [],
+        }
 
     def upload_bundle(self, bundle_path: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -937,18 +1493,13 @@ class RemoteUploadClient:
                 # Check bundle size (server-side enforcement)
                 bundle_size = os.path.getsize(bundle_path)
 
-                files = {
-                    "bundle": open(bundle_path, "rb"),
-                }
                 data = {
                     "workspace_path": self._translate_to_container_path(self.workspace_path),
-                    "collection_name": self.collection_name,
                     "sequence_number": manifest.get("sequence_number"),
                     "force": False,
                     "source_path": self.workspace_path,
                     "logical_repo_id": _compute_logical_repo_id(self.workspace_path),
                 }
-
                 sess = get_auth_session(self.upload_endpoint)
                 if sess:
                     data["session"] = sess
@@ -958,12 +1509,13 @@ class RemoteUploadClient:
 
                 logger.info(f"[remote_upload] Uploading bundle {manifest['bundle_id']} (size: {bundle_size} bytes)")
 
-                response = self.session.post(
-                    f"{self.upload_endpoint}/api/v1/delta/upload",
-                    files=files,
-                    data=data,
-                    timeout=(10, self.timeout)
-                )
+                with open(bundle_path, "rb") as bundle_file:
+                    response = self.session.post(
+                        f"{self.upload_endpoint}/api/v1/delta/upload",
+                        files={"bundle": bundle_file},
+                        data=data,
+                        timeout=(10, self.timeout)
+                    )
 
                 result = None
                 try:
@@ -1015,29 +1567,17 @@ class RemoteUploadClient:
                 last_error = {"success": False, "error": {"code": "TIMEOUT_ERROR", "message": f"Upload timeout: {str(e)}"}}
                 logger.warning(f"[remote_upload] Upload read timeout on attempt {attempt + 1}: {e}")
                 
-                # After read timeout, poll to check if server processed the bundle
-                logger.info(f"[remote_upload] Read timeout occurred, polling server to check if bundle was processed...")
-                poll_result = self._poll_after_timeout(manifest)
-                if poll_result.get("success"):
-                    logger.info(f"[remote_upload] Server confirmed processing of bundle {manifest['bundle_id']} after timeout")
-                    return poll_result
-                
-                logger.warning(f"[remote_upload] Server did not process bundle after timeout, proceeding with failure")
-                break
+                # A timeout is retried normally. The server-side hash plan makes
+                # a replay safe when the request was accepted before the timeout.
+                continue
 
             except requests.exceptions.Timeout as e:
                 last_error = {"success": False, "error": {"code": "TIMEOUT_ERROR", "message": f"Upload timeout: {str(e)}"}}
                 logger.warning(f"[remote_upload] Upload timeout on attempt {attempt + 1}: {e}")
                 
-                # For generic timeout, also try polling
-                logger.info(f"[remote_upload] Timeout occurred, polling server to check if bundle was processed...")
-                poll_result = self._poll_after_timeout(manifest)
-                if poll_result.get("success"):
-                    logger.info(f"[remote_upload] Server confirmed processing of bundle {manifest['bundle_id']} after timeout")
-                    return poll_result
-                
-                logger.warning(f"[remote_upload] Server did not process bundle after timeout, proceeding with failure")
-                break
+                # A timeout is retried normally. The server-side hash plan makes
+                # a replay safe when the request was accepted before the timeout.
+                continue
 
             except requests.exceptions.ConnectionError as e:
                 last_error = {"success": False, "error": {"code": "CONNECTION_ERROR", "message": f"Connection error: {str(e)}"}}
@@ -1061,87 +1601,6 @@ class RemoteUploadClient:
             }
         }
 
-    def _poll_after_timeout(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Poll server status after a timeout to check if bundle was processed.
-        
-        Args:
-            manifest: Bundle manifest containing sequence information
-            
-        Returns:
-            Dictionary indicating success if bundle was processed
-        """
-        try:
-            # Get current server status to know the expected sequence
-            status = self.get_server_status()
-            if not status.get("success"):
-                return {"success": False, "error": status.get("error", {"code": "UNKNOWN", "message": "Failed to get status"})}
-
-            current_sequence = status.get("last_sequence", 0)
-            expected_sequence = manifest.get("sequence", current_sequence + 1)
-
-            logger.info(f"[remote_upload] Current server sequence: {current_sequence}, expected: {expected_sequence}")
-
-            # If server is already at expected sequence, bundle was processed
-            if current_sequence >= expected_sequence:
-                return {
-                    "success": True,
-                    "message": f"Bundle processed (server at sequence {current_sequence})",
-                    "sequence": current_sequence,
-                }
-
-            # Poll window is configurable via REMOTE_UPLOAD_POLL_MAX_SECS (seconds).
-            # Values <= 0 mean "no timeout" (poll until success or process exit).
-            try:
-                max_poll_time = int(os.environ.get("REMOTE_UPLOAD_POLL_MAX_SECS", "300"))
-            except Exception:
-                max_poll_time = 300
-            poll_interval = 5
-            start_time = time.time()
-
-            while True:
-                elapsed = time.time() - start_time
-                if max_poll_time > 0 and elapsed >= max_poll_time:
-                    logger.warning(
-                        f"[remote_upload] Polling timed out after {int(elapsed)}s (limit={max_poll_time}s), bundle was not confirmed as processed"
-                    )
-                    return {
-                        "success": False,
-                        "error": {
-                            "code": "POLL_TIMEOUT",
-                            "message": f"Bundle not confirmed processed after polling for {int(elapsed)}s (limit={max_poll_time}s)",
-                        },
-                    }
-
-                logger.info(
-                    f"[remote_upload] Polling server status... (elapsed: {int(elapsed)}s, limit={'no-limit' if max_poll_time <= 0 else max_poll_time}s)"
-                )
-                time.sleep(poll_interval)
-
-                status = self.get_server_status()
-                if status.get("success"):
-                    new_sequence = status.get("last_sequence", 0)
-                    if new_sequence >= expected_sequence:
-                        logger.info(
-                            f"[remote_upload] Server sequence advanced to {new_sequence}, bundle was processed!"
-                        )
-                        return {
-                            "success": True,
-                            "message": f"Bundle processed after timeout (server at sequence {new_sequence})",
-                            "sequence": new_sequence,
-                        }
-                    logger.debug(
-                        f"[remote_upload] Server sequence still at {new_sequence}, continuing to poll..."
-                    )
-                else:
-                    logger.warning(
-                        f"[remote_upload] Failed to get server status during poll: {status.get('error', {}).get('message', 'Unknown')}"
-                    )
-            
-        except Exception as e:
-            logger.error(f"[remote_upload] Error during post-timeout polling: {e}")
-            return {"success": False, "error": {"code": "POLL_ERROR", "message": f"Polling error: {str(e)}"}}
-
     def get_server_status(self) -> Dict[str, Any]:
         """Get server status with simplified error handling."""
         try:
@@ -1149,14 +1608,27 @@ class RemoteUploadClient:
             connect_timeout = min(self.timeout, 10)
             # Allow slower responses (e.g., cold starts/large collections) before bailing
             read_timeout = max(self.timeout, 30)
+            params = {"workspace_path": container_workspace_path}
+            sess = get_auth_session(self.upload_endpoint)
+            if sess:
+                params["session"] = sess
             response = self.session.get(
                 f"{self.upload_endpoint}/api/v1/delta/status",
-                params={'workspace_path': container_workspace_path},
+                params=params,
                 timeout=(connect_timeout, read_timeout)
             )
 
             if response.status_code == 200:
-                return response.json()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "STATUS_INVALID",
+                            "message": "Invalid status response payload",
+                        },
+                    }
+                return {"success": True, **payload}
 
             # Handle error response
             error_msg = f"Status check failed with HTTP {response.status_code}"
@@ -1179,6 +1651,93 @@ class RemoteUploadClient:
         """Check if changes warrant a delta upload."""
         total_changes = sum(len(files) for op, files in changes.items() if op != "unchanged")
         return total_changes > 0
+
+    def _collect_force_cleanup_paths(self) -> List[Path]:
+        """
+        Return ignored paths that force mode should actively delete remotely.
+
+        In dev-remote mode, dev-workspace is intentionally ignored during upload
+        scans to avoid recursive dogfooding. If that tree already exists on the
+        remote side from an older buggy upload, force mode should remove it even
+        when the local cache does not contain those paths.
+        """
+        cleanup_paths: List[Path] = []
+        if "dev-workspace" not in self._excluded_dirnames():
+            return cleanup_paths
+
+        dev_root = Path(self.workspace_path) / "dev-workspace"
+        if not dev_root.exists():
+            return cleanup_paths
+
+        for root, dirnames, filenames in os.walk(dev_root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for filename in filenames:
+                path = Path(root) / filename
+                try:
+                    if path.is_file():
+                        cleanup_paths.append(path)
+                except Exception:
+                    continue
+        return cleanup_paths
+
+    def build_force_changes(self, all_files: List[Path]) -> Dict[str, List]:
+        """
+        Build force-upload changes while still cleaning stale cached paths.
+
+        Force mode should re-upload every currently managed file, but it must also
+        emit deletes for files that only exist in the local cache now, including
+        paths that are ignored under the current client policy such as
+        dev-workspace in dev-remote mode.
+        """
+        created_files: List[Path] = []
+        path_map: Dict[Path, Path] = {}
+        for path in all_files:
+            if self._is_ignored_path(path):
+                continue
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            created_files.append(path)
+            path_map[resolved] = path
+
+        for cached_abs in self._get_all_cached_paths():
+            try:
+                cached_path = Path(cached_abs)
+                resolved = cached_path.resolve()
+            except Exception:
+                continue
+            if resolved not in path_map:
+                path_map[resolved] = cached_path
+
+        force_cleanup_paths = self._collect_force_cleanup_paths()
+        for cleanup_path in force_cleanup_paths:
+            try:
+                resolved = cleanup_path.resolve()
+            except Exception:
+                continue
+            if resolved not in path_map:
+                path_map[resolved] = cleanup_path
+
+        probed = self.detect_file_changes(list(path_map.values()))
+        deleted_by_resolved: Dict[Path, Path] = {}
+        for deleted_path in probed.get("deleted", []):
+            try:
+                deleted_by_resolved[deleted_path.resolve()] = deleted_path
+            except Exception:
+                continue
+        for cleanup_path in force_cleanup_paths:
+            try:
+                deleted_by_resolved.setdefault(cleanup_path.resolve(), cleanup_path)
+            except Exception:
+                continue
+        return {
+            "created": created_files,
+            "updated": [],
+            "deleted": list(deleted_by_resolved.values()),
+            "moved": [],
+            "unchanged": [],
+        }
 
     def upload_git_history_only(self, git_history: Dict[str, Any]) -> bool:
         try:
@@ -1221,25 +1780,81 @@ class RemoteUploadClient:
         try:
             logger.info(f"[remote_upload] Processing pre-computed changes")
 
+            self._last_plan_payload = None
+            self._last_expected_hashes = {}
+
             # Validate input
             if not changes:
                 logger.info("[remote_upload] No changes provided")
+                self._set_last_upload_result("no_changes")
                 return True
+
 
             if not self.has_meaningful_changes(changes):
                 logger.info("[remote_upload] No meaningful changes detected, skipping upload")
+                self._set_last_upload_result("no_changes")
                 return True
 
             # Log change summary
             total_changes = sum(len(files) for op, files in changes.items() if op != "unchanged")
-            logger.info(f"[remote_upload] Detected {total_changes} meaningful changes: "
-                       f"{len(changes['created'])} created, {len(changes['updated'])} updated, "
-                       f"{len(changes['deleted'])} deleted, {len(changes['moved'])} moved")
+            logger.info(
+                "[remote_upload] Detected %d candidate changes before remote planning: "
+                "created=%d updated=%d deleted=%d moved=%d",
+                total_changes,
+                len(changes["created"]),
+                len(changes["updated"]),
+                len(changes["deleted"]),
+                len(changes["moved"]),
+            )
+
+            planned_changes = changes
+            plan = self._plan_delta_upload(changes)
+            preview: Dict[str, Any] = {}
+            has_content_work = True
+            if plan:
+                preview = plan.get("operation_counts_preview", {})
+                needed = plan.get("needed_files", {}) if isinstance(plan.get("needed_files", {}), dict) else {}
+                diagnostics = plan.get("diagnostics", {}) if isinstance(plan.get("diagnostics", {}), dict) else {}
+                logger.info(
+                    "[remote_upload] Remote plan: candidates=%d content_needed="
+                    "created=%s updated=%s moved=%s deletes=%s "
+                    "skipped_hash_match=%s needed_bytes=%s cache_entries=%s "
+                    "cache_hash_matches=%s",
+                    total_changes,
+                    len(needed.get("created", []) or []),
+                    len(needed.get("updated", []) or []),
+                    len(needed.get("moved", []) or []),
+                    len(changes.get("deleted", [])),
+                    preview.get("skipped_hash_match", 0),
+                    plan.get("needed_size_bytes", 0),
+                    diagnostics.get("cache_entries", 0),
+                    diagnostics.get("cache_hash_matches", 0),
+                )
+                planned_changes = self._filter_changes_by_plan(changes, plan)
+                has_content_work = bool(
+                    planned_changes.get("created")
+                    or planned_changes.get("updated")
+                    or planned_changes.get("moved")
+                )
+                if not has_content_work:
+                    apply_only_result = self._apply_operations_without_content(changes, plan)
+                    if apply_only_result is True:
+                        self._finalize_successful_changes(changes)
+                        return True
+                if not self.has_meaningful_changes(planned_changes):
+                    logger.info("[remote_upload] Plan found no upload work; skipping bundle upload")
+                    self._finalize_successful_changes(changes)
+                    self._set_last_upload_result(
+                        "skipped_by_plan",
+                        plan_preview=preview,
+                        needed_size_bytes=plan.get("needed_size_bytes", 0),
+                    )
+                    return True
 
             # Create delta bundle
             bundle_path = None
             try:
-                bundle_path, manifest = self.create_delta_bundle(changes)
+                bundle_path, manifest = self.create_delta_bundle(planned_changes)
                 logger.info(f"[remote_upload] Created delta bundle: {manifest['bundle_id']} "
                            f"(size: {manifest['total_size_bytes']} bytes)")
 
@@ -1251,6 +1866,7 @@ class RemoteUploadClient:
                 logger.error(f"[remote_upload] Error creating delta bundle: {e}")
                 # Clean up any temporary files on failure
                 self.cleanup()
+                self._set_last_upload_result("failed", stage="bundle_creation", error=str(e))
                 return False
 
             # Upload bundle with retry logic
@@ -1258,9 +1874,31 @@ class RemoteUploadClient:
                 response = self.upload_bundle(bundle_path, manifest)
 
                 if response.get("success", False):
-                    processed_ops = response.get('processed_operations', {})
-                    logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
-                    logger.info(f"[remote_upload] Processed operations: {processed_ops}")
+                    processed_ops = response.get("processed_operations")
+                    if processed_ops is None:
+                        logger.info(
+                            "[remote_upload] Bundle %s accepted by server; processing asynchronously (sequence=%s)",
+                            manifest["bundle_id"],
+                            response.get("sequence_number"),
+                        )
+                        self._set_last_upload_result(
+                            "queued",
+                            bundle_id=manifest["bundle_id"],
+                            sequence_number=response.get("sequence_number"),
+                        )
+                        # Acceptance is the client-side completion point. The
+                        # server owns background processing and journal retry.
+                        self._finalize_successful_changes(changes)
+                    else:
+                        logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
+                        logger.info(f"[remote_upload] Processed operations: {processed_ops}")
+                        self._finalize_successful_changes(changes)
+                        self._set_last_upload_result(
+                            "uploaded",
+                            bundle_id=manifest["bundle_id"],
+                            sequence_number=response.get("sequence_number"),
+                            processed_operations=processed_ops,
+                        )
 
                     # Clean up temporary bundle after successful upload
                     try:
@@ -1276,15 +1914,19 @@ class RemoteUploadClient:
                 else:
                     error_msg = response.get('error', {}).get('message', 'Unknown upload error')
                     logger.error(f"[remote_upload] Upload failed: {error_msg}")
+                    self._set_last_upload_result("failed", stage="upload", error=error_msg)
                     return False
 
             except Exception as e:
                 logger.error(f"[remote_upload] Error uploading bundle: {e}")
+                self._set_last_upload_result("failed", stage="upload", error=str(e))
                 return False
 
         except Exception as e:
             logger.error(f"[remote_upload] Unexpected error in process_changes_and_upload: {e}")
+            self._set_last_upload_result("failed", stage="unexpected", error=str(e))
             return False
+
 
     def get_all_code_files(self) -> List[Path]:
         """Get all code files in the workspace."""
@@ -1295,28 +1937,31 @@ class RemoteUploadClient:
                 return files
 
             # Single walk with early pruning similar to standalone client
-            ext_suffixes = {str(ext).lower() for ext in idx.CODE_EXTS if str(ext).startswith('.')}
-            name_matches = {str(ext) for ext in idx.CODE_EXTS if not str(ext).startswith('.')}
-            dev_remote = os.environ.get("DEV_REMOTE_MODE") == "1" or os.environ.get("REMOTE_UPLOAD_MODE") == "development"
-            excluded = {
-                "node_modules", "vendor", "dist", "build", "target", "out",
-                ".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv",
-                "__pycache__", ".pytest_cache", ".mypy_cache", ".cache",
-                ".context-engine", ".context-engine-uploader", ".codebase"
-            }
-            if dev_remote:
-                excluded.add("dev-workspace")
+            ext_suffixes = {str(ext).lower() for ext in CODE_EXTS if str(ext).startswith('.')}
+            try:
+                extensionless_names = {k.lower() for k in (EXTENSIONLESS_FILES or {}).keys()}
+            except Exception:
+                extensionless_names = set()
+            excluded = self._excluded_dirnames()
 
             seen = set()
             for root, dirnames, filenames in os.walk(workspace_path):
                 dirnames[:] = [d for d in dirnames if d not in excluded and not d.startswith('.')]
 
                 for filename in filenames:
-                    if filename.startswith('.'):
+                    # Allow dotfiles that are in EXTENSIONLESS_FILES (e.g., .gitignore)
+                    fname_lower = filename.lower()
+                    if filename.startswith('.') and fname_lower not in extensionless_names:
                         continue
                     candidate = Path(root) / filename
+                    if self._is_ignored_path(candidate):
+                        continue
                     suffix = candidate.suffix.lower()
-                    if filename in name_matches or suffix in ext_suffixes:
+                    if (
+                        suffix in ext_suffixes
+                        or fname_lower in extensionless_names
+                        or fname_lower.startswith("dockerfile")
+                    ):
                         resolved = candidate.resolve()
                         if resolved not in seen:
                             seen.add(resolved)
@@ -1368,13 +2013,13 @@ class RemoteUploadClient:
 
                 # Always check src_path
                 src_path = Path(event.src_path)
-                if idx.CODE_EXTS.get(src_path.suffix.lower(), "unknown") != "unknown":
+                if self.client._is_watchable_path(src_path):
                     paths_to_process.append(src_path)
 
                 # For FileMovedEvent, also process the destination path
                 if hasattr(event, 'dest_path') and event.dest_path:
                     dest_path = Path(event.dest_path)
-                    if idx.CODE_EXTS.get(dest_path.suffix.lower(), "unknown") != "unknown":
+                    if self.client._is_watchable_path(dest_path):
                         paths_to_process.append(dest_path)
 
                 if not paths_to_process:
@@ -1395,6 +2040,8 @@ class RemoteUploadClient:
             def _process_pending_changes(self):
                 """Process accumulated changes after debounce period."""
                 with self._lock:
+                    # Timer fired; allow a new debounce to be armed while we process.
+                    self._debounce_timer = None
                     # Prevent re-entrancy
                     if self._processing:
                         return
@@ -1406,18 +2053,20 @@ class RemoteUploadClient:
                     check_deletions = self._check_for_deletions
                     self._check_for_deletions = False
 
+                upload_succeeded = False
                 try:
                     # Only include cached paths when deletion-related events occurred
                     if check_deletions:
                         cached_file_hashes = _load_local_cache_file_hashes(
                             self.client.workspace_path,
-                            self.client.repo_name
+                            self.client.repo_name,
+                            metadata_root=self.client.metadata_root,
                         )
-                        all_paths = list(set(pending + [
-                            Path(p) for p in cached_file_hashes.keys()
-                        ]))
+                        cached_paths = [Path(p) for p in cached_file_hashes.keys()]
+                        all_paths = list(set(pending + cached_paths))
                     else:
                         all_paths = pending
+
 
                     changes = self.client.detect_file_changes(all_paths)
                     meaningful_changes = (
@@ -1428,10 +2077,15 @@ class RemoteUploadClient:
                     )
 
                     if meaningful_changes > 0:
-                        logger.info(f"[watch] Detected {meaningful_changes} changes: { {k: len(v) for k, v in changes.items() if k != 'unchanged'} }")
+                        logger.info(
+                            "[watch] Detected %d candidate changes: %s",
+                            meaningful_changes,
+                            {k: len(v) for k, v in changes.items() if k != "unchanged"},
+                        )
                         success = self.client.process_changes_and_upload(changes)
                         if success:
-                            logger.info("[watch] Successfully uploaded changes")
+                            self.client.log_watch_upload_result()
+                            upload_succeeded = True
                         else:
                             logger.error("[watch] Failed to upload changes")
                     else:
@@ -1447,19 +2101,33 @@ class RemoteUploadClient:
                             success = self.client.upload_git_history_only(git_history)
                             if success:
                                 logger.info("[watch] Successfully uploaded git history metadata")
+                                upload_succeeded = True
                             else:
                                 logger.error("[watch] Failed to upload git history metadata")
+                        else:
+                            upload_succeeded = True  # No changes to process
                 except Exception as e:
                     logger.error(f"[watch] Error processing changes: {e}")
                 finally:
                     # Clear processing flag even if an error occurred
                     with self._lock:
                         self._processing = False
+                        # Re-queue pending paths if upload failed
+                        if not upload_succeeded and pending:
+                            # Merge pending paths back into _pending_paths
+                            for p in pending:
+                                self._pending_paths.add(p)
+                        # Arm next pass if there are pending paths
+                        if self._pending_paths and self._debounce_timer is None:
+                            self._debounce_timer = threading.Timer(
+                                self.debounce_seconds,
+                                self._process_pending_changes,
+                            )
+                            self._debounce_timer.start()
 
         
         observer = Observer()
         handler = CodeFileEventHandler(self, debounce_seconds=2.0)
-        
         try:
             observer.schedule(handler, self.workspace_path, recursive=True)
             observer.start()
@@ -1504,7 +2172,11 @@ class RemoteUploadClient:
                         path_map[resolved] = p
 
                     # Include any paths that are only present in the local cache (deleted files)
-                    cached_file_hashes = _load_local_cache_file_hashes(self.workspace_path, self.repo_name)
+                    cached_file_hashes = _load_local_cache_file_hashes(
+                        self.workspace_path,
+                        self.repo_name,
+                        metadata_root=self.metadata_root,
+                    )
                     for cached_abs in cached_file_hashes.keys():
                         try:
                             cached_path = Path(cached_abs)
@@ -1521,12 +2193,16 @@ class RemoteUploadClient:
                     meaningful_changes = len(changes.get("created", [])) + len(changes.get("updated", [])) + len(changes.get("deleted", [])) + len(changes.get("moved", []))
 
                     if meaningful_changes > 0:
-                        logger.info(f"[watch] Detected {meaningful_changes} changes: { {k: len(v) for k, v in changes.items() if k != 'unchanged'} }")
+                        logger.info(
+                            "[watch] Detected %d candidate changes: %s",
+                            meaningful_changes,
+                            {k: len(v) for k, v in changes.items() if k != "unchanged"},
+                        )
 
                         success = self.process_changes_and_upload(changes)
 
                         if success:
-                            logger.info(f"[watch] Successfully uploaded changes")
+                            self.log_watch_upload_result()
                         else:
                             logger.error(f"[watch] Failed to upload changes")
                     else:
@@ -1584,80 +2260,7 @@ class RemoteUploadClient:
             except Exception as e:
                 logger.error(f"[remote_upload] Error detecting file changes: {e}")
                 return False
-
-            if not self.has_meaningful_changes(changes):
-                logger.info("[remote_upload] No meaningful changes detected, skipping upload")
-                return True
-
-            # Log change summary
-            total_changes = sum(len(files) for op, files in changes.items() if op != "unchanged")
-            logger.info(f"[remote_upload] Detected {total_changes} meaningful changes: "
-                       f"{len(changes['created'])} created, {len(changes['updated'])} updated, "
-                       f"{len(changes['deleted'])} deleted, {len(changes['moved'])} moved")
-
-            # Create delta bundle
-            bundle_path = None
-            try:
-                bundle_path, manifest = self.create_delta_bundle(changes)
-                logger.info(f"[remote_upload] Created delta bundle: {manifest['bundle_id']} "
-                           f"(size: {manifest['total_size_bytes']} bytes)")
-
-                # Validate bundle was created successfully
-                if not bundle_path or not os.path.exists(bundle_path):
-                    raise RuntimeError(f"Failed to create bundle at {bundle_path}")
-
-            except Exception as e:
-                logger.error(f"[remote_upload] Error creating delta bundle: {e}")
-                # Clean up any temporary files on failure
-                self.cleanup()
-                return False
-
-            # Upload bundle with retry logic
-            try:
-                response = self.upload_bundle(bundle_path, manifest)
-
-                if response.get("success", False):
-                    processed_ops = response.get('processed_operations', {})
-                    logger.info(f"[remote_upload] Successfully uploaded bundle {manifest['bundle_id']}")
-                    logger.info(f"[remote_upload] Processed operations: {processed_ops}")
-
-                    # Clean up temporary bundle after successful upload
-                    try:
-                        if os.path.exists(bundle_path):
-                            os.remove(bundle_path)
-                            logger.debug(f"[remote_upload] Cleaned up temporary bundle: {bundle_path}")
-                        # Also clean up the entire temp directory if this is the last bundle
-                        self.cleanup()
-                    except Exception as cleanup_error:
-                        logger.warning(f"[remote_upload] Failed to cleanup bundle {bundle_path}: {cleanup_error}")
-
-                    return True
-                else:
-                    error = response.get("error", {})
-                    error_code = error.get("code", "UNKNOWN")
-                    error_msg = error.get("message", "Unknown error")
-
-                    logger.error(f"[remote_upload] Upload failed: {error_msg}")
-
-                    # Handle specific error types
-                    # CLI is stateless - server handles sequence management
-                    if error_code in ["BUNDLE_TOO_LARGE", "BUNDLE_NOT_FOUND"]:
-                        # These are unrecoverable errors
-                        logger.error(f"[remote_upload] Unrecoverable error ({error_code}): {error_msg}")
-                        return False
-                    elif error_code in ["TIMEOUT_ERROR", "CONNECTION_ERROR", "NETWORK_ERROR"]:
-                        # These might be temporary, suggest fallback
-                        logger.warning(f"[remote_upload] Network-related error ({error_code}): {error_msg}")
-                        logger.warning("[remote_upload] Consider falling back to local mode if this persists")
-                        return False
-                    else:
-                        # Other errors
-                        logger.error(f"[remote_upload] Upload error ({error_code}): {error_msg}")
-                        return False
-
-            except Exception as e:
-                logger.error(f"[remote_upload] Unexpected error during upload: {e}")
-                return False
+            return self.process_changes_and_upload(changes)
 
         except Exception as e:
             logger.error(f"[remote_upload] Critical error in process_and_upload_changes: {e}")
@@ -1688,7 +2291,7 @@ def _cleanup_dir_with_retries(path: Optional[str]) -> None:
         logger.debug(f"[remote_upload] Last cleanup error for {path}: {last_error}")
 
 
-def get_remote_config(cli_path: Optional[str] = None) -> Dict[str, str]:
+def get_remote_config(cli_path: Optional[str] = None) -> Dict[str, Any]:
     """Get remote upload configuration from environment variables and command-line arguments."""
     # Use command-line path if provided, otherwise fall back to environment variables
     if cli_path:
@@ -1698,17 +2301,10 @@ def get_remote_config(cli_path: Optional[str] = None) -> Dict[str, str]:
 
     logical_repo_id = _compute_logical_repo_id(workspace_path)
 
-    # Use auto-generated collection name based on repo name
-    repo_name = _extract_repo_name_from_path(workspace_path)
-    # Fallback to directory name if repo detection fails
-    if not repo_name:
-        repo_name = Path(workspace_path).name
-    collection_name = get_collection_name(repo_name)
-
     return {
         "upload_endpoint": os.environ.get("REMOTE_UPLOAD_ENDPOINT", "http://localhost:8080"),
         "workspace_path": workspace_path,
-        "collection_name": collection_name,
+        "collection_name": None,
         "logical_repo_id": logical_repo_id,
         # Use higher, more robust defaults but still allow env overrides
         "max_retries": int(os.environ.get("REMOTE_UPLOAD_MAX_RETRIES", "5")),
@@ -1816,7 +2412,7 @@ Examples:
         config["timeout"] = args.timeout
 
     logger.info(f"Workspace path: {config['workspace_path']}")
-    logger.info(f"Collection name: {config['collection_name']}")
+    logger.info(f"Collection name: {config['collection_name'] or '<server-owned>'}")
     logger.info(f"Upload endpoint: {config['upload_endpoint']}")
 
     if args.show_mapping:
@@ -1850,15 +2446,8 @@ Examples:
                 # Test server connection first
                 logger.info("Checking server status...")
                 status = client.get_server_status()
-                is_success = (
-                    isinstance(status, dict) and
-                    'workspace_path' in status and
-                    'collection_name' in status and
-                    status.get('status') == 'ready'
-                )
-                if not is_success:
-                    error = status.get("error", {})
-                    logger.error(f"Cannot connect to server: {error.get('message', 'Unknown error')}")
+                if not _is_usable_delta_status(status):
+                    logger.error("Cannot connect to server: %s", _server_status_error_message(status))
                     return 1
 
                 logger.info("Server connection successful")
@@ -1894,34 +2483,24 @@ Examples:
             # Test server connection
             logger.info("Checking server status...")
             status = client.get_server_status()
-            # For delta endpoint, success is indicated by having expected fields (not a "success" boolean)
-            is_success = (
-                isinstance(status, dict) and
-                'workspace_path' in status and
-                'collection_name' in status and
-                status.get('status') == 'ready'
-            )
-            if not is_success:
-                error = status.get("error", {})
-                logger.error(f"Cannot connect to server: {error.get('message', 'Unknown error')}")
+            if not _is_usable_delta_status(status):
+                logger.error("Cannot connect to server: %s", _server_status_error_message(status))
                 return 1
 
-            logger.info("Server connection successful")
+            logger.info(
+                "Server connection successful: status=%s pending_journal=%s journal=%s",
+                status.get("status"),
+                status.get("pending_operations"),
+                (status.get("server_info") or {}).get("journal", {}),
+            )
 
             # Scan repository and upload files
             logger.info("Scanning repository for files...")
             workspace_path = Path(config['workspace_path'])
 
-            # Find all files in the repository
-            all_files = []
-            for file_path in workspace_path.rglob('*'):
-                if file_path.is_file() and not file_path.name.startswith('.'):
-                    rel_path = file_path.relative_to(workspace_path)
-                    # Skip .codebase directory and other metadata
-                    if not str(rel_path).startswith('.codebase'):
-                        all_files.append(file_path)
+            all_files = client.get_all_code_files()
 
-            logger.info(f"Found {len(all_files)} files to upload")
+            logger.info(f"Found {len(all_files)} eligible files to scan")
 
             if not all_files:
                 logger.warning("No files found to upload")
@@ -1929,8 +2508,7 @@ Examples:
 
             # Detect changes (treat all files as changes for initial upload)
             if args.force:
-                # Force mode: treat all files as created
-                changes = {"created": all_files, "updated": [], "deleted": [], "moved": [], "unchanged": []}
+                changes = client.build_force_changes(all_files)
             else:
                 changes = client.detect_file_changes(all_files)
 
@@ -1938,16 +2516,32 @@ Examples:
                 logger.info("No meaningful changes to upload")
                 return 0
 
-            logger.info(f"Changes detected: {len(changes.get('created', []))} created, {len(changes.get('updated', []))} updated, {len(changes.get('deleted', []))} deleted")
+            logger.info(
+                "Candidates detected before remote planning: created=%d updated=%d deleted=%d moved=%d",
+                len(changes.get("created", [])),
+                len(changes.get("updated", [])),
+                len(changes.get("deleted", [])),
+                len(changes.get("moved", [])),
+            )
 
             # Process and upload changes
             logger.info("Uploading files to remote server...")
             success = client.process_changes_and_upload(changes)
 
             if success:
-                logger.info("Repository upload completed successfully!")
-                logger.info(f"Collection name: {config['collection_name']}")
-                logger.info(f"Files uploaded: {len(all_files)}")
+                outcome = str((client.last_upload_result or {}).get("outcome") or "")
+                if outcome == "skipped_by_plan":
+                    logger.info("No upload needed after plan")
+                elif outcome == "queued":
+                    logger.info("Repository upload request accepted; server processing asynchronously")
+                else:
+                    logger.info("Repository upload completed successfully!")
+                logger.info(f"Collection name: {config['collection_name'] or '<server-owned>'}")
+                logger.info(
+                    "Remote upload result: outcome=%s details=%s",
+                    outcome,
+                    client.last_upload_result,
+                )
             else:
                 logger.error("Repository upload failed!")
                 return 1

@@ -7,11 +7,9 @@ OUT_DIR="$SCRIPT_DIR/../out"
 SRC_SCRIPT="$SCRIPT_DIR/../../scripts/standalone_upload_client.py"
 CLIENT="standalone_upload_client.py"
 STAGE_DIR="$OUT_DIR/extension-stage"
-BUNDLE_DEPS="${1:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 HOOK_SRC="$SCRIPT_DIR/../../ctx-hook-simple.sh"
 CTX_SRC="$SCRIPT_DIR/../../scripts/ctx.py"
-ROUTER_SRC="$SCRIPT_DIR/../../scripts/mcp_router.py"
 REFRAG_SRC="$SCRIPT_DIR/../../scripts/refrag_glm.py"
 ENV_EXAMPLE_SRC="$SCRIPT_DIR/../../.env.example"
 AUTH_SRC="$SCRIPT_DIR/../../scripts/upload_auth_utils.py"
@@ -48,9 +46,6 @@ fi
 if [[ -f "$CTX_SRC" ]]; then
     cp "$CTX_SRC" "$STAGE_DIR/ctx.py"
 fi
-if [[ -f "$ROUTER_SRC" ]]; then
-    cp "$ROUTER_SRC" "$STAGE_DIR/mcp_router.py"
-fi
 if [[ -f "$REFRAG_SRC" ]]; then
     cp "$REFRAG_SRC" "$STAGE_DIR/refrag_glm.py"
 fi
@@ -64,16 +59,47 @@ if [[ -f "$ENV_EXAMPLE_SRC" ]]; then
     cp "$ENV_EXAMPLE_SRC" "$STAGE_DIR/env.example"
 fi
 
-# Optional: bundle Python deps into the staged extension when requested
-if [[ "$BUNDLE_DEPS" == "--bundle-deps" ]]; then
-    echo "Bundling Python dependencies into staged extension using $PYTHON_BIN..."
-    # On macOS, urllib3 v2 + system LibreSSL emits NotOpenSSLWarning; pin <2 there.
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "Detected macOS; pinning urllib3<2 to avoid LibreSSL/OpenSSL warning."
-        "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" "urllib3<2" requests charset_normalizer "openai>=1.0" watchdog
+# Bundle Python deps into the staged extension. Runtime assumes bundled
+# python_libs are present and only requires an installed Python interpreter.
+echo "Bundling Python dependencies into staged extension using $PYTHON_BIN..."
+rm -rf "$STAGE_DIR/python_libs"
+# On macOS, urllib3 v2 + system LibreSSL emits NotOpenSSLWarning; pin <2 there.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "Detected macOS; pinning urllib3<2 to avoid LibreSSL/OpenSSL warning."
+    "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" "urllib3<2" requests charset_normalizer "openai>=1.0" watchdog
+else
+    "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" requests urllib3 charset_normalizer "openai>=1.0" watchdog
+fi
+
+# Bundle MCP bridge npm package into the staged extension
+BRIDGE_SRC="$SCRIPT_DIR/../../ctx-mcp-bridge"
+BRIDGE_DIR="ctx-mcp-bridge"
+
+if [[ -d "$BRIDGE_SRC" && -f "$BRIDGE_SRC/package.json" ]]; then
+    echo "Bundling MCP bridge npm package into staged extension..."
+    mkdir -p "$STAGE_DIR/$BRIDGE_DIR"
+    if [[ -d "$BRIDGE_SRC/bin" ]]; then
+        cp -a "$BRIDGE_SRC/bin" "$STAGE_DIR/$BRIDGE_DIR/"
     else
-        "$PYTHON_BIN" -m pip install -t "$STAGE_DIR/python_libs" requests urllib3 charset_normalizer "openai>=1.0" watchdog
+        echo "Warning: Bridge bin directory not found at $BRIDGE_SRC/bin (skipping)"
     fi
+    if [[ -d "$BRIDGE_SRC/src" ]]; then
+        cp -a "$BRIDGE_SRC/src" "$STAGE_DIR/$BRIDGE_DIR/"
+    else
+        echo "Warning: Bridge src directory not found at $BRIDGE_SRC/src (skipping)"
+    fi
+    cp "$BRIDGE_SRC/package.json" "$STAGE_DIR/$BRIDGE_DIR/"
+
+    echo "Installing MCP bridge production dependencies into staged extension..."
+    if [[ -f "$BRIDGE_SRC/package-lock.json" ]]; then
+        cp "$BRIDGE_SRC/package-lock.json" "$STAGE_DIR/$BRIDGE_DIR/"
+        (cd "$STAGE_DIR/$BRIDGE_DIR" && npm ci --omit=dev)
+    else
+        (cd "$STAGE_DIR/$BRIDGE_DIR" && npm install --omit=dev)
+    fi
+    echo "MCP bridge bundled successfully."
+else
+    echo "Warning: MCP bridge source not found at $BRIDGE_SRC"
 fi
 
 pushd "$STAGE_DIR" >/dev/null

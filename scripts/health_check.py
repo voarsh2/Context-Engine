@@ -1,25 +1,11 @@
 #!/usr/bin/env python3
 import os
 import sys
-from pathlib import Path
 from typing import Dict, Any
 
 from qdrant_client import QdrantClient, models
 
-# Ensure /work (repo root) is on sys.path when run from /work/scripts
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-# Use embedder factory for Qwen3 support; fallback to direct fastembed
-try:
-    from scripts.embedder import get_embedding_model, get_model_dimension
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
-    from fastembed import TextEmbedding
-
-
+from scripts.embedder import get_embedding_model, get_model_dimension
 from scripts.utils import sanitize_vector_name
 from scripts.auth_backend import ensure_collections, AuthDisabledError
 
@@ -42,18 +28,14 @@ def assert_true(cond: bool, msg: str, *, critical: bool = False, failures: list[
 def main():
     qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:6333")
     api_key = os.environ.get("QDRANT_API_KEY")
-    collection = os.environ.get("COLLECTION_NAME", "codebase")
+    collection = (os.environ.get("COLLECTION_NAME") or "codebase").strip()
     model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
 
     print(f"Health check -> {qdrant_url} collection={collection} model={model_name}")
 
     # Init embedding to derive dimension and test embedding
-    if _EMBEDDER_FACTORY:
-        model = get_embedding_model(model_name)
-        dim = get_model_dimension(model_name)
-    else:
-        model = TextEmbedding(model_name=model_name)
-        dim = len(next(model.embed(["health dim probe"])))
+    model = get_embedding_model(model_name)
+    dim = get_model_dimension(model_name)
     vec_name_expect = sanitize_vector_name(model_name)
 
     client = QdrantClient(url=qdrant_url, api_key=api_key or None)
@@ -82,7 +64,6 @@ def main():
         print("No collections found - nothing to health check")
         return
 
-    # Check each collection
     for collection_name in collections:
         print(f"Checking collection: {collection_name}")
 
@@ -92,10 +73,20 @@ def main():
         if isinstance(cfg, dict):
             present_names = list(cfg.keys())
             assert_true(len(present_names) >= 1, "Collection has at least one named vector")
+            has_expected_vector = vec_name_expect in present_names
             assert_true(
-                vec_name_expect in present_names,
+                has_expected_vector,
                 f"Expected vector name present: {vec_name_expect} in {present_names}",
             )
+            if not has_expected_vector:
+                failures.append(
+                    f"Collection {collection_name} is missing expected vector {vec_name_expect}"
+                )
+                print(
+                    f"[WARN] Skipping vector query for {collection_name}; "
+                    f"expected vector {vec_name_expect!r} not present"
+                )
+                continue
             got_dim = cfg[vec_name_expect].size
         else:
             present_names = ["<unnamed>"]

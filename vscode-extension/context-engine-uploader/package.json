@@ -1,8 +1,8 @@
 {
   "name": "context-engine-uploader",
   "displayName": "Context Engine Uploader",
-  "description": "Runs the Context-Engine remote upload client with a force sync on startup followed by watch mode. Requires Python with pip install requests urllib3 charset_normalizer.",
-  "version": "0.1.39",
+  "description": "Runs the Context-Engine remote upload client with bundled Python dependencies, force sync, and watch mode.",
+  "version": "0.1.40",
   "publisher": "context-engine",
   "engines": {
     "vscode": "^1.85.0"
@@ -282,7 +282,7 @@
         "contextEngineUploader.autoStartMcpBridge": {
           "type": "boolean",
           "default": true,
-          "description": "When enabled and mcpServerMode='bridge' with mcpTransportMode='http', automatically start the local ctx-mcp-bridge HTTP server for the active workspace so IDE clients can connect over HTTP without manual commands. Has no effect in stdio/direct modes."
+          "description": "When enabled and mcpServerMode='bridge', automatically start the bundled local ctx bridge process for the active workspace. In http mode it serves the local HTTP MCP bridge directly; in sse-remote mode it starts the same bundled bridge adapter used by bridge-stdio wiring. Has no effect in direct modes."
         },
         "contextEngineUploader.mcpBridgePort": {
           "type": "number",
@@ -297,7 +297,17 @@
         "contextEngineUploader.mcpBridgeLocalOnly": {
           "type": "boolean",
           "default": false,
-          "description": "Development toggle. When true (default) the extension prefers local bridge binaries resolved from mcpBridgeBinPath or CTXCE_BRIDGE_BIN before falling back to the published npm build via npx."
+          "description": "Development toggle. When true and mcpBridgeMode='external', prefers local bridge binaries resolved from mcpBridgeBinPath or CTXCE_BRIDGE_BIN before falling back to the published npm build via npx. Ignored when mcpBridgeMode='bundled'."
+        },
+        "contextEngineUploader.mcpBridgeMode": {
+          "type": "string",
+          "enum": ["bundled", "external"],
+          "default": "bundled",
+          "description": "Bridge invocation mode. 'bundled' uses the bundled bridge inside the extension (offline, no npx required). 'external' uses external binary path or npx (current behavior).",
+          "enumDescriptions": [
+            "Use the bundled MCP bridge inside the extension (works offline).",
+            "Use external binary path or npx to run the bridge (requires internet for first npx install)."
+          ]
         },
         "contextEngineUploader.mcpServerMode": {
           "type": "string",

@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 import os
 import argparse
-import sys
-from pathlib import Path
 from qdrant_client import QdrantClient, models
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
 from scripts.utils import sanitize_vector_name
+from scripts.embedder import get_embedding_model as _get_model
 
 # Warm start: load embedding model and warm Qdrant HNSW search path with a small query
 # Useful to reduce first-query latency and set a higher runtime ef for quality
@@ -21,14 +16,7 @@ def derive_vector_name(model_name: str) -> str:
 
 def get_embedding_model(model_name: str):
     """Get embedding model with Qwen3 support via embedder factory."""
-    try:
-        from scripts.embedder import get_embedding_model as _get_model
-        return _get_model(model_name)
-    except ImportError:
-        pass
-    # Fallback to direct fastembed
-    from fastembed import TextEmbedding
-    return TextEmbedding(model_name=model_name)
+    return _get_model(model_name)
 
 
 def main():

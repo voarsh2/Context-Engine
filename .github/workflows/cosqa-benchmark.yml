@@ -1,0 +1,147 @@
+name: CoSQA Search Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      enforce_hybrid_gate:
+        description: Fail run if best hybrid underperforms best dense past threshold
+        required: false
+        default: false
+        type: boolean
+      hybrid_min_delta:
+        description: Minimum accepted (hybrid_mrr - dense_mrr), e.g. -0.02
+        required: false
+        default: "-0.02"
+        type: string
+      upload_full_artifacts:
+        description: Upload full logs/json bundle (higher storage usage)
+        required: false
+        default: false
+        type: boolean
+
+  pull_request:
+    branches: [ test ]
+    paths:
+      - scripts/hybrid/**
+      - scripts/hybrid_search.py
+      - scripts/mcp_impl/search.py
+      - scripts/mcp_impl/context_search.py
+      - scripts/mcp_indexer_server.py
+      - scripts/benchmarks/cosqa/**
+      - .github/workflows/cosqa-benchmark.yml
+
+  schedule:
+    - cron: "25 3 * * *"
+
+jobs:
+  cosqa-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.15.1
+        ports:
+          - 6333:6333
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache HuggingFace datasets
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface/datasets
+            ~/.cache/huggingface/hub
+          key: ${{ runner.os }}-hf-cosqa-${{ hashFiles('scripts/benchmarks/cosqa/dataset.py') }}
+          restore-keys: |
+            ${{ runner.os }}-hf-cosqa-
+            ${{ runner.os }}-hf-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "datasets>=2.18.0"
+
+      - name: Wait for Qdrant
+        run: |
+          timeout 90 bash -c 'until curl -fsS http://localhost:6333/readyz; do sleep 2; done'
+          curl -fsS http://localhost:6333/collections >/dev/null
+
+      - name: Resolve run config
+        id: cfg
+        run: |
+          echo "profile=full" >> "$GITHUB_OUTPUT"
+          echo "run_set=full" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.enforce_hybrid_gate }}" = "true" ]; then
+            echo "enforce_hybrid_gate=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enforce_hybrid_gate=0" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.hybrid_min_delta }}" != "" ]; then
+            echo "hybrid_min_delta=${{ inputs.hybrid_min_delta }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "hybrid_min_delta=-0.02" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run CoSQA search matrix
+        id: bench
+        env:
+          QDRANT_URL: http://localhost:6333
+          PROFILE: ${{ steps.cfg.outputs.profile }}
+          RUN_SET: ${{ steps.cfg.outputs.run_set }}
+          ENFORCE_HYBRID_GATE: ${{ steps.cfg.outputs.enforce_hybrid_gate }}
+          HYBRID_MIN_DELTA: ${{ steps.cfg.outputs.hybrid_min_delta }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          RUN_TAG="gha-${{ github.run_id }}-${{ github.run_attempt }}"
+          OUT_DIR="bench_results/cosqa/${RUN_TAG}"
+          echo "out_dir=${OUT_DIR}" >> "$GITHUB_OUTPUT"
+          RUN_TAG="${RUN_TAG}" OUT_DIR="${OUT_DIR}" ./scripts/benchmarks/cosqa/run_search_matrix.sh
+
+      - name: Publish benchmark summary
+        if: always()
+        run: |
+          SUMMARY="${{ steps.bench.outputs.out_dir }}/summary.md"
+          if [ -f "${SUMMARY}" ]; then
+            cat "${SUMMARY}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary file generated" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosqa-search-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.bench.outputs.out_dir }}/summary.md
+            ${{ steps.bench.outputs.out_dir }}/summary.json
+          retention-days: 3
+
+      - name: Upload full benchmark artifacts
+        if: |
+          always() && (
+            github.event_name == 'schedule' ||
+            (github.event_name == 'workflow_dispatch' && inputs.upload_full_artifacts == true)
+          )
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosqa-search-bench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.bench.outputs.out_dir }}
+          retention-days: 7

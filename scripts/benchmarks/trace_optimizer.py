@@ -11,13 +11,10 @@ Supports multiple time windows: 24h (default), 7d, 30d
 import asyncio
 import json
 import os
-import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # ---------------------------------------------------------------------------
 # Time Window Configuration

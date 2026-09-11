@@ -12,7 +12,6 @@ const { createLogsTerminalManager } = require('./logs_terminal');
 const { createPromptPlusManager } = require('./prompt_plus');
 const { registerPromptPlusCommands } = require('./prompt_plus_commands');
 const { createOnboardingManager } = require('./onboarding');
-const { createPythonEnvManager } = require('./python_env');
 const { createProcessManager } = require('./process_manager');
 const { registerExtensionCommands } = require('./commands');
 const { createConfigResolver } = require('./config_resolver');
@@ -30,11 +29,11 @@ let ctxConfigManager;
 
 let promptPlusManager;
 let onboardingManager;
-let pythonEnvManager;
 let processManager;
 let configResolver;
 let sidebarApi;
 let pendingProfileRestartTimer;
+let hasShownPythonError = false;
 const DEFAULT_CONTAINER_ROOT = '/work';
 // const CLAUDE_HOOK_COMMAND = '/home/coder/project/Context-Engine/ctx-hook-simple.sh';
 
@@ -186,25 +185,6 @@ function activate(context) {
   }
 
   try {
-    pythonEnvManager = createPythonEnvManager({
-      vscode,
-      spawn: spawn,
-      path,
-      fs,
-      log,
-      getEffectiveConfig,
-      getWorkspaceFolderPath: () => configResolver ? configResolver.getWorkspaceFolderPath() : undefined,
-      getExtensionRoot: () => extensionRoot,
-      getGlobalStoragePath: () => globalStoragePath,
-      getPythonOverridePath: () => pythonOverridePath,
-      setPythonOverridePath: (p) => { pythonOverridePath = p; },
-    });
-  } catch (error) {
-    pythonEnvManager = undefined;
-    log(`Python env manager init failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  try {
     processManager = createProcessManager({
       vscode,
       spawn: spawn,
@@ -230,11 +210,13 @@ function activate(context) {
       path,
       fs,
       log,
+      extensionRoot,
       getEffectiveConfig,
       resolveBridgeWorkspacePath: () => configResolver ? configResolver.resolveBridgeWorkspacePath() : undefined,
       attachOutput: (child, label) => processManager ? processManager.attachOutput(child, label) : undefined,
       terminateProcess: (proc, label, afterStop) => processManager ? processManager.terminateProcess(proc, label, afterStop) : Promise.resolve(),
       scheduleMcpConfigRefreshAfterBridge: (delay) => mcpConfigManager ? mcpConfigManager.scheduleMcpConfigRefreshAfterBridge(delay) : undefined,
+      cancelPendingBridgeConfigRefresh: () => mcpConfigManager ? mcpConfigManager.cancelPendingBridgeConfigRefresh() : undefined,
     });
   } catch (error) {
     bridgeManager = undefined;
@@ -249,10 +231,7 @@ function activate(context) {
       extensionRoot,
       getEffectiveConfig,
       resolveOptions: () => configResolver ? configResolver.resolveOptions() : undefined,
-      ensurePythonDependencies: (pythonPath, workingDirectory, pythonPathSource) =>
-        pythonEnvManager
-          ? pythonEnvManager.ensurePythonDependencies(pythonPath, workingDirectory, pythonPathSource)
-          : Promise.resolve(false),
+      ensurePythonReady,
       buildChildEnv: (options) => processManager?.buildChildEnv?.(options) ?? {},
       resolveBridgeHttpUrl: () => bridgeManager ? bridgeManager.resolveBridgeHttpUrl() : undefined,
     });
@@ -274,6 +253,7 @@ function activate(context) {
       resolveBridgeCliInvocation: () => bridgeManager ? bridgeManager.resolveBridgeCliInvocation() : undefined,
       resolveBridgeHttpUrl: () => bridgeManager ? bridgeManager.resolveBridgeHttpUrl() : undefined,
       requiresHttpBridge: (s, t) => bridgeManager ? bridgeManager.requiresHttpBridge(s, t) : (s === 'bridge' && t === 'http'),
+      requiresLocalBridgeProcess: (s, t) => bridgeManager ? bridgeManager.requiresLocalBridgeProcess(s, t) : (s === 'bridge' && (t === 'http' || t === 'sse-remote')),
       ensureHttpBridgeReadyForConfigs: () => bridgeManager ? bridgeManager.ensureReadyForConfigs() : Promise.resolve(false),
       getBridgeIsRunning: () => (bridgeManager && typeof bridgeManager.isRunning === 'function' ? bridgeManager.isRunning() : false),
       writeCtxConfig: () => ctxConfigManager ? ctxConfigManager.writeCtxConfig() : Promise.resolve(),
@@ -302,13 +282,6 @@ function activate(context) {
   } catch (_) {
     // ignore
   }
-  try {
-    const venvPy = pythonEnvManager ? pythonEnvManager.resolvePrivateVenvPython() : undefined;
-    if (venvPy) {
-      pythonOverridePath = venvPy;
-      log(`Detected existing private venv interpreter: ${venvPy}`);
-    }
-  } catch (_) { }
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBarItem.command = 'contextEngineUploader.indexCodebase';
   context.subscriptions.push(statusBarItem);
@@ -425,6 +398,7 @@ function activate(context) {
       event.affectsConfiguration('contextEngineUploader.mcpBridgeBinPath') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgePort') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgeLocalOnly') ||
+      event.affectsConfiguration('contextEngineUploader.mcpBridgeMode') ||
       event.affectsConfiguration('contextEngineUploader.windsurfMcpPath') ||
       event.affectsConfiguration('contextEngineUploader.augmentMcpPath') ||
       event.affectsConfiguration('contextEngineUploader.antigravityMcpPath') ||
@@ -439,6 +413,7 @@ function activate(context) {
       event.affectsConfiguration('contextEngineUploader.mcpBridgePort') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgeBinPath') ||
       event.affectsConfiguration('contextEngineUploader.mcpBridgeLocalOnly') ||
+      event.affectsConfiguration('contextEngineUploader.mcpBridgeMode') ||
       event.affectsConfiguration('contextEngineUploader.mcpIndexerUrl') ||
       event.affectsConfiguration('contextEngineUploader.mcpMemoryUrl') ||
       event.affectsConfiguration('contextEngineUploader.mcpServerMode') ||
@@ -484,10 +459,10 @@ function activate(context) {
     const serverModeRaw = config.get('mcpServerMode') || 'bridge';
     const transportMode = (typeof transportModeRaw === 'string' ? transportModeRaw.trim() : 'sse-remote') || 'sse-remote';
     const serverMode = (typeof serverModeRaw === 'string' ? serverModeRaw.trim() : 'bridge') || 'bridge';
-    if (bridgeManager && bridgeManager.requiresHttpBridge(serverMode, transportMode)) {
+    if (bridgeManager && bridgeManager.requiresLocalBridgeProcess(serverMode, transportMode)) {
       startHttpBridgeProcess().catch(error => log(`Auto-start HTTP MCP bridge failed: ${error instanceof Error ? error.message : String(error)}`));
     } else {
-      log('Context Engine Uploader: autoStartMcpBridge is enabled, but current MCP wiring does not use the HTTP bridge; skipping auto-start.');
+      log('Context Engine Uploader: autoStartMcpBridge is enabled, but current MCP wiring does not use the local bridge process; skipping auto-start.');
     }
   }
 }
@@ -516,14 +491,12 @@ async function runSequence(mode = 'auto') {
     log(`Auth preflight check failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const depsSatisfied = pythonEnvManager
-    ? await pythonEnvManager.ensurePythonDependencies(options.pythonPath, options.workingDirectory, options.pythonPathSource)
-    : false;
+  const depsSatisfied = await ensurePythonReady(options.pythonPath);
   if (!depsSatisfied) {
     setStatusBarState('idle');
     return;
   }
-  // Re-resolve options in case ensurePythonDependencies switched to a better interpreter
+  // Re-resolve options in case Python preflight selected a better interpreter.
   const reoptions = configResolver ? configResolver.resolveOptions() : undefined;
   if (reoptions) {
     Object.assign(options, reoptions);
@@ -540,8 +513,9 @@ async function runSequence(mode = 'auto') {
     if (code === 0) {
       setStatusBarState('indexed');
       if (processManager) { processManager.ensureIndexedWatcher(options.targetPath); }
-      // Only start watching after a regular force sync, not after git history upload
-      if (mode === 'force' && options.startWatchAfterForce && processManager) {
+      // Start watch after successful force sync in normal flows (`force` and `auto`),
+      // but keep git-history upload as one-shot.
+      if (mode !== 'uploadGitHistory' && options.startWatchAfterForce && processManager) {
         processManager.startWatch(options);
       }
     } else {
@@ -552,6 +526,42 @@ async function runSequence(mode = 'auto') {
   if (processManager) {
     processManager.startWatch(options);
   }
+}
+
+function probePython(command, args = []) {
+  try {
+    const result = spawnSync(command, [...args, '-c', 'import sys; print(f"{sys.version_info[0]}|{sys.executable}")'], { encoding: 'utf8', timeout: 5000 });
+    if (result.status !== 0) return undefined;
+    const [major, executable] = String(result.stdout || '').trim().split('|');
+    return Number.parseInt(major, 10) >= 3 && executable ? executable.trim() : undefined;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function ensurePythonReady(pythonPath) {
+  if (pythonOverridePath) return true;
+  const requested = pythonPath || 'python3';
+  const candidates = process.platform === 'win32'
+    ? [[requested, []], ['py', ['-3']], ['python', []], ['python3', []]]
+    : [[requested, []], ['python3', []], ['python', []], ['/opt/homebrew/bin/python3', []]];
+  const seen = new Set();
+  for (const [command, args] of candidates) {
+    const key = `${command} ${args.join(' ')}`.trim();
+    if (!command || seen.has(key)) continue;
+    seen.add(key);
+    const executable = probePython(command, args);
+    if (!executable) continue;
+    pythonOverridePath = executable;
+    log(`Using Python interpreter: ${executable}`);
+    return true;
+  }
+  log(`Python preflight failed for ${requested}.`);
+  if (!hasShownPythonError) {
+    hasShownPythonError = true;
+    vscode.window.showErrorMessage(`Context Engine Uploader: Python 3 was not found. Install Python 3 or update contextEngineUploader.pythonPath (current: ${requested}).`);
+  }
+  return false;
 }
 
 

@@ -20,9 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-# Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 # Load environment variables from .env
 try:
@@ -136,8 +134,8 @@ GROUND_TRUTH_QUERIES = [
         "expected_files": ["hybrid/ranking.py", "hybrid_search.py", "hybrid/__init__.py"],
     },
     {
-        "query": "recursive reranker TRM learning",
-        "expected_files": ["rerank_recursive/core.py", "rerank_recursive/learning.py", "rerank_tools/recursive_reranker.py"],
+        "query": "relevance feedback graph recall",
+        "expected_files": ["relevance_feedback.py", "mcp_impl/search.py"],
     },
     {
         "query": "context_answer grounding citations",
@@ -161,7 +159,7 @@ GROUND_TRUTH_QUERIES = [
     },
     {
         "query": "MCP tool registration fastmcp",
-        "expected_files": ["mcp_indexer_server.py", "mcp_router/__init__.py"],
+        "expected_files": ["mcp_indexer_server.py", "mcp_impl/search.py"],
     },
     {
         "query": "memory store find operations",

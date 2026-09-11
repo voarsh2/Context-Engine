@@ -1,9 +1,7 @@
 import importlib
-import types
-import os
 import pytest
 
-srv = importlib.import_module("scripts.mcp_indexer_server")
+search_impl = importlib.import_module("scripts.mcp_impl.search")
 
 
 @pytest.mark.service
@@ -11,19 +9,21 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
     # Force rerank via env default when arg not provided
     monkeypatch.setenv("RERANKER_ENABLED", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "0")
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     # Floor 1500ms; client asks 200ms -> effective >= 1500ms -> 1.5s
     monkeypatch.setenv("RERANK_TIMEOUT_FLOOR_MS", "1500")
     # Fix default timeout for test determinism (CI may set a higher value)
     monkeypatch.setenv("RERANKER_TIMEOUT_MS", "200")
 
-    # Fake _run_async to capture calls
+    # Fake subprocess runner to capture hybrid + rerank calls without loading the MCP facade.
     calls = []
 
     async def fake_run(cmd, env=None, timeout=None):
         calls.append({"cmd": cmd, "timeout": timeout})
-        # Distinguish hybrid vs rerank by script name
-        if any("rerank_local.py" in str(x) for x in cmd):
+        # Distinguish hybrid vs rerank by module name
+        if "scripts.rerank_tools.local" in " ".join(map(str, cmd)):
             # Return something that looks like rerank stdout
             return {
                 "ok": True,
@@ -40,17 +40,21 @@ def test_rerank_timeout_floor_and_env_defaults(monkeypatch):
                 "code": 0,
             }
 
-    monkeypatch.setattr(srv, "_run_async", fake_run)
-
     # Call repo_search with no rerank_enabled arg to pick env default
-    res = srv.asyncio.get_event_loop().run_until_complete(
-        srv.repo_search(query="foo", limit=3, per_path=1)
+    res = search_impl.asyncio.get_event_loop().run_until_complete(
+        search_impl._repo_search_impl(
+            query="foo",
+            limit=3,
+            per_path=1,
+            run_async_fn=fake_run,
+            require_auth_session_fn=lambda session: session,
+        )
     )
 
     assert any(
-        "rerank_local.py" in " ".join(map(str, c["cmd"])) for c in calls
+        "scripts.rerank_tools.local" in " ".join(map(str, c["cmd"])) for c in calls
     ), "rerank subprocess should be invoked"
     # find rerank call
-    rc = next(c for c in calls if any("rerank_local.py" in str(x) for x in c["cmd"]))
+    rc = next(c for c in calls if "scripts.rerank_tools.local" in " ".join(map(str, c["cmd"])))
     assert rc["timeout"] >= 1.5 and rc["timeout"] <= 2.0
     assert res["used_rerank"] is True

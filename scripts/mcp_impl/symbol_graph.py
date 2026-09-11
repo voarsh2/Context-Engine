@@ -20,9 +20,53 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+    path_matches_under as _path_matches_under,
+)
+
 logger = logging.getLogger(__name__)
+
+try:
+    from scripts.ingest.graph_edges import GRAPH_COLLECTION_SUFFIX as _GRAPH_SUFFIX
+except Exception:
+    _GRAPH_SUFFIX = "_graph"
+
+GRAPH_COLLECTION_SUFFIX = _GRAPH_SUFFIX
+# Time-based cache: collection -> expiry timestamp (5 minutes TTL)
+_MISSING_GRAPH_COLLECTIONS: dict[str, float] = {}
+_MISSING_GRAPH_TTL = 300  # 5 minutes
+
+
+def _clean_expired_missing_graphs() -> None:
+    """Remove expired entries from the missing graph cache."""
+    now = time.monotonic()
+    expired = [coll for coll, expiry in _MISSING_GRAPH_COLLECTIONS.items() if expiry <= now]
+    for coll in expired:
+        _MISSING_GRAPH_COLLECTIONS.pop(coll, None)
+
+
+def _is_graph_missing(collection: str) -> bool:
+    """Check if a graph collection is marked as missing (with expiration)."""
+    _clean_expired_missing_graphs()
+    if collection in _MISSING_GRAPH_COLLECTIONS:
+        return _MISSING_GRAPH_COLLECTIONS.get(collection, 0) > time.monotonic()
+    return False
+
+
+def _mark_graph_missing(collection: str) -> None:
+    """Mark a graph collection as missing (with TTL)."""
+    _MISSING_GRAPH_COLLECTIONS[collection] = time.monotonic() + _MISSING_GRAPH_TTL
+
+
+def _clear_graph_missing(collection: str) -> None:
+    """Remove a collection from the missing graph cache (e.g., after successful creation)."""
+    _MISSING_GRAPH_COLLECTIONS.pop(collection, None)
+
 
 __all__ = [
     "_symbol_graph_impl",
@@ -105,23 +149,18 @@ def _symbol_variants(symbol: str) -> List[str]:
     return list(dict.fromkeys(variants))  # Dedupe preserving order
 
 def _norm_under(u: Optional[str]) -> Optional[str]:
-    """Normalize an `under` path to match ingest's stored `metadata.path_prefix` values.
+    """Normalize user-facing `under` to recursive subtree scope token."""
+    return _normalize_under_scope(u)
 
-    This mirrors the engine's convention: normalize to a /work/... style path.
-    Note: `under` in this engine is an exact directory filter (not recursive).
-    """
-    if not u:
-        return None
-    s = str(u).strip().replace("\\", "/")
-    s = "/".join([p for p in s.split("/") if p])
-    if not s:
-        return None
-    # Normalize to /work/...
-    if not s.startswith("/"):
-        v = "/work/" + s
-    else:
-        v = "/work/" + s.lstrip("/") if not s.startswith("/work/") else s
-    return v.rstrip("/")
+
+def _point_matches_under(pt: Any, under: Optional[str]) -> bool:
+    if not under:
+        return True
+    payload = getattr(pt, "payload", None) or {}
+    md = payload.get("metadata", payload)
+    if not isinstance(md, dict):
+        md = {}
+    return _metadata_matches_under(md, under)
 
 
 async def _symbol_graph_impl(
@@ -142,7 +181,7 @@ async def _symbol_graph_impl(
         query_type: One of "callers", "definition", "importers"
         limit: Maximum number of results
         language: Optional language filter
-        under: Optional path prefix filter
+        under: Optional recursive workspace subtree filter
         collection: Optional collection override
         session: Optional session ID for collection routing
         ctx: MCP context (optional)
@@ -193,18 +232,32 @@ async def _symbol_graph_impl(
 
     results = []
 
+    norm_under = _norm_under(under)
+
     try:
         if query_type == "callers":
-            # Find chunks where metadata.calls array contains the symbol (exact match)
-            results = await _query_array_field(
+            # Prefer graph edges collection when available (fast keyword filters).
+            results = await _query_graph_edges_collection(
                 client=client,
                 collection=coll,
-                field_key="metadata.calls",
-                value=symbol,
+                symbol=symbol,
+                edge_type="calls",
                 limit=limit,
                 language=language,
-                under=_norm_under(under),
+                repo_filter=None,
+                under=norm_under,
             )
+            if not results:
+                # Fall back to array field lookup in the main collection.
+                results = await _query_array_field(
+                    client=client,
+                    collection=coll,
+                    field_key="metadata.calls",
+                    value=symbol,
+                    limit=limit,
+                    language=language,
+                    under=norm_under,
+                )
         elif query_type == "definition":
             # Find chunks where symbol_path matches the symbol
             results = await _query_definition(
@@ -213,19 +266,30 @@ async def _symbol_graph_impl(
                 symbol=symbol,
                 limit=limit,
                 language=language,
-                under=_norm_under(under),
+                under=norm_under,
             )
         elif query_type == "importers":
-            # Find chunks where metadata.imports array contains the symbol
-            results = await _query_array_field(
+            results = await _query_graph_edges_collection(
                 client=client,
                 collection=coll,
-                field_key="metadata.imports",
-                value=symbol,
+                symbol=symbol,
+                edge_type="imports",
                 limit=limit,
                 language=language,
-                under=_norm_under(under),
+                repo_filter=None,
+                under=norm_under,
             )
+            if not results:
+                # Fall back to array field lookup in the main collection.
+                results = await _query_array_field(
+                    client=client,
+                    collection=coll,
+                    field_key="metadata.imports",
+                    value=symbol,
+                    limit=limit,
+                    language=language,
+                    under=norm_under,
+                )
 
         # If no results, fall back to semantic search
         if not results:
@@ -234,6 +298,7 @@ async def _symbol_graph_impl(
                 query_type=query_type,
                 limit=limit,
                 language=language,
+                under=norm_under,
                 collection=coll,
                 session=session,
             )
@@ -246,6 +311,7 @@ async def _symbol_graph_impl(
             query_type=query_type,
             limit=limit,
             language=language,
+            under=norm_under,
             collection=coll,
             session=session,
         )
@@ -257,6 +323,155 @@ async def _symbol_graph_impl(
         "count": len(results),
         "collection": coll,
     }
+
+
+async def _query_graph_edges_collection(
+    client: Any,
+    collection: str,
+    symbol: str,
+    edge_type: str,
+    limit: int,
+    language: Optional[str] = None,
+    repo_filter: str | None = None,
+    under: str | None = None,
+) -> List[Dict[str, Any]]:
+    """Query `<collection>_graph` and hydrate results from the main collection.
+
+    The graph collection stores file-level edges:
+    - caller_path -> callee_symbol (calls/imports)
+    """
+    from qdrant_client import models as qmodels
+
+    graph_coll = f"{collection}{GRAPH_COLLECTION_SUFFIX}"
+    if _is_graph_missing(graph_coll):
+        return []
+
+    # Build graph filter
+    must: list[Any] = [
+        qmodels.FieldCondition(
+            key="edge_type", match=qmodels.MatchValue(value=str(edge_type))
+        )
+    ]
+    if repo_filter:
+        rf = str(repo_filter).strip()
+        if rf and rf != "*":
+            must.append(
+                qmodels.FieldCondition(key="repo", match=qmodels.MatchValue(value=rf))
+            )
+
+    # Try exact match, then symbol variants.
+    callee_variants = _symbol_variants(symbol) or [symbol]
+    seen_paths: set[str] = set()
+    caller_paths: List[str] = []
+
+    for variant in callee_variants:
+        if len(caller_paths) >= limit:
+            break
+        v = str(variant).strip()
+        if not v:
+            continue
+        flt = qmodels.Filter(
+            must=must
+            + [
+                qmodels.FieldCondition(
+                    key="callee_symbol", match=qmodels.MatchValue(value=v)
+                )
+            ]
+        )
+
+        def _scroll(_flt=flt):
+            return client.scroll(
+                collection_name=graph_coll,
+                scroll_filter=_flt,
+                limit=max(32, limit * 4),
+                with_payload=True,
+                with_vectors=False,
+            )
+
+        try:
+            points, _ = await asyncio.to_thread(_scroll)
+        except Exception as e:
+            err = str(e).lower()
+            if "404" in err or "doesn't exist" in err or "not found" in err:
+                _mark_graph_missing(graph_coll)
+                return []
+            logger.exception(
+                "_query_graph_edges_collection scroll failed for %s", graph_coll
+            )
+            raise
+
+        for rec in points or []:
+            payload = getattr(rec, "payload", None) or {}
+            p = payload.get("caller_path") or ""
+            if not p:
+                continue
+            path_s = str(p)
+            if under and not _path_matches_under(
+                path_s, under, repo_hint=(payload.get("repo") or repo_filter)
+            ):
+                continue
+            if path_s in seen_paths:
+                continue
+            seen_paths.add(path_s)
+            caller_paths.append(path_s)
+            if len(caller_paths) >= limit:
+                break
+
+    if not caller_paths:
+        return []
+
+    # Hydrate caller paths back into normal symbol_graph point-shaped results.
+    hydrated: List[Dict[str, Any]] = []
+    for p in caller_paths[:limit]:
+        if len(hydrated) >= limit:
+            break
+
+        def _scroll_main(_p=p, _language=language):
+            must = [
+                qmodels.FieldCondition(
+                    key="metadata.path", match=qmodels.MatchValue(value=_p)
+                )
+            ]
+            if _language:
+                must.append(
+                    qmodels.FieldCondition(
+                        key="metadata.language",
+                        match=qmodels.MatchValue(value=str(_language).lower()),
+                    )
+                )
+            return client.scroll(
+                collection_name=collection,
+                scroll_filter=qmodels.Filter(
+                    must=must
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+        try:
+            pts, _ = await asyncio.to_thread(_scroll_main)
+        except Exception:
+            pts = []
+
+        if pts:
+            hydrated.append(_format_point(pts[0]))
+        else:
+            # If language filtering was requested but no matching main-collection doc
+            # exists (or hydration failed), skip returning a placeholder to avoid
+            # producing language-inconsistent results.
+            if not language:
+                hydrated.append(
+                    {
+                        "path": p,
+                        "symbol": "",
+                        "symbol_path": "",
+                        "start_line": 0,
+                        "end_line": 0,
+                    }
+                )
+
+    return hydrated
 
 
 async def _query_array_field(
@@ -290,14 +505,6 @@ async def _query_array_field(
                 match=qmodels.MatchValue(value=language.lower()),
             )
         )
-    if under:
-        base_conditions.append(
-            qmodels.FieldCondition(
-                key="metadata.path_prefix",
-                match=qmodels.MatchValue(value=under),
-            )
-        )
-
     # Strategy 1: Exact match with MatchAny (most reliable for array fields)
     try:
         filter1 = qmodels.Filter(
@@ -321,6 +528,8 @@ async def _query_array_field(
         scroll_result = await asyncio.to_thread(scroll1)
         points = scroll_result[0] if scroll_result else []
         for pt in points:
+            if under and not _point_matches_under(pt, under):
+                continue
             pt_id = str(getattr(pt, "id", id(pt)))
             if pt_id not in seen_ids:
                 seen_ids.add(pt_id)
@@ -356,6 +565,8 @@ async def _query_array_field(
                 scroll_result = await asyncio.to_thread(scroll2)
                 points = scroll_result[0] if scroll_result else []
                 for pt in points:
+                    if under and not _point_matches_under(pt, under):
+                        continue
                     pt_id = str(getattr(pt, "id", id(pt)))
                     if pt_id not in seen_ids:
                         seen_ids.add(pt_id)
@@ -387,6 +598,8 @@ async def _query_array_field(
             scroll_result = await asyncio.to_thread(scroll3)
             points = scroll_result[0] if scroll_result else []
             for pt in points:
+                if under and not _point_matches_under(pt, under):
+                    continue
                 pt_id = str(getattr(pt, "id", id(pt)))
                 if pt_id not in seen_ids:
                     seen_ids.add(pt_id)
@@ -422,14 +635,6 @@ async def _query_definition(
                 match=qmodels.MatchValue(value=language.lower()),
             )
         )
-    if under:
-        base_conditions.append(
-            qmodels.FieldCondition(
-                key="metadata.path_prefix",
-                match=qmodels.MatchValue(value=under),
-            )
-        )
-
     # Strategy 1: Exact match on symbol_path (e.g., "MyClass.my_method")
     try:
         filter1 = qmodels.Filter(
@@ -514,6 +719,8 @@ async def _query_definition(
     seen_ids = set()
     unique_results = []
     for pt in results:
+        if under and not _point_matches_under(pt, under):
+            continue
         pt_id = getattr(pt, "id", None)
         if pt_id not in seen_ids:
             seen_ids.add(pt_id)
@@ -570,6 +777,7 @@ async def _fallback_semantic_search(
     query_type: str,
     limit: int = 20,
     language: Optional[str] = None,
+    under: Optional[str] = None,
     collection: Optional[str] = None,
     session: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -591,6 +799,8 @@ async def _fallback_semantic_search(
             query=query,
             limit=limit,
             language=language,
+            under=under,
+            collection=collection,
             session=session,
             output_format="json",  # Avoid TOON encoding for internal calls
         )
@@ -598,7 +808,7 @@ async def _fallback_semantic_search(
         # Handle case where results might be TOON-encoded string (shouldn't happen with output_format="json")
         results = search_result.get("results", [])
         if isinstance(results, str):
-            # If somehow still a string, return empty - TOON decoding is not worth it here
+            # Internal callers require structured rows; skip malformed text-only responses.
             logger.debug("Fallback search returned TOON-encoded results, skipping")
             return []
         return results
@@ -655,7 +865,7 @@ async def _compute_called_by(
         symbol: The symbol name to find callers for
         limit: Maximum number of callers to return
         language: Optional language filter
-        under: Optional path prefix filter
+        under: Optional recursive workspace subtree filter
         collection: Optional collection override
 
     Returns:
@@ -703,13 +913,6 @@ async def _compute_called_by(
             )
         )
     norm_under = _norm_under(under)
-    if norm_under:
-        base_conditions.append(
-            qmodels.FieldCondition(
-                key="metadata.path_prefix",
-                match=qmodels.MatchValue(value=norm_under),
-            )
-        )
 
     callers: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
@@ -743,6 +946,8 @@ async def _compute_called_by(
             points = scroll_result[0] if scroll_result else []
 
             for pt in points:
+                if norm_under and not _point_matches_under(pt, norm_under):
+                    continue
                 pt_id = str(getattr(pt, "id", id(pt)))
                 if pt_id in seen_ids:
                     continue

@@ -11,9 +11,20 @@ import os
 import time
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any  # type: ignore
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 from scripts.ingest.config import (
     LEX_VECTOR_NAME,
@@ -31,6 +42,7 @@ from scripts.ingest.config import (
 # ---------------------------------------------------------------------------
 ENSURED_COLLECTIONS: set[str] = set()
 ENSURED_COLLECTIONS_LAST_CHECK: dict[str, float] = {}
+ENSURED_PAYLOAD_INDEX_COLLECTIONS: set[str] = set()
 
 
 class CollectionNeedsRecreateError(Exception):
@@ -38,8 +50,7 @@ class CollectionNeedsRecreateError(Exception):
     pass
 
 
-PATTERN_VECTOR_NAME = "pattern_vector"
-PATTERN_VECTOR_DIM = 64  # Structural pattern embedding dimension
+
 
 PAYLOAD_INDEX_FIELDS = (
     "metadata.language",
@@ -126,15 +137,6 @@ def _desired_vector_configs(
             )
     except Exception:
         pass
-    try:
-        if os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            vectors_cfg[PATTERN_VECTOR_NAME] = models.VectorParams(
-                size=PATTERN_VECTOR_DIM,
-                distance=models.Distance.COSINE,
-            )
-    except Exception:
-        pass
-
     sparse_cfg = None
     if LEX_SPARSE_MODE:
         sparse_cfg = {
@@ -321,7 +323,6 @@ def ensure_collection(
 
     Always includes dense (vector_name) and lexical (LEX_VECTOR_NAME).
     When REFRAG_MODE=1, also includes a compact mini vector (MINI_VECTOR_NAME).
-    When PATTERN_VECTORS=1, also includes pattern_vector for structural similarity.
     """
     mode = _normalize_schema_mode(schema_mode)
     if mode != "legacy":
@@ -366,22 +367,6 @@ def ensure_collection(
                         distance=models.Distance.COSINE,
                     )
 
-                # Check for pattern vector
-                try:
-                    pattern_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {
-                        "1", "true", "yes", "on",
-                    }
-                    has_pattern = PATTERN_VECTOR_NAME in cfg
-                except Exception:
-                    pattern_on = False
-                    has_pattern = False
-
-                if pattern_on and not has_pattern:
-                    missing[PATTERN_VECTOR_NAME] = models.VectorParams(
-                        size=PATTERN_VECTOR_DIM,
-                        distance=models.Distance.COSINE,
-                    )
-
                 if missing:
                     try:
                         update_cfg = _prepare_vector_update_config(missing)
@@ -416,15 +401,6 @@ def ensure_collection(
             )
     except Exception:
         pass
-    try:
-        if os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            vectors_cfg[PATTERN_VECTOR_NAME] = models.VectorParams(
-                size=PATTERN_VECTOR_DIM,
-                distance=models.Distance.COSINE,
-            )
-    except Exception:
-        pass
-
     sparse_cfg = None
     if LEX_SPARSE_MODE:
         sparse_cfg = {
@@ -535,6 +511,9 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
     if not name:
         print("[BUG] recreate_collection called with name=None! Fix the caller - collection name is required.", flush=True)
         return
+    ENSURED_COLLECTIONS.discard(name)
+    ENSURED_COLLECTIONS_LAST_CHECK.pop(name, None)
+    ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard(name)
     try:
         client.delete_collection(name)
     except Exception:
@@ -549,14 +528,6 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
         if os.environ.get("REFRAG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}:
             vectors_cfg[MINI_VECTOR_NAME] = models.VectorParams(
                 size=int(os.environ.get("MINI_VEC_DIM", MINI_VEC_DIM) or MINI_VEC_DIM),
-                distance=models.Distance.COSINE,
-            )
-    except Exception:
-        pass
-    try:
-        if os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            vectors_cfg[PATTERN_VECTOR_NAME] = models.VectorParams(
-                size=PATTERN_VECTOR_DIM,
                 distance=models.Distance.COSINE,
             )
     except Exception:
@@ -580,6 +551,20 @@ def recreate_collection(client: QdrantClient, name: str, dim: int, vector_name: 
 
 def ensure_payload_indexes(client: QdrantClient, collection: str):
     """Create helpful payload indexes if they don't exist (idempotent)."""
+    if not collection:
+        return
+
+    # On memo hit, verify collection still exists and indexes are present
+    if collection in ENSURED_PAYLOAD_INDEX_COLLECTIONS:
+        try:
+            info = client.get_collection(collection)
+            if not _missing_payload_indexes(info):
+                # Memo is still valid
+                return
+        except Exception:
+            # Collection doesn't exist or error accessing it; remove from memo
+            ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard(collection)
+
     for field in PAYLOAD_INDEX_FIELDS:
         try:
             client.create_payload_index(
@@ -589,6 +574,15 @@ def ensure_payload_indexes(client: QdrantClient, collection: str):
             )
         except Exception:
             pass
+    try:
+        info = client.get_collection(collection)
+    except Exception:
+        return
+    if _missing_payload_indexes(info):
+        # Do not memoize; a later call should retry.
+        return
+    # Even if create_payload_index threw, get_collection confirms indexes exist.
+    ENSURED_PAYLOAD_INDEX_COLLECTIONS.add(collection)
 
 
 def ensure_collection_and_indexes_once(
@@ -627,6 +621,10 @@ def ensure_collection_and_indexes_once(
                 pass
             try:
                 ENSURED_COLLECTIONS_LAST_CHECK.pop(collection, None)
+            except Exception:
+                pass
+            try:
+                ENSURED_PAYLOAD_INDEX_COLLECTIONS.discard(collection)
             except Exception:
                 pass
     ensure_collection(client, collection, dim, vector_name, schema_mode=mode)

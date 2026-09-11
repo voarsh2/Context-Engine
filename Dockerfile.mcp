@@ -17,9 +17,12 @@ RUN pip install --no-cache-dir --upgrade -r /tmp/requirements.txt \
 
 # Bake scripts into image so server can run even when /work points elsewhere
 COPY scripts /app/scripts
+RUN chmod -R a+rX /app/scripts
 
 # Expose SSE port
 EXPOSE 8000
 
 # Default command: run the server with SSE transport (env provides host/port)
-CMD ["python", "/app/scripts/mcp_memory_server.py"]
+WORKDIR /app
+
+CMD ["python", "-m", "scripts.mcp_memory_server"]

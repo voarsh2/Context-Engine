@@ -12,7 +12,6 @@ from watchdog.events import FileSystemEventHandler
 import scripts.ingest_code as idx
 from scripts.workspace_state import (
     _extract_repo_name_from_path,
-    _get_global_state_dir,
     get_cached_file_hash,
     log_watcher_activity as _log_activity,
     remove_cached_file,
@@ -27,6 +26,7 @@ from .utils import (
     safe_print,
 )
 from .rename import _rename_in_store
+from .paths import is_internal_metadata_path
 
 
 class IndexHandler(FileSystemEventHandler):
@@ -81,6 +81,9 @@ class IndexHandler(FileSystemEventHandler):
         except Exception:
             pass
 
+    def _is_internal_metadata_path(self, p: Path) -> bool:
+        return is_internal_metadata_path(p)
+
     def _maybe_enqueue(self, src_path: str) -> None:
         self._maybe_reload_excluder()
         p = Path(src_path)
@@ -95,15 +98,7 @@ class IndexHandler(FileSystemEventHandler):
         except ValueError:
             return
 
-        try:
-            if callable(_get_global_state_dir):
-                global_state_dir = _get_global_state_dir()
-                if global_state_dir is not None and p.is_relative_to(global_state_dir):
-                    return
-        except (OSError, ValueError):
-            pass
-
-        if any(part == ".codebase" for part in p.parts):
+        if self._is_internal_metadata_path(p):
             return
 
         # Git history manifests are handled by a separate ingestion pipeline and should still
@@ -140,7 +135,7 @@ class IndexHandler(FileSystemEventHandler):
             p = Path(event.src_path).resolve()
         except Exception:
             return
-        if any(part == ".codebase" for part in p.parts):
+        if self._is_internal_metadata_path(p):
             return
         if not idx.is_indexable_file(p):
             return
@@ -162,6 +157,42 @@ class IndexHandler(FileSystemEventHandler):
             dest = Path(event.dest_path).resolve()
         except Exception:
             return
+        # Handle internal-boundary moves properly
+        src_internal = self._is_internal_metadata_path(src)
+        dest_internal = self._is_internal_metadata_path(dest)
+        if src_internal and dest_internal:
+            # Both internal -> ignore
+            return
+        if dest_internal:
+            # External -> internal: delete source, don't index destination
+            if idx.is_indexable_file(src):
+                try:
+                    coll = self._resolve_collection(src)
+                    deleted = False
+                    if self.client is not None and coll is not None:
+                        idx.delete_points_by_path(self.client, coll, str(src))
+                        # Clean up graph edges for the moved file
+                        try:
+                            idx.delete_graph_edges_by_path(
+                                self.client,
+                                coll,
+                                caller_path=str(src),
+                            )
+                        except Exception:
+                            pass  # Graph cleanup is best-effort
+                        deleted = True
+                    if deleted:
+                        safe_print(f"[moved:external_to_internal] deleted {src}")
+                except Exception as exc:
+                    safe_print(f"[moved:external_to_internal:error] {src}: {exc}")
+                finally:
+                    self._invalidate_cache(src)
+            return
+        if src_internal:
+            # Internal -> external: index destination as new file
+            if idx.is_indexable_file(dest):
+                self._maybe_enqueue(str(dest))
+            return
         if not idx.is_indexable_file(dest) and not idx.is_indexable_file(src):
             return
         try:
@@ -174,18 +205,25 @@ class IndexHandler(FileSystemEventHandler):
                 if idx.is_indexable_file(src):
                     try:
                         coll = self._resolve_collection(src)
+                        deleted = False
                         if self.client is not None and coll is not None:
                             idx.delete_points_by_path(self.client, coll, str(src))
-                        safe_print(f"[moved:ignored_dest_deleted_src] {src} -> {dest}")
-                        src_repo_path = _detect_repo_for_file(src)
-                        src_repo_name = _repo_name_or_none(src_repo_path)
-                        try:
-                            if src_repo_name:
-                                remove_cached_file(str(src), src_repo_name)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                            # Clean up graph edges for the moved file
+                            try:
+                                idx.delete_graph_edges_by_path(
+                                    self.client,
+                                    coll,
+                                    caller_path=str(src),
+                                )
+                            except Exception:
+                                pass  # Graph cleanup is best-effort
+                            deleted = True
+                        if deleted:
+                            safe_print(f"[moved:ignored_dest_deleted_src] {src} -> {dest}")
+                    except Exception as exc:
+                        safe_print(f"[moved:ignored_dest_deleted_src:error] {src}: {exc}")
+                    finally:
+                        self._invalidate_cache(src)
                 return
         except Exception:
             pass
@@ -270,6 +308,14 @@ class IndexHandler(FileSystemEventHandler):
             return
         try:
             idx.delete_points_by_path(self.client, collection, str(path))
+            try:
+                idx.delete_graph_edges_by_path(
+                    self.client,
+                    collection,
+                    caller_path=str(path),
+                )
+            except Exception:
+                pass
             safe_print(f"[deleted] {path} -> {collection}")
         except Exception:
             pass

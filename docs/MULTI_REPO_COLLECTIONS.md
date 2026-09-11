@@ -341,11 +341,11 @@ results = client.search(
 ### 4. Monitor Collection Health
 
 ```bash
-# Check collection status
-make qdrant-status
+# Check indexer health
+curl http://localhost:${FASTMCP_INDEXER_HTTP_HEALTH_PORT:-18003}/readyz
 
 # List all collections
-make qdrant-list
+# Use the qdrant_list MCP tool from your MCP client.
 
 # Prune stale points
 make prune
@@ -407,4 +407,3 @@ The architecture supports future enhancements:
 - [MCP API Reference](MCP_API.md)
 - [Architecture Overview](ARCHITECTURE.md)
 - [Development Guide](DEVELOPMENT.md)
-

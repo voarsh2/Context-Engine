@@ -81,7 +81,7 @@ These rules are NOT optional - favor qdrant-indexer tooling at all costs over ex
 
   Tool Roles Cheat Sheet:
 
-  - repo_search / code_search:
+  - repo_search:
     - Use for: finding relevant files/spans and inspecting raw code.
     - Think: "where is X implemented?", "show me usages of Y".
   - context_search:
@@ -90,13 +90,6 @@ These rules are NOT optional - favor qdrant-indexer tooling at all costs over ex
   - context_answer:
     - Use for: short natural-language summaries/explanations of specific modules or tools, grounded in code/docs with citations.
     - Good for: "What does scripts/standalone_upload_client.py do at a high level?", "Summarize the remote upload client pipeline.".
-  - pattern_search (optional, may not be enabled):
-    - Use for: finding structurally similar code patterns across files and languages.
-    - Accepts EITHER code examples OR natural language pattern descriptions.
-    - Good for: "find retry loops with exponential backoff", "try: ... except: logger.error()", "error handling patterns".
-    - Cross-language: Python pattern can match Go/Rust/Java with similar control flow.
-    - Note: Returns error if pattern detection module is not available.
-
   Advanced lineage workflow (code + history):
 
   - Goal: answer "when/why did behavior X change?" without flooding context.
@@ -133,10 +126,8 @@ These rules are NOT optional - favor qdrant-indexer tooling at all costs over ex
     - workspace_info, list_workspaces, collection_map
     - set_session_defaults
   - Search / QA tools:
-    - repo_search, code_search, context_search, context_answer
-    - pattern_search (optional; structural code pattern matching, cross-language)
-    - search_tests_for, search_config_for, search_callers_for, search_importers_for
-    - change_history_for_path, expand_query
+    - repo_search, context_search, context_answer
+    - symbol_graph, change_history_for_path, expand_query
   - Memory tools:
     - memory.set_session_defaults, memory.memory_store, memory.memory_find
 

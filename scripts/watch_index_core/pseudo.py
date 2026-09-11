@@ -8,6 +8,7 @@ import threading
 from typing import Optional
 
 import scripts.ingest_code as idx
+from . import config as watch_config
 from .utils import get_boolean_env
 from scripts.workspace_state import (
     _cross_process_lock,
@@ -17,8 +18,6 @@ from scripts.workspace_state import (
     is_multi_repo_mode,
 )
 
-from .config import ROOT
-
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +26,8 @@ def _start_pseudo_backfill_worker(
     default_collection: str,
     model_dim: int,
     vector_name: str,
+    *,
+    allow_default_collection_fallback: bool = True,
 ) -> Optional[threading.Event]:
     """Start a daemon thread that periodically backfills pseudo/tags.
     
@@ -34,7 +35,12 @@ def _start_pseudo_backfill_worker(
     or None if the worker was not started (disabled via env).
     """
     
-    if not get_boolean_env("PSEUDO_DEFER_TO_WORKER"):
+    # This worker is controlled by PSEUDO_BACKFILL_ENABLED (pseudo/tags) and/or
+    # GRAPH_EDGES_BACKFILL (graph edges). PSEUDO_DEFER_TO_WORKER only controls
+    # whether the foreground index path generates pseudo inline.
+    pseudo_backfill_enabled = get_boolean_env("PSEUDO_BACKFILL_ENABLED")
+    graph_backfill_enabled = get_boolean_env("GRAPH_EDGES_BACKFILL")
+    if not (pseudo_backfill_enabled or graph_backfill_enabled):
         return None
 
     try:
@@ -49,20 +55,36 @@ def _start_pseudo_backfill_worker(
         max_points = 256
     if max_points <= 0:
         max_points = 1
+    try:
+        graph_max_files = int(
+            os.environ.get("GRAPH_EDGES_BACKFILL_MAX_FILES", "128") or 128
+        )
+    except Exception:
+        graph_max_files = 128
+    if graph_max_files <= 0:
+        graph_max_files = 1
 
     shutdown_event = threading.Event()
 
     def _worker() -> None:
         while not shutdown_event.is_set():
             try:
+                pseudo_backfill_on = get_boolean_env("PSEUDO_BACKFILL_ENABLED")
+                graph_backfill_on = get_boolean_env("GRAPH_EDGES_BACKFILL")
                 try:
-                    mappings = get_collection_mappings(search_root=str(ROOT))
+                    mappings = get_collection_mappings(search_root=str(watch_config.ROOT))
                 except Exception:
                     mappings = []
                 if not mappings:
-                    mappings = [
-                        {"repo_name": None, "collection_name": default_collection},
-                    ]
+                    # Do not fall back to the default collection unless startup explicitly
+                    # allowed the watcher to touch it. This keeps background backfill from
+                    # recreating collections that the caller intentionally left alone.
+                    if is_multi_repo_mode() or not allow_default_collection_fallback:
+                        mappings = []
+                    else:
+                        mappings = [
+                            {"repo_name": None, "collection_name": default_collection},
+                        ]
                 for mapping in mappings:
                     if shutdown_event.is_set():
                         break
@@ -74,21 +96,52 @@ def _start_pseudo_backfill_worker(
                         if is_multi_repo_mode() and repo_name:
                             state_dir = _get_repo_state_dir(repo_name)
                         else:
-                            state_dir = _get_global_state_dir(str(ROOT))
+                            state_dir = _get_global_state_dir(str(watch_config.ROOT))
                         lock_path = state_dir / "pseudo.lock"
                         with _cross_process_lock(lock_path):
-                            processed = idx.pseudo_backfill_tick(
-                                client,
-                                coll,
-                                repo_name=repo_name,
-                                max_points=max_points,
-                                dim=model_dim,
-                                vector_name=vector_name,
-                            )
-                            if processed:
-                                logger.info(
-                                    "[pseudo_backfill] repo=%s collection=%s processed=%d",
-                                    repo_name or "default", coll, processed,
+                            if pseudo_backfill_on:
+                                processed = idx.pseudo_backfill_tick(
+                                    client,
+                                    coll,
+                                    repo_name=repo_name,
+                                    max_points=max_points,
+                                    dim=model_dim,
+                                    vector_name=vector_name,
+                                )
+                                if processed:
+                                    logger.info(
+                                        "[pseudo_backfill] repo=%s collection=%s processed=%d",
+                                        repo_name or "default",
+                                        coll,
+                                        processed,
+                                    )
+                        # Optional: backfill graph edge collection from main points.
+                        # Controlled separately because it may scan large collections over time.
+                        # Run under its own lock to avoid blocking pseudo/tag backfill workers.
+                        if graph_backfill_on:
+                            try:
+                                graph_lock_path = state_dir / "graph_edges.lock"
+                                with _cross_process_lock(graph_lock_path):
+                                    files_done = idx.graph_edges_backfill_tick(
+                                        client,
+                                        coll,
+                                        repo_name=repo_name,
+                                        max_files=graph_max_files,
+                                    )
+                                if files_done:
+                                    logger.info(
+                                        "[graph_backfill] repo=%s collection=%s files=%d",
+                                        repo_name or "default",
+                                        coll,
+                                        files_done,
+                                    )
+                            except Exception as exc:
+                                logger.error(
+                                    "[graph_backfill] error repo=%s collection=%s: %s",
+                                    repo_name or "default",
+                                    coll,
+                                    exc,
+                                    exc_info=True,
                                 )
                     except Exception as exc:
                         logger.error(
@@ -110,4 +163,3 @@ def _start_pseudo_backfill_worker(
 
 
 __all__ = ["_start_pseudo_backfill_worker"]
-

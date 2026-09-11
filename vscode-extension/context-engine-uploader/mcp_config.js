@@ -52,6 +52,13 @@ function createMcpConfigManager(deps) {
     }
   }
 
+  function cancelPendingBridgeConfigRefresh() {
+    if (pendingBridgeConfigTimer) {
+      clearTimeout(pendingBridgeConfigTimer);
+      pendingBridgeConfigTimer = undefined;
+    }
+  }
+
   async function writeAntigravityMcpServers(configPath, indexerUrl, memoryUrl, transportMode, serverMode = 'bridge', workspaceHint) {
     // TODO: Factor the shared "ensure dir + load JSON + applyMcpServersUpdate + writeJsonConfig" pattern
     // into a helper so Claude/Windsurf/Augment/Antigravity all call the same utility.
@@ -338,10 +345,7 @@ function createMcpConfigManager(deps) {
 
   function scheduleMcpConfigRefreshAfterBridge(delayMs = 1500) {
     try {
-      if (pendingBridgeConfigTimer) {
-        clearTimeout(pendingBridgeConfigTimer);
-        pendingBridgeConfigTimer = undefined;
-      }
+      cancelPendingBridgeConfigRefresh();
       // For bridge-http mode started by the extension, Windsurf needs the
       // "context-engine" MCP server entry removed and then re-added once the
       // HTTP bridge is ready. Best-effort removal happens immediately here;
@@ -363,8 +367,12 @@ function createMcpConfigManager(deps) {
       }
       pendingBridgeConfigTimer = setTimeout(() => {
         pendingBridgeConfigTimer = undefined;
-        log('Context Engine Uploader: HTTP bridge ready; refreshing MCP configs.');
-        writeMcpConfig().catch(error => {
+        if (typeof getBridgeIsRunning === 'function' && !getBridgeIsRunning()) {
+          log('Context Engine Uploader: HTTP bridge is not running; skipping delayed MCP config refresh.');
+          return;
+        }
+        log('Context Engine Uploader: HTTP bridge still running; refreshing MCP configs.');
+        writeMcpConfig({ skipHttpBridgeStart: true }).catch(error => {
           log(`Context Engine Uploader: MCP config refresh after bridge start failed: ${error instanceof Error ? error.message : String(error)}`);
         });
       }, delayMs);
@@ -736,6 +744,10 @@ function createMcpConfigManager(deps) {
     const needsHttpBridge = requiresHttpBridge(serverMode, transportMode);
     const bridgeWasRunning = !!(typeof getBridgeIsRunning === 'function' && getBridgeIsRunning());
     if (needsHttpBridge) {
+      if (options.skipHttpBridgeStart && !bridgeWasRunning) {
+        log('Context Engine Uploader: HTTP bridge is not running; MCP config refresh will not restart it.');
+        return;
+      }
       const ready = await ensureHttpBridgeReadyForConfigs();
       if (!ready) {
         vscode.window.showErrorMessage('Context Engine Uploader: HTTP MCP bridge failed to start; MCP config not updated.');
@@ -828,6 +840,7 @@ function createMcpConfigManager(deps) {
   }
 
   return {
+    cancelPendingBridgeConfigRefresh,
     scheduleMcpConfigRefreshAfterBridge,
     writeMcpConfig,
     dispose,

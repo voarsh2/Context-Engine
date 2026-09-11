@@ -1,6 +1,40 @@
 {% extends "admin/base.html" %}
 
 {% block content %}
+  {% set qp = request.query_params %}
+  {% if qp and ((qp.get("copied") and qp.get("new")) or qp.get("deleted") or qp.get("journal_cleared")) %}
+    <div class="card">
+      {% if qp.get("copied") and qp.get("new") %}
+        <div>
+          Copied collection <code>{{ qp.get("copied") }}</code> → <code>{{ qp.get("new") }}</code>.
+          {% if qp.get("graph_copied") == "1" %}
+            <span class="muted">(graph clone copied)</span>
+          {% elif qp.get("graph_copied") == "0" %}
+            <span class="muted">(graph clone not copied; will rebuild/backfill)</span>
+          {% endif %}
+        </div>
+      {% endif %}
+      {% if qp.get("deleted") %}
+        <div>
+          Deleted collection <code>{{ qp.get("deleted") }}</code>.
+          {% if qp.get("graph_deleted") == "1" %}
+            <span class="muted">(graph clone deleted)</span>
+          {% elif qp.get("graph_deleted") == "0" %}
+            <span class="muted">(graph clone not deleted or missing)</span>
+          {% endif %}
+        </div>
+      {% endif %}
+      {% if qp.get("journal_cleared") %}
+        <div>
+          Cleared index journal for collection <code>{{ qp.get("journal_cleared") }}</code>.
+          {% if qp.get("journal_removed") %}
+            <span class="muted">({{ qp.get("journal_removed") }} entries removed)</span>
+          {% endif %}
+        </div>
+      {% endif %}
+    </div>
+  {% endif %}
+
   <div class="card" data-staging-enabled="{{ '1' if staging_enabled else '0' }}">
     <h2>Users</h2>
 
@@ -167,6 +201,10 @@
                 <form class="inline js-confirmable" data-confirm="Recreate collection {{ c.qdrant_collection }}? This will recreate Qdrant collection and reindex all files." method="post" action="/admin/collections/recreate">
                   <input type="hidden" name="collection" value="{{ c.qdrant_collection }}" />
                   <button type="submit">Recreate</button>
+                </form>
+                <form class="inline js-confirmable" data-confirm="Clear index journal for {{ c.qdrant_collection }}? Pending watcher retry entries for this collection will be removed." method="post" action="/admin/collections/clear-journal">
+                  <input type="hidden" name="collection" value="{{ c.qdrant_collection }}" />
+                  <button type="submit">Clear Journal</button>
                 </form>
               {% endif %}
               {% if deletion_enabled %}
@@ -394,6 +432,12 @@
             )}? This will create a full copy of the collection." method="post" action="/admin/staging/copy">
               <input type="hidden" name="collection" value="${escapeHtml(c.qdrant_collection)}" />
               <button type="submit">Copy</button>
+            </form>
+            <form class="inline js-confirmable" data-confirm="Clear index journal for ${escapeHtml(
+              c.qdrant_collection
+            )}? Pending watcher retry entries for this collection will be removed." method="post" action="/admin/collections/clear-journal">
+              <input type="hidden" name="collection" value="${escapeHtml(c.qdrant_collection)}" />
+              <button type="submit">Clear Journal</button>
             </form>
           `
           : "";

@@ -29,27 +29,25 @@ import logging
 from typing import List, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+)
+
 logger = logging.getLogger("hybrid_expand")
 
 # Import QdrantClient type for annotations
 if TYPE_CHECKING:
     from qdrant_client import QdrantClient
 
-# Import semantic expansion functionality (optional)
-try:
-    from scripts.semantic_expansion import (
-        expand_queries_semantically,
-        expand_queries_with_prf,
-        get_expansion_stats,
-        clear_expansion_cache,
-    )
-    SEMANTIC_EXPANSION_AVAILABLE = True
-except ImportError:
-    SEMANTIC_EXPANSION_AVAILABLE = False
-    expand_queries_semantically = None
-    expand_queries_with_prf = None
-    get_expansion_stats = None
-    clear_expansion_cache = None
+from scripts.semantic_expansion import (
+    expand_queries_semantically,
+    expand_queries_with_prf,
+    get_expansion_stats,
+    clear_expansion_cache,
+)
+
+SEMANTIC_EXPANSION_AVAILABLE = True
 
 
 # Feature flag for embedding-based dynamic expansion
@@ -542,20 +540,8 @@ def expand_via_embeddings(
         except Exception:
             vec_name = None
 
-    def _norm_under(u: str | None) -> str | None:
-        if not u:
-            return None
-        u = str(u).strip().replace("\\", "/")
-        u = "/".join([p for p in u.split("/") if p])
-        if not u:
-            return None
-        if u.startswith("/work/"):
-            return u
-        if not u.startswith("/"):
-            return "/work/" + u
-        return "/work/" + u.lstrip("/")
-
     flt = None
+    eff_under = _normalize_under_scope(under)
     try:
         from qdrant_client import models
 
@@ -567,15 +553,6 @@ def expand_via_embeddings(
                     match=models.MatchValue(value=language),
                 )
             )
-        if under:
-            eff_under = _norm_under(under)
-            if eff_under:
-                must.append(
-                    models.FieldCondition(
-                        key="metadata.path_prefix",
-                        match=models.MatchValue(value=eff_under),
-                    )
-                )
         if kind:
             must.append(
                 models.FieldCondition(
@@ -621,10 +598,11 @@ def expand_via_embeddings(
 
     # Search for soft matches (we want semantically similar docs, not exact matches)
     try:
+        initial_limit = 8 if not eff_under else max(32, int(max_terms) * 8)
         search_kwargs = {
             "collection_name": collection,
             "query_vector": (vec_name, query_vector) if vec_name else query_vector,
-            "limit": 8,  # Get top 8 neighbors
+            "limit": initial_limit,  # Over-fetch when `under` is set (we post-filter).
             "with_payload": True,
             "score_threshold": 0.3,  # Lower threshold to get more diverse results
         }
@@ -636,6 +614,17 @@ def expand_via_embeddings(
 
     if not results:
         return []
+
+    if eff_under:
+        _scoped = []
+        for hit in results:
+            payload = getattr(hit, "payload", None) or {}
+            md = payload.get("metadata") or {}
+            if _metadata_matches_under(md, eff_under):
+                _scoped.append(hit)
+        results = _scoped
+        if not results:
+            return []
 
     # Extract unique terms from neighbors
     extracted_terms: set[str] = set()

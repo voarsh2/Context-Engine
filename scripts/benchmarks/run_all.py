@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import unified metadata utilities
 from scripts.benchmarks.common import BenchmarkMetadata
@@ -75,15 +74,6 @@ async def run_all_benchmarks(components: List[str]) -> Dict[str, Any]:
         except Exception as e:
             print(f"  Eval harness failed: {e}")
     
-    if "trm" in components or "all" in components:
-        try:
-            from scripts.benchmarks.trm_bench import run_trm_benchmark
-            print("\n▶ Running TRM/Reranker Benchmark...")
-            report = await run_trm_benchmark(name="trm")
-            results["components"]["trm_reranker"] = report.to_dict()
-        except Exception as e:
-            print(f"  TRM benchmark failed: {e}")
-    
     if "refrag" in components or "all" in components:
         try:
             from scripts.benchmarks.refrag_bench import run_refrag_benchmark
@@ -101,15 +91,6 @@ async def run_all_benchmarks(components: List[str]) -> Dict[str, Any]:
             results["components"]["query_expansion"] = report.to_dict()
         except Exception as e:
             print(f"  Expansion benchmark failed: {e}")
-
-    if "router" in components or "all" in components:
-        try:
-            from scripts.benchmarks.router_bench import run_router_benchmark
-            print("\n▶ Running Router Benchmark...")
-            report = await run_router_benchmark(name="router")
-            results["components"]["router"] = report.to_dict()
-        except Exception as e:
-            print(f"  Router benchmark failed: {e}")
 
     if "rrf" in components or "all" in components:
         try:
@@ -204,17 +185,6 @@ def generate_recommendations(components: Dict[str, Any]) -> List[Dict[str, Any]]
                 "impact": f"Grounding rate {grounding:.0%} indicates insufficient context",
             })
     
-    # Check TRM latency
-    if "trm_reranker" in components:
-        p90 = components["trm_reranker"].get("metrics", {}).get("p90_latency_ms", 0)
-        if p90 > 500:
-            recs.append({
-                "priority": "medium",
-                "component": "trm_reranker",
-                "action": "Consider ONNX fallback or reduce candidate pool",
-                "impact": f"P90 latency {p90:.0f}ms may impact UX",
-            })
-
     # Check Router accuracy
     if "router" in components:
         acc = components["router"].get("metrics", {}).get("accuracy", 0)
@@ -270,7 +240,7 @@ def main():
         "--components",
         nargs="+",
         default=["all"],
-        choices=["all", "eval", "trm", "refrag", "expand", "router", "rrf", "grounding", "efficiency", "embedding"],
+        choices=["all", "eval", "refrag", "expand", "router", "rrf", "grounding", "efficiency", "embedding"],
         help="Components to benchmark",
     )
     parser.add_argument("--output", type=str, help="Output JSON file")

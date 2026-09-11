@@ -18,10 +18,13 @@ pytestmark = pytest.mark.unit
 # Fixture: Import ranking module
 # ============================================================================
 @pytest.fixture
-def ranking_module():
+def ranking_module(monkeypatch):
     """Import hybrid ranking module."""
     import importlib
+    monkeypatch.setenv("HYBRID_LEXICAL_WEIGHT", "0.20")
+    monkeypatch.setenv("HYBRID_LEX_VECTOR_WEIGHT", "0.20")
     ranking = importlib.import_module("scripts.hybrid.ranking")
+    ranking = importlib.reload(ranking)
     return ranking
 
 

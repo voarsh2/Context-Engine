@@ -8,7 +8,7 @@
 - [Overview](#overview)
 - [Core Principles](#core-principles)
 - [System Architecture](#system-architecture)
-- [Learning Reranker System](#5-learning-reranker-system)
+- [Relevance Feedback System](#5-relevance-feedback-optional)
 - [Data Flow](#data-flow)
 - [ReFRAG Pipeline](#refrag-pipeline)
 
@@ -123,121 +123,66 @@ Production-ready MCP (Model Context Protocol) retrieval stack unifying code inde
 - **Local LLM Integration**: llama.cpp for offline expansion
 - **Caching**: Expanded query results cached for reuse
 
-#### Pattern Detection (`scripts/pattern_detection/`)
-- **Structural Search**: Find similar code patterns across languages via AST analysis
-- **64-dim Pattern Vector**: WL graph kernel, CFG fingerprint, SimHash, spectral features
-- **Auto-Detection**: Identifies retry patterns, resource cleanup, filter loops
-- **Requires**: `PATTERN_VECTORS=1` to enable
+#### Pseudo Descriptions
+- **Index-time vocabulary bridge**: Optional LLM-generated pseudo descriptions
+  and tags are stored with chunks and can be included in dense indexing text via
+  `INDEX_DENSE_MODE=info+pseudo+tags`.
+- **Lexical participation**: Pseudo/tags are appended to lexical text during
+  indexing and can contribute to lexical scoring when `HYBRID_PSEUDO_BOOST` is
+  enabled.
+- **Not reranker-only**: These fields are carried through search results and are
+  already part of retrieval when indexing/search env knobs enable them.
 
-### 5. Learning Reranker System (Optional)
+### 5. Relevance Feedback (Optional)
 
-The Learning Reranker is an **optional** self-improving ranking system that learns from search patterns to provide increasingly relevant results over time. It is enabled by default but can be disabled via `RERANK_LEARNING=0` and `RERANK_EVENTS_ENABLED=0` environment variables. See [Configuration](CONFIGURATION.md#learning-reranker) for all options.
+Per-collection feedback via `rate_search_results` MCP tool. Agents or users
+rate search results (0=not used, 1=glanced, 2=directly used) and a background
+trainer aggregates ratings into per-collection weight files.
 
-#### Architecture Overview
+Feedback uses stable target identity rather than exact line spans:
+- `result_id` / `target_id`: stable symbol-or-file target used for recall and boosts
+- `impression_id`: query/content/span-specific diagnostic ID
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Search Query   │────►│  Hybrid Search   │────►│  TinyScorer     │
-│                 │     │  (initial rank)  │     │  (learned rank) │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                                                         │
-                        ┌──────────────────┐             │
-                        │  Event Logger    │◄────────────┘
-                        │  (NDJSON files)  │
-                        └────────┬─────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │ Learning Worker  │
-                        │  (background)    │
-                        └────────┬─────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │  ONNX Teacher    │
-                        │ (cross-encoder)  │
-                        └────────┬─────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │  Weight Updates  │
-                        │  (.npz files)    │
-                        └──────────────────┘
-```
+Identity and reindex behavior:
+- Line shifts and body edits keep feedback when repo, kind, and symbol identity stay
+  the same.
+- File moves keep symbol feedback because the path is not part of symbol target
+  identity.
+- Exact-body symbol renames are reconciled during smart reindex using the
+  symbol-level content hash.
+- A removed symbol may transfer feedback to multiple extracted successors only
+  when their token overlap collectively covers the old body above conservative
+  thresholds. The inherited weight is divided between successors.
+- Ambiguous renames/splits are not migrated. The old feedback remains recorded
+  but does not attach itself to an uncertain target.
 
-#### Components
+Recent result metadata used by hands-off ratings is persisted per collection in
+the shared feedback volume. Search and rating calls therefore do not need to hit
+the same server process.
 
-**TinyScorer** (`scripts/rerank_recursive.py`)
-- 2-layer MLP neural network (~3MB per collection)
-- Scores query-document pairs based on learned patterns
-- Hot-reloads weights every 60 seconds from disk
-- Per-collection weights (each repo learns independently)
+Subsequent searches can rehydrate positively-rated targets that ordinary
+retrieval missed, then apply a soft `relevance_boost`. Feedback adds candidates
+and nudges rank; it does not force rated targets to win.
 
-**Event Logger** (`scripts/rerank_events.py`)
-- Logs every search to NDJSON files at `/tmp/rerank_events/`
-- Records: query, candidates, initial scores, timestamps
-- Hourly file rotation with configurable retention
+For adjacent-code discovery, feedback recall uses inverse graph lookups against
+the materialized Qdrant graph collection: a rated callee symbol can produce
+candidate caller paths via `callee_symbol -> caller_path`, which are then
+hydrated from the main code collection.
 
-**Learning Worker** (`scripts/learning_reranker_worker.py`)
-- Background daemon that processes logged events
-- Uses ONNX cross-encoder as "teacher" model
-- Trains TinyScorer via knowledge distillation
-- Saves versioned weight checkpoints atomically
+Components:
+- **Event Logger** (`scripts/rerank_tools/events.py`): NDJSON-based event files
+- **Relevance Trainer** (`scripts/relevance_trainer.py`): Aggregates ratings,
+  preserves rehydratable target metadata, writes per-collection weight files
+  atomically
+- **Feedback Recall + Boost** (`scripts/mcp_impl/search.py`): Reads weight files
+  at search time, rehydrates a small number of rated targets and inverse-graph
+  caller candidates from Qdrant, then applies `relevance_boost` to target IDs
 
-#### Learning Flow
+Key env vars: `RELEVANCE_BOOST_FACTOR`, `RELEVANCE_RECALL_MAX`,
+`RELEVANCE_GRAPH_RECALL_MAX`, `RERANKER_WEIGHTS_DIR`, `RERANK_EVENTS_DIR`
 
-1. **Event Capture**: Every search logs query + candidates to NDJSON
-2. **Teacher Scoring**: ONNX cross-encoder scores the candidates
-3. **Student Training**: TinyScorer learns to match teacher rankings
-4. **Weight Update**: New weights saved atomically with versioning
-5. **Hot Reload**: Serving path picks up new weights within 60s
-6. **Score Integration**: `learning_score` blends with other signals
-
-#### Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RERANKER_WEIGHTS_DIR` | Directory for weight files | `/tmp/rerank_weights` |
-| `RERANKER_WEIGHTS_RELOAD_INTERVAL` | Hot-reload check interval (seconds) | 60 |
-| `RERANKER_MAX_CHECKPOINTS` | Number of weight versions to keep | 5 |
-| `RERANKER_LR_DECAY_STEPS` | Steps between learning rate decay | 1000 |
-| `RERANKER_LR_DECAY_RATE` | Learning rate decay multiplier | 0.95 |
-| `RERANKER_MIN_LR` | Minimum learning rate | 0.0001 |
-| `RERANK_EVENTS_DIR` | Directory for event logs | `/tmp/rerank_events` |
-| `RERANK_EVENTS_RETENTION_DAYS` | Days to keep event files | 7 |
-| `RERANK_LEARNING_BATCH_SIZE` | Events per training batch | 32 |
-| `RERANK_LEARNING_POLL_INTERVAL` | Worker poll interval (seconds) | 30 |
-| `RERANK_LEARNING_RATE` | Initial learning rate | 0.001 |
-
-#### Observability
-
-Search results include learning metrics in the `why` field:
-```json
-{
-  "score": 3.2,
-  "why": ["lexical:1.0", "dense_rrf:0.05", "learning:3", "score:3.2"],
-  "components": {
-    "learning_score": 3.2,
-    "learning_iterations": 3
-  }
-}
-```
-
-Worker logs show training progress:
-```
-[codebase] Processed 5 events | v12 | lr=0.001 | avg_loss=1.8 | converged=False
-```
-
-#### Benefits
-
-- **Zero Manual Training**: Learns automatically from usage
-- **Per-Collection Specialization**: Each codebase gets tuned rankings
-- **Fast Inference**: TinyScorer adds <1ms to search latency
-- **Continuous Improvement**: Rankings improve over time
-- **Offline Capable**: Teacher runs locally, no external API calls
-
-#### MCP Router (`scripts/mcp_router.py`)
-- **Intent Classification**: Determines which MCP tool to call based on query
-- **Tool Orchestration**: Routes to search, answer, memory, or index tools
-- **HTTP Execution**: Executes tools via RMCP/HTTP without extra dependencies
-- **Plan Mode**: Preview tool selection without execution
+This replaces the former self-supervised ranking experiment with explicit
+human/agent ratings and bounded feedback recall.
 
 ## Data Flow Architecture
 

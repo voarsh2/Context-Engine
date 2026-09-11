@@ -1,27 +1,17 @@
 #!/usr/bin/env python3
 import os
 import argparse
-import sys
 from collections import defaultdict
 from typing import List, Dict, Any
-from pathlib import Path
 
 from qdrant_client import QdrantClient, models
 import re
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
 from scripts.utils import sanitize_vector_name
 
-# Use embedder factory for Qwen3 support; fallback to direct fastembed
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
-    from fastembed import TextEmbedding
+from scripts.embedder import get_embedding_model as _get_embedding_model
+
+_EMBEDDER_FACTORY = True
 
 
 # Env configuration

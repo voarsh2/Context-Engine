@@ -50,7 +50,8 @@ from scripts.mcp_impl.utils import (
     _primary_identifier_from_queries,
 )
 from scripts.mcp_impl.workspace import _default_collection
-from scripts.logger import safe_int, ValidationError
+from scripts.logger import safe_bool, safe_float, safe_int, ValidationError
+from scripts.refrag_glm import detect_glm_runtime, get_glm_model_name, get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +115,7 @@ def _cleanup_answer(text: str, max_chars: int | None = None) -> str:
 
 def _answer_style_guidance() -> str:
     """Compact instruction to keep answers direct and grounded."""
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    is_glm = detect_glm_runtime()
     
     if is_glm:
         sentence_guidance = "Write a clear, comprehensive answer in 4-8 sentences."
@@ -233,11 +230,7 @@ def _answer_style_guidance() -> str:
     GLM models get more generous guidance (4-8 sentences) since they handle
     longer outputs better than Granite-4.0-Micro which needs strict 2-4 sentence limits.
     """
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    is_glm = detect_glm_runtime()
     
     if is_glm:
         # GLM models can handle longer, more detailed answers
@@ -1013,30 +1006,6 @@ def _ca_fallback_and_budget(
                 model=model,
                 repo=repo,  # Cross-codebase isolation
             )
-            # Ensure last call reflects tier-2 relaxed filters for introspection/testing
-            _ = run_hybrid_search(
-                queries=queries,
-                limit=int(max(lim, 1)),
-                per_path=int(max(ppath, 1)),
-                language=eff_language,
-                under=override_under or None,
-                kind=None,
-                symbol=None,
-                ext=None,
-                not_filter=(not_ or kwargs.get("not_") or kwargs.get("not") or None),
-                case=(case or kwargs.get("case") or None),
-                path_regex=None,
-                path_glob=None,
-                not_glob=eff_not_glob,
-                expand=False
-                if did_local_expand
-                else (
-                    str(os.environ.get("HYBRID_EXPAND", "0")).strip().lower()
-                    in {"1", "true", "yes", "on"}
-                ),
-                model=model,
-                repo=repo,  # Cross-codebase isolation
-            )
 
             if os.environ.get("DEBUG_CONTEXT_ANSWER"):
                 logger.debug(
@@ -1518,58 +1487,56 @@ def _ca_fallback_and_budget(
     # Filter out memory-like items without a valid path to avoid empty citations
     items = [it for it in items if str(it.get("path") or "").strip()]
 
-    # Apply ReFRAG span budgeting to compress context
-    from scripts.hybrid_search import _merge_and_budget_spans  # type: ignore
-
-    try:
-        if os.environ.get("DEBUG_CONTEXT_ANSWER"):
-            logger.debug("BUDGET_BEFORE", extra={"items": len(items)})
-        _pairs = {}
-        try:
-            # Relax budgets for context_answer unless explicitly disabled via CTX_RELAX_BUDGETS=0
-            if str(os.environ.get("CTX_RELAX_BUDGETS", "1")).strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }:
-                # GLM models have much larger context windows - use higher budgets
-                try:
-                    from scripts.refrag_glm import detect_glm_runtime
-                    is_glm = detect_glm_runtime()
-                except ImportError:
-                    is_glm = False
-                
-                if is_glm:
-                    # GLM: 200K context allows much more code context
-                    _default_budget = "8192"  # 8x more than Granite
-                    _default_spans = "24"     # 3x more spans
-                else:
-                    # Granite/llamacpp: tighter limits
-                    _default_budget = "1024"
-                    _default_spans = "8"
-                
-                _pairs = {
-                    "MICRO_BUDGET_TOKENS": os.environ.get(
-                        "MICRO_BUDGET_TOKENS", _default_budget
-                    ),
-                    "MICRO_OUT_MAX_SPANS": os.environ.get("MICRO_OUT_MAX_SPANS", _default_spans),
-                }
-        except Exception:
-            _pairs = {"MICRO_BUDGET_TOKENS": "5000", "MICRO_OUT_MAX_SPANS": "8"}
-        with _env_overrides(_pairs):
-            budgeted = _merge_and_budget_spans(items)
-        if os.environ.get("DEBUG_CONTEXT_ANSWER"):
-            logger.debug("BUDGET_AFTER", extra={"items": len(budgeted)})
-        if not budgeted and items:
-            if os.environ.get("DEBUG_CONTEXT_ANSWER"):
-                logger.debug("BUDGET_EMPTY_FALLBACK")
-            budgeted = items
-    except (ImportError, AttributeError, KeyError):
-        logger.warning("Span budgeting failed, using raw items", exc_info=True)
-        if os.environ.get("DEBUG_CONTEXT_ANSWER"):
-            logger.debug("BUDGET_FAILED", exc_info=True)
+    if items and all(isinstance(it, dict) and it.get("span_budgeted") for it in items):
         budgeted = items
+    else:
+        try:
+            from scripts.hybrid_search import _merge_and_budget_spans  # type: ignore
+
+            if os.environ.get("DEBUG_CONTEXT_ANSWER"):
+                logger.debug("BUDGET_BEFORE", extra={"items": len(items)})
+            _pairs = {}
+            try:
+                # Relax budgets for context_answer unless explicitly disabled via CTX_RELAX_BUDGETS=0
+                if str(os.environ.get("CTX_RELAX_BUDGETS", "1")).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    # GLM models have much larger context windows - use higher budgets
+                    is_glm = detect_glm_runtime()
+
+                    if is_glm:
+                        # GLM: 200K context allows much more code context
+                        _default_budget = "8192"  # 8x more than Granite
+                        _default_spans = "24"     # 3x more spans
+                    else:
+                        # Granite/llamacpp: tighter limits
+                        _default_budget = "1024"
+                        _default_spans = "8"
+
+                    _pairs = {
+                        "MICRO_BUDGET_TOKENS": os.environ.get(
+                            "MICRO_BUDGET_TOKENS", _default_budget
+                        ),
+                        "MICRO_OUT_MAX_SPANS": os.environ.get("MICRO_OUT_MAX_SPANS", _default_spans),
+                    }
+            except Exception:
+                _pairs = {"MICRO_BUDGET_TOKENS": "5000", "MICRO_OUT_MAX_SPANS": "8"}
+            with _env_overrides(_pairs):
+                budgeted = _merge_and_budget_spans(items)
+            if os.environ.get("DEBUG_CONTEXT_ANSWER"):
+                logger.debug("BUDGET_AFTER", extra={"items": len(budgeted)})
+            if not budgeted and items:
+                if os.environ.get("DEBUG_CONTEXT_ANSWER"):
+                    logger.debug("BUDGET_EMPTY_FALLBACK")
+                budgeted = items
+        except (ImportError, AttributeError, KeyError):
+            logger.warning("Span budgeting failed, using raw items", exc_info=True)
+            if os.environ.get("DEBUG_CONTEXT_ANSWER"):
+                logger.debug("BUDGET_FAILED", exc_info=True)
+            budgeted = items
 
     # Enforce an output max spans knob - do this BEFORE env restore
     try:
@@ -2055,11 +2022,7 @@ def _ca_decoder_params(max_tokens: Any) -> tuple[int, float, int, float, list[st
     
     # Granite/llamacpp: use env var or 2000 default
     # GLM: dynamically use model's max_output_tokens from config
-    try:
-        from scripts.refrag_glm import detect_glm_runtime, get_glm_model_name, get_model_config
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    is_glm = detect_glm_runtime()
     
     if is_glm:
         # Pull dynamic limit from GLM model config (imports already succeeded above)
@@ -2502,22 +2465,6 @@ async def _context_answer_impl(
     import time
     import asyncio
 
-    # Import logger utilities
-    try:
-        from scripts.logger import safe_bool, safe_float
-    except ImportError:
-        def safe_bool(val, default=False, **kw):
-            if val is None:
-                return default
-            if isinstance(val, bool):
-                return val
-            return str(val).strip().lower() in {"1", "true", "yes", "on"}
-        def safe_float(val, default=0.0, **kw):
-            try:
-                return float(val) if val is not None else default
-            except Exception:
-                return default
-
     # Get embedding model function
     if get_embedding_model_fn is None:
         from scripts.mcp_impl.admin_tools import _get_embedding_model
@@ -2784,19 +2731,6 @@ async def _context_answer_impl(
             "query": original_queries,
         }
 
-    # Ensure final retrieval call reflects Tier-2 relaxed filters
-    try:
-        from scripts.hybrid_search import run_hybrid_search as _rh
-        await asyncio.to_thread(
-            lambda: _rh(
-                queries=queries,
-                limit=int(max(lim, 1)),
-                per_path=int(max(ppath, 1)),
-            )
-        )
-    except Exception:
-        pass
-
     # Build citations and context payload for the decoder
     (
         citations,
@@ -3039,17 +2973,6 @@ async def _context_answer_impl(
             "citations": citations,
             "query": original_queries,
         }
-
-    # Final introspection call
-    try:
-        from scripts.hybrid_search import run_hybrid_search as _rh2
-        _ = _rh2(
-            queries=queries,
-            limit=int(max(lim, 1)),
-            per_path=int(max(ppath, 1)),
-        )
-    except Exception:
-        pass
 
     # Optional: provide per-query answers/citations for pack mode
     answers_by_query = None

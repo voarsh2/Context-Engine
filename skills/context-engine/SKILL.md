@@ -1,11 +1,11 @@
 ---
 name: context-engine
-description: Codebase search and context retrieval for any programming language. Hybrid semantic/lexical search with neural reranking. Use for code lookup, finding implementations, understanding codebases, Q&A grounded in source code, and persistent memory across sessions.
+description: Codebase search and context retrieval for any programming language. Use for code lookup, finding implementations, understanding codebases, Q&A grounded in source code, and persistent memory across sessions.
 ---
 
 # Context-Engine
 
-Search and retrieve code context from any codebase using hybrid vector search (semantic + lexical) with neural reranking.
+Search and retrieve code context from any codebase using the configured retrieval mode. `repo_search` is the canonical code search tool; dense, fusion, and reranking behavior depends on deployment settings.
 
 ## Decision Tree: Choosing the Right Tool
 
@@ -14,8 +14,8 @@ What do you need?
     |
     +-- Find code locations/implementations
     |       |
-    |       +-- Simple query --> info_request
-    |       +-- Need filters/control --> repo_search
+    |       +-- Any query --> repo_search
+    |       +-- Need file-type focus --> repo_search with profile
     |
     +-- Understand how something works
     |       |
@@ -29,13 +29,13 @@ What do you need?
     |
     +-- Find specific file types
     |       |
-    |       +-- Test files --> search_tests_for
-    |       +-- Config files --> search_config_for
+    |       +-- Test files --> repo_search with profile="tests"
+    |       +-- Config files --> repo_search with profile="config"
     |
     +-- Find relationships
     |       |
-    |       +-- Who calls this function --> search_callers_for
-    |       +-- Who imports this module --> search_importers_for
+    |       +-- Who calls this function --> symbol_graph query_type="callers"
+    |       +-- Who imports this module --> symbol_graph query_type="importers"
     |       +-- Symbol graph navigation (callers/defs/importers) --> symbol_graph
     |
     +-- Git history --> search_commits_for
@@ -47,7 +47,7 @@ What do you need?
 
 ## Primary Search: repo_search
 
-Use `repo_search` (or its alias `code_search`) for most code lookups. Reranking is ON by default.
+Use `repo_search` for code lookups. Retrieval mode and reranking are controlled by deployment configuration and per-call arguments.
 
 ```json
 {
@@ -106,24 +106,10 @@ Use `repo: "*"` to search all indexed repos.
 - `ext` - File extension
 - `repo` - Repository filter for multi-repo setups
 - `case` - Case-sensitive matching
-
-## Simple Lookup: info_request
-
-Use `info_request` for natural language queries with minimal parameters:
-
-```json
-{
-  "info_request": "how does user authentication work"
-}
-```
-
-Add explanations:
-```json
-{
-  "info_request": "database connection pooling",
-  "include_explanation": true
-}
-```
+- `profile` - Focus common scopes:
+  - `"tests"` - Test files
+  - `"config"` - Configuration files
+  - `"code"` - Source-code extensions
 
 ## Q&A with Citations: context_answer
 
@@ -206,27 +192,26 @@ Find structurally similar code patterns across all languages. Accepts **either**
 
 The `query_signature` encodes control flow: `L` (loops), `B` (branches), `T` (try/except), `M` (match).
 
-## Specialized Search Tools
+## Focused Search Profiles
 
-**search_tests_for** - Find test files:
+Use `repo_search.profile` instead of separate focused tools.
+
+**Test files**:
 ```json
-{"query": "UserService", "limit": 10}
+{"query": "UserService", "profile": "tests", "limit": 10}
 ```
 
-**search_config_for** - Find config files:
+**Config files**:
 ```json
-{"query": "database connection", "limit": 5}
+{"query": "database connection", "profile": "config", "limit": 5}
 ```
 
-**search_callers_for** - Find callers of a symbol:
+**Source-code files**:
 ```json
-{"query": "processPayment", "language": "typescript"}
+{"query": "imports qdrant client", "profile": "code", "limit": 10}
 ```
 
-**search_importers_for** - Find importers:
-```json
-{"query": "utils/helpers", "limit": 10}
-```
+For caller/importer relationships, prefer `symbol_graph` when you know the symbol. Use `repo_search` for exploratory prose queries.
 
 **symbol_graph** - Symbol graph navigation (callers / definition / importers):
 ```json
@@ -344,10 +329,7 @@ With recreate (drops existing data):
 
 Set via `output_format` parameter.
 
-## Aliases and Compat Wrappers
-
-**Aliases:**
-- `code_search` = `repo_search` (identical behavior)
+## Compat Wrappers
 
 **Cross-server tools:**
 - `memory_store` / `memory_find` — Memory server tools for persistent knowledge

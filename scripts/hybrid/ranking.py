@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Ranking and scoring logic for hybrid search.
 
@@ -21,7 +23,20 @@ import os
 import re
 import math
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 logger = logging.getLogger("hybrid_ranking")
 
@@ -81,11 +96,8 @@ def _get_micro_defaults() -> Tuple[int, int, int, int]:
     Budget tokens floor is 5000 to ensure context_answer has enough context for quality answers.
     """
     micro_enabled = os.environ.get("INDEX_MICRO_CHUNKS", "1").strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    from scripts.refrag_glm import detect_glm_runtime
+    is_glm = detect_glm_runtime()
     if is_glm:
         if micro_enabled:
             return (24, 6, 8192, 32)
@@ -658,12 +670,6 @@ def _get_symbol_extent(
     if cache_key in _SYMBOL_EXTENT_CACHE:
         return _SYMBOL_EXTENT_CACHE[cache_key]
 
-    # Lazy import to avoid circular dependencies
-    try:
-        from qdrant_client import QdrantClient, models
-    except ImportError:
-        return (0, 0)
-
     if not collection:
         collection = os.environ.get("COLLECTION_NAME", "")
     if not collection:
@@ -679,7 +685,9 @@ def _get_symbol_extent(
                     timeout_s = float(os.environ.get("ADAPTIVE_SPAN_QDRANT_TIMEOUT", "1.0") or 1.0)
                 except Exception:
                     timeout_s = 1.0
-                _SYMBOL_EXTENT_CLIENT = QdrantClient(
+                from qdrant_client import QdrantClient as _QdrantClient
+
+                _SYMBOL_EXTENT_CLIENT = _QdrantClient(
                     url=qdrant_url,
                     api_key=os.environ.get("QDRANT_API_KEY"),
                     timeout=timeout_s,

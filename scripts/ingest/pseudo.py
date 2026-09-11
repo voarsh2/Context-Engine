@@ -7,11 +7,13 @@ for code chunks using LLM decoders (GLM or llama.cpp).
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Tuple, List
 
 from scripts.ingest.config import (
     get_cached_pseudo,
+    get_cached_symbols,
     set_cached_pseudo,
     compare_symbol_changes,
 )
@@ -130,25 +132,58 @@ def should_process_pseudo_for_chunk(
     start_line = chunk.get("start", 0)
     symbol_id = f"{kind}_{symbol_name}_{start_line}"
 
-    # If we don't have any change information, best effort: try reusing cached pseudo when present
-    if not changed_symbols and get_cached_pseudo:
-        try:
-            cached_pseudo, cached_tags = get_cached_pseudo(file_path, symbol_id)
-            if cached_pseudo or cached_tags:
-                return False, cached_pseudo, cached_tags
-        except Exception:
-            pass
-        return True, "", []
-
-    # Unchanged symbol: prefer reuse when cached pseudo/tags exist
-    if symbol_id not in changed_symbols:
+    def _lookup_cached() -> Tuple[str, List[str]]:
         if get_cached_pseudo:
             try:
                 cached_pseudo, cached_tags = get_cached_pseudo(file_path, symbol_id)
                 if cached_pseudo or cached_tags:
-                    return False, cached_pseudo, cached_tags
-            except Exception:
-                pass
+                    return cached_pseudo, cached_tags
+            except Exception as exc:
+                logging.getLogger(__name__).debug(
+                    "get_cached_pseudo failed for %s/%s: %s",
+                    file_path,
+                    symbol_id,
+                    exc,
+                    exc_info=True,
+                )
+        if get_cached_symbols:
+            try:
+                cached_symbols = get_cached_symbols(file_path) or {}
+                for info in cached_symbols.values():
+                    if str(info.get("type") or "") != str(kind):
+                        continue
+                    if str(info.get("name") or "") != str(symbol_name):
+                        continue
+                    cached_pseudo = info.get("pseudo", "")
+                    cached_tags = info.get("tags", [])
+                    if not isinstance(cached_pseudo, str):
+                        cached_pseudo = ""
+                    if not isinstance(cached_tags, list):
+                        cached_tags = []
+                    cached_tags = [str(tag) for tag in cached_tags if str(tag)]
+                    if cached_pseudo or cached_tags:
+                        return cached_pseudo, cached_tags
+            except Exception as exc:
+                logging.getLogger(__name__).debug(
+                    "get_cached_symbols failed for %s: %s",
+                    file_path,
+                    exc,
+                    exc_info=True,
+                )
+        return "", []
+
+    # If we don't have any change information, best effort: try reusing cached pseudo when present
+    if not changed_symbols:
+        cached_pseudo, cached_tags = _lookup_cached()
+        if cached_pseudo or cached_tags:
+            return False, cached_pseudo, cached_tags
+        return True, "", []
+
+    # Unchanged symbol: prefer reuse when cached pseudo/tags exist
+    if symbol_id not in changed_symbols:
+        cached_pseudo, cached_tags = _lookup_cached()
+        if cached_pseudo or cached_tags:
+            return False, cached_pseudo, cached_tags
         # Unchanged but no cached data yet – process once
         return True, "", []
 
@@ -162,7 +197,6 @@ def should_use_smart_reindexing(file_path: str, file_hash: str) -> Tuple[bool, s
     Returns:
         (use_smart, reason)
     """
-    from scripts.ingest.config import get_cached_symbols, compare_symbol_changes
     from scripts.ingest.symbols import extract_symbols_with_tree_sitter
     
     if not _smart_symbol_reindexing_enabled():

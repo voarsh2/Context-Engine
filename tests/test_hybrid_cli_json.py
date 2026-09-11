@@ -1,12 +1,38 @@
 import json
 import sys
+import types
 from types import SimpleNamespace
 
 import importlib
 
 
 def test_hybrid_cli_json_output(monkeypatch, capsys):
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class DummyModels(types.ModuleType):
+        def __getattr__(self, name):
+            def _factory(*args, **kwargs):
+                return SimpleNamespace(_model=name, args=args, **kwargs)
+
+            return _factory
+
+    fake_models = DummyModels("qdrant_client.models")
+    fake_qdrant = types.ModuleType("qdrant_client")
+    fake_qdrant.QdrantClient = DummyClient
+    fake_qdrant.models = fake_models
+    monkeypatch.setitem(sys.modules, "qdrant_client", fake_qdrant)
+    monkeypatch.setitem(sys.modules, "qdrant_client.models", fake_models)
+
+    monkeypatch.setenv("HYBRID_LEXICAL_WEIGHT", "0.20")
+    monkeypatch.setenv("HYBRID_LEX_VECTOR_WEIGHT", "0.20")
+    monkeypatch.setenv("HYBRID_DENSE_WEIGHT", "1.5")
+    importlib.reload(importlib.import_module("scripts.hybrid.config"))
+    importlib.reload(importlib.import_module("scripts.hybrid.ranking"))
     hy = importlib.import_module("scripts.hybrid_search")
+    hy = importlib.reload(hy)
     embedder = importlib.import_module("scripts.embedder")
 
     class DummyVec:
@@ -23,11 +49,6 @@ def test_hybrid_cli_json_output(monkeypatch, capsys):
         def embed(self, texts):
             for _ in texts:
                 yield DummyVec()
-
-    class DummyClient:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
 
     def fake_dense_query(client, vec_name, vector, flt, per_query, collection_name=None, query_text=None):
         md = {

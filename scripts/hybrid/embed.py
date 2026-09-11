@@ -25,24 +25,14 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, List, Optional, TYPE_CHECKING
 
-# ---------------------------------------------------------------------------
-# Embedder factory setup
-# ---------------------------------------------------------------------------
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
-    _get_embedding_model = None  # type: ignore
+from scripts.embedder import get_embedding_model as _get_embedding_model
 
-# Always try to import TextEmbedding for backward compatibility with tests
-try:
-    from fastembed import TextEmbedding
-except ImportError:
-    TextEmbedding = None  # type: ignore
+_EMBEDDER_FACTORY = True
+
+TextEmbedding = None
 
 # Type alias for embedding model (TextEmbedding or compatible)
-EmbeddingModel = Any if TextEmbedding is None else TextEmbedding
+EmbeddingModel = Any
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -52,12 +42,9 @@ MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
 # ---------------------------------------------------------------------------
 # Unified cache system
 # ---------------------------------------------------------------------------
-try:
-    from scripts.cache_manager import get_embedding_cache
-    UNIFIED_CACHE_AVAILABLE = True
-except ImportError:
-    UNIFIED_CACHE_AVAILABLE = False
-    get_embedding_cache = None  # type: ignore
+from scripts.cache_manager import get_embedding_cache
+
+UNIFIED_CACHE_AVAILABLE = True
 
 # Legacy cache fallback structures
 _EMBED_QUERY_CACHE: OrderedDict[tuple[str, str], List[float]] = OrderedDict()
@@ -109,14 +96,12 @@ def get_embedding_model(model_name: Optional[str] = None) -> EmbeddingModel:
     if _EMBEDDER_FACTORY and _get_embedding_model is not None:
         return _get_embedding_model(model_name)
 
-    if TextEmbedding is None:
-        raise ImportError(
-            "No embedding backend available. Install fastembed or ensure "
-            "scripts.embedder is importable."
-        )
-
     name = model_name or MODEL_NAME
-    return TextEmbedding(model_name=name)
+    text_embedding_cls = TextEmbedding
+    if text_embedding_cls is None:
+        from fastembed import TextEmbedding as text_embedding_cls
+
+    return text_embedding_cls(model_name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +154,9 @@ def embed_queries_cached(
         name = os.environ.get("EMBEDDING_MODEL", MODEL_NAME)
 
     # Apply Qwen3 instruction prefix if enabled (queries only, not documents)
-    try:
-        from scripts.embedder import prefix_queries
-        sanitized = prefix_queries(sanitized, name)
-    except ImportError:
-        pass
+    from scripts.embedder import prefix_queries
+
+    sanitized = prefix_queries(sanitized, name)
 
     cache = _get_embed_cache()
 

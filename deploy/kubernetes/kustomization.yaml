@@ -18,7 +18,6 @@ resources:
   - mcp-memory.yaml
   - mcp-indexer.yaml
   - mcp-http.yaml
-  - learning-reranker-worker.yaml
 
   # Indexer services
   - indexer-services.yaml

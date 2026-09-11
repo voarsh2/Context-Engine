@@ -1,6 +1,18 @@
 """Tests for GLM model version configuration and backwards compatibility."""
 import os
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
+
+
+def _install_fake_openai(monkeypatch):
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
+    mock_client.chat.completions.create.return_value = mock_response
+    openai_module = SimpleNamespace(OpenAI=MagicMock(return_value=mock_client))
+    monkeypatch.setitem(sys.modules, "openai", openai_module)
+    return mock_client
 
 
 class TestGLMModelConfig:
@@ -81,16 +93,10 @@ class TestGLMModelConfig:
 class TestGLMRefragClientModelSelection:
     """Test GLMRefragClient model selection logic."""
 
-    @patch("openai.OpenAI")
-    def test_default_model_is_glm46(self, mock_openai_class):
+    def test_default_model_is_glm46(self, monkeypatch):
         """Test that default model is glm-4.6."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         # Remove GLM_MODEL from env to test default, keep GLM_API_KEY
         env_copy = os.environ.copy()
@@ -106,16 +112,10 @@ class TestGLMRefragClientModelSelection:
             assert call_kwargs["model"] == "glm-4.6"
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.6"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_env_model_override(self, mock_openai_class):
+    def test_env_model_override(self, monkeypatch):
         """Test that GLM_MODEL env var overrides default."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         client.generate_with_soft_embeddings("test prompt")
@@ -124,16 +124,10 @@ class TestGLMRefragClientModelSelection:
         assert call_kwargs["model"] == "glm-4.6"
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL_FAST": "glm-4.5"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_fast_model_with_disable_thinking(self, mock_openai_class):
+    def test_fast_model_with_disable_thinking(self, monkeypatch):
         """Test that disable_thinking uses GLM_MODEL_FAST."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         client.generate_with_soft_embeddings("test prompt", disable_thinking=True)
@@ -146,16 +140,10 @@ class TestGLMToolStreamSupport:
     """Test GLM-4.7 tool_stream feature support."""
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.7"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_tool_stream_enabled_for_glm47(self, mock_openai_class):
+    def test_tool_stream_enabled_for_glm47(self, monkeypatch):
         """Test that tool_stream is enabled for GLM-4.7 when requested."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]
@@ -166,16 +154,10 @@ class TestGLMToolStreamSupport:
         assert call_kwargs.get("extra_body", {}).get("tool_stream") is True
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.6"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_tool_stream_not_enabled_for_glm46(self, mock_openai_class):
+    def test_tool_stream_not_enabled_for_glm46(self, monkeypatch):
         """Test that tool_stream is NOT enabled for GLM-4.6."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]
@@ -191,16 +173,10 @@ class TestGLMThinkingSupport:
     """Test GLM thinking/reasoning support."""
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.7"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_enable_thinking_for_glm47(self, mock_openai_class):
+    def test_enable_thinking_for_glm47(self, monkeypatch):
         """Test that thinking can be explicitly enabled for GLM-4.7."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         client.generate_with_soft_embeddings("test prompt", enable_thinking=True)
@@ -209,16 +185,10 @@ class TestGLMThinkingSupport:
         assert call_kwargs.get("extra_body", {}).get("thinking") == {"type": "enabled"}
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.5"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_thinking_not_set_for_glm45(self, mock_openai_class):
+    def test_thinking_not_set_for_glm45(self, monkeypatch):
         """Test that thinking is NOT set for GLM-4.5 (no thinking support)."""
         from scripts.refrag_glm import GLMRefragClient
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         client.generate_with_soft_embeddings("test prompt", enable_thinking=True)
@@ -234,16 +204,10 @@ class TestGLMMaxTokensLimit:
     """Test max_tokens limiting based on model capabilities."""
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.7"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_max_tokens_capped_to_model_limit(self, mock_openai_class):
+    def test_max_tokens_capped_to_model_limit(self, monkeypatch):
         """Test that max_tokens is capped to model's max_output_tokens."""
         from scripts.refrag_glm import GLMRefragClient, GLM_MODEL_CONFIGS
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         # Request more than GLM-4.7 can output (131072)
@@ -253,16 +217,10 @@ class TestGLMMaxTokensLimit:
         assert call_kwargs["max_tokens"] <= GLM_MODEL_CONFIGS["glm-4.7"]["max_output_tokens"]
 
     @patch.dict(os.environ, {"GLM_API_KEY": "test-key", "GLM_MODEL": "glm-4.5"}, clear=False)
-    @patch("openai.OpenAI")
-    def test_max_tokens_uses_smaller_limit_for_glm45(self, mock_openai_class):
+    def test_max_tokens_uses_smaller_limit_for_glm45(self, monkeypatch):
         """Test that GLM-4.5 uses its smaller max_output limit."""
         from scripts.refrag_glm import GLMRefragClient, GLM_MODEL_CONFIGS
-        
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=MagicMock(content="test response"))]
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_openai_class.return_value = mock_client
+        mock_client = _install_fake_openai(monkeypatch)
         
         client = GLMRefragClient()
         # Request more than GLM-4.5 can output (8192)

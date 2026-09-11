@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Qdrant client and query logic extracted from hybrid_search.py.
 
@@ -25,16 +27,22 @@ import os
 import logging
 import threading
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, TYPE_CHECKING
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-# Core Qdrant imports
-try:
-    from qdrant_client import QdrantClient, models
-except ImportError:
-    QdrantClient = None  # type: ignore
-    models = None  # type: ignore
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 logger = logging.getLogger("hybrid_qdrant")
 
@@ -75,6 +83,9 @@ from scripts.ingest.config import (
     LEX_SPARSE_NAME,
     LEX_SPARSE_MODE,
 )
+from scripts.query_optimizer import optimize_query
+from scripts.utils import lex_hash_vector_queries as _lex_hash_vector_queries
+from scripts.utils import lex_sparse_vector_queries as _lex_sparse_vector_queries
 
 EF_SEARCH = _safe_int(os.environ.get("QDRANT_EF_SEARCH", "128"), 128)
 
@@ -101,40 +112,13 @@ def _get_search_params(ef: int) -> models.SearchParams:
 # Connection pooling setup
 # ---------------------------------------------------------------------------
 
-try:
-    from scripts.qdrant_client_manager import get_qdrant_client, return_qdrant_client, pooled_qdrant_client
-    _POOL_AVAILABLE = True
-except ImportError:
-    _POOL_AVAILABLE = False
+from scripts.qdrant_client_manager import (
+    get_qdrant_client,
+    return_qdrant_client,
+    pooled_qdrant_client,
+)
 
-    def get_qdrant_client(url=None, api_key=None, force_new=False, use_pool=True):
-        """Fallback client creation when pooling is unavailable."""
-        if QdrantClient is None:
-            raise ImportError(
-                "qdrant_client is not installed. Install with: pip install qdrant-client"
-            )
-        return QdrantClient(
-            url=url or os.environ.get("QDRANT_URL", "http://localhost:6333"),
-            api_key=api_key or os.environ.get("QDRANT_API_KEY")
-        )
-
-    def return_qdrant_client(client):
-        """No-op when pooling is unavailable."""
-        pass
-
-    class pooled_qdrant_client:
-        """Fallback context manager when pooling is unavailable."""
-        def __init__(self, url=None, api_key=None):
-            self.url = url
-            self.api_key = api_key
-            self.client = None
-
-        def __enter__(self):
-            self.client = get_qdrant_client(self.url, self.api_key)
-            return self.client
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            return_qdrant_client(self.client)
+_POOL_AVAILABLE = True
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +243,7 @@ def _ensure_collection(client, collection: str, dim: int, vec_name: str):
     """Cached wrapper for ensure_collection - only calls once per (endpoint, collection, vec_name) pair.
 
     IMPORTANT: This is called during SEARCH operations. We must NOT delete/recreate collections
-    that already exist with data. The ensure_collection in ingest_code can trigger recreation
-    when PATTERN_VECTORS=1 or LEX_SPARSE_MODE=1 if the collection lacks those vectors.
+    that already exist with data. Schema changes belong to the ingestion path, not search.
 
     For search, we only need to verify the collection exists - not modify its schema.
     """
@@ -276,12 +259,10 @@ def _ensure_collection(client, collection: str, dim: int, vec_name: str):
         _ENSURED_COLLECTIONS.add(cache_key)
         return
 
-    # Collection doesn't exist - only then call ensure_collection to create it
-    try:
-        from scripts.ingest_code import ensure_collection as _ensure_collection_raw
-        _ensure_collection_raw(client, collection, dim, vec_name)
-    except ImportError:
-        pass
+    # Collection doesn't exist - only then call the ingest Qdrant adapter to create it.
+    from scripts.ingest.qdrant import ensure_collection as _ensure_collection_raw
+
+    _ensure_collection_raw(client, collection, dim, vec_name)
 
     try:
         _cache_collection_vectors(client, collection)
@@ -403,51 +384,12 @@ def lex_hash_vector(phrases: List[str], dim: int | None = None) -> List[float]:
     """Generate dense lexical hash vector for query phrases."""
     if dim is None:
         dim = LEX_VECTOR_DIM
-    try:
-        from scripts.utils import lex_hash_vector_queries as _lex_hash_vector_queries
-        return _lex_hash_vector_queries(phrases, dim)
-    except ImportError:
-        return _fallback_lex_hash_vector(phrases, dim)
-
-
-def _fallback_lex_hash_vector(phrases: List[str], dim: int) -> List[float]:
-    """Fallback implementation when utils is unavailable."""
-    import hashlib
-    vec = [0.0] * dim
-    for phrase in phrases:
-        for tok in _split_ident_lex(phrase):
-            h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
-            idx = h % dim
-            vec[idx] += 1.0
-    norm = sum(v * v for v in vec) ** 0.5
-    if norm > 0:
-        vec = [v / norm for v in vec]
-    return vec
+    return _lex_hash_vector_queries(phrases, dim)
 
 
 def lex_sparse_vector(phrases: List[str]) -> Dict[str, Any]:
     """Generate sparse vector for query phrases (lossless exact matching)."""
-    try:
-        from scripts.utils import lex_sparse_vector_queries as _lex_sparse_vector_queries
-        return _lex_sparse_vector_queries(phrases)
-    except ImportError:
-        return _fallback_lex_sparse_vector(phrases)
-
-
-def _fallback_lex_sparse_vector(phrases: List[str]) -> Dict[str, Any]:
-    """Fallback implementation when utils is unavailable."""
-    import hashlib
-    indices = []
-    values = []
-    seen = set()
-    for phrase in phrases:
-        for tok in _split_ident_lex(phrase):
-            h = int(hashlib.md5(tok.encode()).hexdigest(), 16) % (2**31)
-            if h not in seen:
-                indices.append(h)
-                values.append(1.0)
-                seen.add(h)
-    return {"indices": indices, "values": values}
+    return _lex_sparse_vector_queries(phrases)
 
 
 # ---------------------------------------------------------------------------
@@ -605,15 +547,12 @@ def dense_query(
     # Apply dynamic EF optimization if query text provided
     if query_text:
         try:
-            from scripts.query_optimizer import optimize_query
             result = optimize_query(query_text)
             # Only override EF when adaptive optimization is enabled
             if result.get("adaptive_enabled", False):
                 ef = result["recommended_ef"]
                 if os.environ.get("DEBUG_HYBRID_SEARCH"):
                     logger.debug(f"Dynamic EF: {ef} (complexity={result['complexity']}, type={result['query_type']})")
-        except ImportError:
-            pass
         except Exception as e:
             if os.environ.get("DEBUG_HYBRID_SEARCH"):
                 logger.debug(f"Query optimizer failed, using default EF: {e}")

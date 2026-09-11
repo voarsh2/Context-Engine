@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import asyncio
 import importlib
 import pytest
 
@@ -41,11 +42,11 @@ class FakeEmbedder:
 @pytest.mark.integration
 def test_index_and_search_minirepo(tmp_path, monkeypatch, qdrant_container):
     # Env for services
-    os.environ["QDRANT_URL"] = qdrant_container
-    os.environ["COLLECTION_NAME"] = f"test-{uuid.uuid4().hex[:8]}"
-    os.environ["USE_TREE_SITTER"] = "0"
-    os.environ["HYBRID_IN_PROCESS"] = "1"
-    os.environ["EMBEDDING_MODEL"] = "fake"
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
+    monkeypatch.setenv("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
+    monkeypatch.setenv("USE_TREE_SITTER", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "fake")
 
     # Stub embeddings everywhere (FakeEmbedder produces 32-dim vectors)
     monkeypatch.setattr(ing, "TextEmbedding", lambda *a, **k: FakeEmbedder("fake"))
@@ -75,7 +76,7 @@ def test_index_and_search_minirepo(tmp_path, monkeypatch, qdrant_container):
     )
 
     # Search directly via async function
-    res = srv.asyncio.get_event_loop().run_until_complete(
+    res = asyncio.run(
         srv.repo_search(
             queries=["def f"],
             limit=5,
@@ -92,11 +93,11 @@ def test_index_and_search_minirepo(tmp_path, monkeypatch, qdrant_container):
 @pytest.mark.integration
 def test_filters_language_and_path(tmp_path, monkeypatch, qdrant_container):
     # Reuse container; set env
-    os.environ["QDRANT_URL"] = qdrant_container
-    os.environ.setdefault("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
-    os.environ["USE_TREE_SITTER"] = "0"
-    os.environ["HYBRID_IN_PROCESS"] = "1"
-    os.environ["EMBEDDING_MODEL"] = "fake"
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
+    monkeypatch.setenv("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
+    monkeypatch.setenv("USE_TREE_SITTER", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "fake")
 
     # Stub embeddings (FakeEmbedder produces 32-dim vectors)
     monkeypatch.setattr(ing, "TextEmbedding", lambda *a, **k: FakeEmbedder("fake"))
@@ -127,19 +128,19 @@ def test_filters_language_and_path(tmp_path, monkeypatch, qdrant_container):
     f_md = str(tmp_path / "pkg" / "b.md")
 
     # Filter by language=python should bias toward .py
-    res1 = srv.asyncio.get_event_loop().run_until_complete(
+    res1 = asyncio.run(
         srv.repo_search(queries=["def"], limit=5, language="python", compact=False)
     )
     assert any(f_py in (r.get("path") or "") for r in res1.get("results", []))
 
     # Filter by ext=txt should retrieve text file
-    res2 = srv.asyncio.get_event_loop().run_until_complete(
+    res2 = asyncio.run(
         srv.repo_search(queries=["hello"], limit=5, ext="md", compact=False)
     )
     assert any(f_md in (r.get("path") or "") for r in res2.get("results", []))
 
     # Path glob to only allow pkg/*.py
-    res3 = srv.asyncio.get_event_loop().run_until_complete(
+    res3 = asyncio.run(
         srv.repo_search(
             queries=["def"],
             limit=5,

@@ -25,18 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 # Shared utilities
 from scripts.benchmarks.qdrant_utils import probe_pseudo_tags, verify_config_compatibility, get_qdrant_client
-
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 # Read .env settings
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")

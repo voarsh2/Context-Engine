@@ -8,12 +8,7 @@ to scripts/benchmarks/core_indexer.py for actual indexing.
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 from typing import Any, Dict, List
-
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from scripts.benchmarks.core_indexer import (
     BenchmarkDoc,

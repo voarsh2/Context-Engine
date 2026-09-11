@@ -37,6 +37,7 @@ from scripts.mcp_impl.utils import (
 )
 from scripts.mcp_impl.workspace import _default_collection, _MEM_COLL_CACHE
 from scripts.mcp_impl.toon import _should_use_toon, _format_context_results_as_toon
+from scripts.mcp_http_client import call_tool_http
 
 # Environment
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -681,8 +682,6 @@ async def _context_search_impl(
     used_http_fallback = False
     if not code_hits:
         try:
-            from scripts.mcp_router import call_tool_http  # type: ignore
-
             base = (
                 os.environ.get("MCP_INDEXER_HTTP_URL") or "http://localhost:8003/mcp"
             ).rstrip("/")
@@ -1254,4 +1253,3 @@ async def _context_search_impl(
     if _should_use_toon(output_format):
         return _format_context_results_as_toon(ret, compact=bool(eff_compact))
     return ret
-

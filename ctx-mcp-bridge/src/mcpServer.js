@@ -8,7 +8,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { loadAnyAuthEntry, loadAuthEntry, readConfig, saveAuthEntry } from "./authConfig.js";
 import { maybeRemapToolArgs, maybeRemapToolResult } from "./resultPathMapping.js";
 import * as oauthHandler from "./oauthHandler.js";
@@ -27,16 +33,23 @@ function debugLog(message) {
 
 async function sendSessionDefaults(client, payload, label) {
   if (!client) {
-    return;
+    return false;
   }
   try {
-    await client.callTool({
-      name: "set_session_defaults",
-      arguments: payload,
-    });
+    const timeoutMs = getBridgeToolTimeoutMs();
+    await withTimeout(
+      client.callTool({
+        name: "set_session_defaults",
+        arguments: payload,
+      }),
+      timeoutMs,
+      `sendSessionDefaults(${label})`
+    );
+    return true;
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(`[ctxce] Failed to call set_session_defaults on ${label}:`, err);
+    return false;
   }
 }
 function dedupeTools(tools) {
@@ -58,20 +71,172 @@ function dedupeTools(tools) {
   return out;
 }
 
-async function listMemoryTools(client) {
-  if (!client) {
+function dedupeResources(resources) {
+  const seen = new Set();
+  const out = [];
+  for (const resource of resources) {
+    const uri = resource && typeof resource.uri === "string" ? resource.uri : "";
+    if (!uri || seen.has(uri)) {
+      continue;
+    }
+    seen.add(uri);
+    out.push(resource);
+  }
+  return out;
+}
+
+function dedupeResourceTemplates(templates) {
+  const seen = new Set();
+  const out = [];
+  for (const template of templates) {
+    const uri =
+      template && typeof template.uriTemplate === "string"
+        ? template.uriTemplate
+        : "";
+    if (!uri || seen.has(uri)) {
+      continue;
+    }
+    seen.add(uri);
+    out.push(template);
+  }
+  return out;
+}
+
+async function callListWithSessionRecovery(call, label, onSessionError) {
+  try {
+    return await withTransientRetry(call, label);
+  } catch (err) {
+    if (isSessionError(err) && typeof onSessionError === "function") {
+      try {
+        await onSessionError();
+        return await withTransientRetry(call, `${label} (retry)`);
+      } catch (retryErr) {
+        debugLog(`[ctxce] ${label} failed after MCP session recovery: ` + String(retryErr));
+      }
+    }
+    throw err;
+  }
+}
+
+async function listMemoryTools(getClient, onSessionError) {
+  if (typeof getClient !== "function" || !getClient()) {
     return [];
   }
   try {
-    const remote = await withTimeout(
-      client.listTools(),
-      5000,
+    const remote = await callListWithSessionRecovery(
+      () => {
+        const client = getClient();
+        if (!client) {
+          throw new Error("Memory MCP client not initialized");
+        }
+        const timeoutMs = getBridgeListTimeoutMs();
+        return withTimeout(client.listTools(), timeoutMs, "memory tools/list");
+      },
       "memory tools/list",
+      onSessionError,
     );
     return Array.isArray(remote?.tools) ? remote.tools.slice() : [];
   } catch (err) {
     debugLog("[ctxce] Error calling memory tools/list: " + String(err));
     return [];
+  }
+}
+
+function encodeCompositeCursor(cursorObj) {
+  try {
+    const payload = JSON.stringify(cursorObj || {});
+    return Buffer.from(payload, "utf8").toString("base64");
+  } catch {
+    return "";
+  }
+}
+
+function decodeCompositeCursor(raw) {
+  try {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) {
+      return null;
+    }
+    const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+    const parsed = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function listResourcesSafe(getClient, label, cursor, onSessionError) {
+  if (typeof getClient !== "function" || !getClient()) {
+    return { resources: [], nextCursor: null };
+  }
+  try {
+    const params = cursor ? { cursor } : {};
+    const remote = await callListWithSessionRecovery(
+      () => {
+        const client = getClient();
+        if (!client) {
+          throw new Error(`${label} MCP client not initialized`);
+        }
+        const timeoutMs = getBridgeListTimeoutMs();
+        return withTimeout(
+          client.listResources(params),
+          timeoutMs,
+          `${label} resources/list`,
+        );
+      },
+      `${label} resources/list`,
+      onSessionError,
+    );
+    return {
+      resources: Array.isArray(remote?.resources) ? remote.resources.slice() : [],
+      nextCursor:
+        remote && typeof remote.nextCursor === "string" && remote.nextCursor
+          ? remote.nextCursor
+          : null,
+    };
+  } catch (err) {
+    debugLog(`[ctxce] Error calling ${label} resources/list: ` + String(err));
+    return { resources: [], nextCursor: null };
+  }
+}
+
+async function listResourceTemplatesSafe(getClient, label, cursor, onSessionError) {
+  if (typeof getClient !== "function" || !getClient()) {
+    return { resourceTemplates: [], nextCursor: null };
+  }
+  try {
+    const params = cursor ? { cursor } : {};
+    const remote = await callListWithSessionRecovery(
+      () => {
+        const client = getClient();
+        if (!client) {
+          throw new Error(`${label} MCP client not initialized`);
+        }
+        const timeoutMs = getBridgeListTimeoutMs();
+        return withTimeout(
+          client.listResourceTemplates(params),
+          timeoutMs,
+          `${label} resources/templates/list`,
+        );
+      },
+      `${label} resources/templates/list`,
+      onSessionError,
+    );
+    return {
+      resourceTemplates: Array.isArray(remote?.resourceTemplates)
+        ? remote.resourceTemplates.slice()
+        : [],
+      nextCursor:
+        remote && typeof remote.nextCursor === "string" && remote.nextCursor
+          ? remote.nextCursor
+          : null,
+    };
+  } catch (err) {
+    debugLog(`[ctxce] Error calling ${label} resources/templates/list: ` + String(err));
+    return { resourceTemplates: [], nextCursor: null };
   }
 }
 
@@ -125,6 +290,25 @@ function getBridgeToolTimeoutMs() {
   }
 }
 
+function getBridgeListTimeoutMs() {
+  try {
+    // Keep list operations on a separate budget from tools/call.
+    // Some streamable-http clients (including Codex) probe tools/resources early,
+    // and a short timeout here can make the bridge appear unavailable.
+    const raw = process.env.CTXCE_LIST_TIMEOUT_MSEC;
+    if (!raw) {
+      return 60000;
+    }
+    const parsed = Number.parseInt(String(raw), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return 60000;
+    }
+    return parsed;
+  } catch {
+    return 60000;
+  }
+}
+
 function selectClientForTool(name, indexerClient, memoryClient) {
   if (!name) {
     return indexerClient;
@@ -148,6 +332,7 @@ function isSessionError(error) {
       msg.includes("No valid session ID") ||
       msg.includes("Mcp-Session-Id header is required") ||
       msg.includes("Server not initialized") ||
+      msg.includes("Received request before initialization was complete") ||
       msg.includes("Session not found")
     );
   } catch {
@@ -269,6 +454,34 @@ function isTransientToolError(error) {
   } catch {
     return false;
   }
+}
+
+async function withTransientRetry(operation, label, maxAttempts, retryDelayMs) {
+  const attempts = Number.isFinite(maxAttempts) && maxAttempts > 0
+    ? Math.floor(maxAttempts)
+    : getBridgeRetryAttempts();
+  const delayMs = Number.isFinite(retryDelayMs) && retryDelayMs >= 0
+    ? Math.floor(retryDelayMs)
+    : getBridgeRetryDelayMs();
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0 && delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (!isTransientToolError(err) || attempt === attempts - 1) {
+        throw err;
+      }
+      debugLog(
+        `[ctxce] ${label}: transient error (attempt ${attempt + 1}/${attempts}), retrying: ` +
+        String(err),
+      );
+    }
+  }
+  throw lastError || new Error(`[ctxce] ${label}: unknown transient retry failure`);
 }
 // MCP stdio server implemented using the official MCP TypeScript SDK.
 // Acts as a low-level proxy for tools, forwarding tools/list and tools/call
@@ -440,6 +653,7 @@ async function createBridgeServer(options) {
 
   let indexerClient = null;
   let memoryClient = null;
+  let lastDefaultsSyncedSessionId = "";
 
   // Derive a simple session identifier for this bridge process. In the
   // future this can be made user-aware (e.g. from auth), but for now we
@@ -568,6 +782,23 @@ async function createBridgeServer(options) {
     defaultsPayload.under = defaultUnder;
   }
 
+  async function ensureRemoteDefaults(force = false) {
+    defaultsPayload.session = sessionId;
+    if (!sessionId) {
+      return;
+    }
+    if (!force && lastDefaultsSyncedSessionId === sessionId) {
+      return;
+    }
+    const indexerOk = await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
+    if (memoryClient) {
+      await sendSessionDefaults(memoryClient, defaultsPayload, "memory");
+    }
+    if (indexerOk) {
+      lastDefaultsSyncedSessionId = sessionId;
+    }
+  }
+
   async function initializeRemoteClients(forceRecreate = false) {
     if (!forceRecreate && indexerClient) {
       return;
@@ -579,6 +810,22 @@ async function createBridgeServer(options) {
       } catch {
         // ignore logging failures
       }
+      try {
+        if (indexerClient && typeof indexerClient.close === "function") {
+          await indexerClient.close();
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        if (memoryClient && typeof memoryClient.close === "function") {
+          await memoryClient.close();
+        }
+      } catch {
+        // ignore
+      }
+      indexerClient = null;
+      memoryClient = null;
     }
 
     let nextIndexerClient = null;
@@ -633,15 +880,34 @@ async function createBridgeServer(options) {
     indexerClient = nextIndexerClient;
     memoryClient = nextMemoryClient;
 
-    if (Object.keys(defaultsPayload).length > 1 && indexerClient) {
-      await sendSessionDefaults(indexerClient, defaultsPayload, "indexer");
-      if (memoryClient) {
-        await sendSessionDefaults(memoryClient, defaultsPayload, "memory");
-      }
-    }
+    await ensureRemoteDefaults(true);
   }
 
-  await initializeRemoteClients(false);
+  async function refreshSessionAndSyncDefaults() {
+    const freshSession = resolveSessionId() || sessionId;
+    const changed = Boolean(freshSession && freshSession !== sessionId);
+    if (changed) {
+      sessionId = freshSession;
+      defaultsPayload.session = sessionId;
+      lastDefaultsSyncedSessionId = "";
+    }
+    await initializeRemoteClients(false);
+    await ensureRemoteDefaults(changed);
+  }
+
+  async function recoverRemoteClientsAfterSessionError() {
+    const freshSession = resolveSessionId() || sessionId;
+    const changed = Boolean(freshSession && freshSession !== sessionId);
+    if (changed) {
+      sessionId = freshSession;
+      defaultsPayload.session = sessionId;
+      lastDefaultsSyncedSessionId = "";
+    }
+    await initializeRemoteClients(true);
+    await ensureRemoteDefaults(true);
+  }
+
+  await refreshSessionAndSyncDefaults();
 
   const server = new Server( // TODO: marked as depreciated
     {
@@ -651,6 +917,7 @@ async function createBridgeServer(options) {
     {
       capabilities: {
         tools: {},
+        resources: {},
       },
     },
   );
@@ -658,20 +925,36 @@ async function createBridgeServer(options) {
   // tools/list → fetch tools from remote indexer
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     let remote;
+    let listError = null;
     try {
-      debugLog("[ctxce] tools/list: fetching tools from indexer");
       await initializeRemoteClients(false);
-      if (!indexerClient) {
-        throw new Error("Indexer MCP client not initialized");
-      }
-      remote = await withTimeout(
-        indexerClient.listTools(),
-        10000,
+      await ensureRemoteDefaults(false);
+      debugLog("[ctxce] tools/list: fetching tools from indexer");
+      remote = await callListWithSessionRecovery(
+        () => {
+          if (!indexerClient) {
+            throw new Error("Indexer MCP client not initialized");
+          }
+          const timeoutMs = getBridgeListTimeoutMs();
+          return withTimeout(
+            indexerClient.listTools(),
+            timeoutMs,
+            "indexer tools/list",
+          );
+        },
         "indexer tools/list",
+        recoverRemoteClientsAfterSessionError,
       );
     } catch (err) {
-      debugLog("[ctxce] Error calling remote tools/list: " + String(err));
-      const memoryToolsFallback = await listMemoryTools(memoryClient);
+      listError = err;
+    }
+
+    if (!remote) {
+      debugLog("[ctxce] Error calling remote tools/list: " + String(listError));
+      const memoryToolsFallback = await listMemoryTools(
+        () => memoryClient,
+        recoverRemoteClientsAfterSessionError,
+      );
       const toolsFallback = dedupeTools([...memoryToolsFallback]);
       return { tools: toolsFallback };
     }
@@ -687,10 +970,128 @@ async function createBridgeServer(options) {
     }
 
     const indexerTools = Array.isArray(remote?.tools) ? remote.tools.slice() : [];
-    const memoryTools = await listMemoryTools(memoryClient);
+    const memoryTools = await listMemoryTools(
+      () => memoryClient,
+      recoverRemoteClientsAfterSessionError,
+    );
     const tools = dedupeTools([...indexerTools, ...memoryTools]);
     debugLog(`[ctxce] tools/list: returning ${tools.length} tools`);
     return { tools };
+  });
+
+  server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+    // Proxy resource discovery/read-through so clients that use MCP resources
+    // (not only tools) can access upstream indexer/memory resources directly.
+    await initializeRemoteClients(false);
+    await ensureRemoteDefaults(false);
+    const cursor =
+      request && request.params && typeof request.params.cursor === "string"
+        ? request.params.cursor
+        : null;
+    const decoded = decodeCompositeCursor(cursor);
+    const indexerCursor =
+      decoded && typeof decoded.i === "string" ? decoded.i : cursor;
+    const memoryCursor =
+      decoded && typeof decoded.m === "string" ? decoded.m : cursor;
+    if (cursor && decoded === null) {
+      debugLog("[ctxce] resources/list: received non-composite cursor; forwarding to both upstreams.");
+    }
+    const indexerRes = await listResourcesSafe(
+      () => indexerClient,
+      "indexer",
+      indexerCursor,
+      recoverRemoteClientsAfterSessionError,
+    );
+    const memoryRes = await listResourcesSafe(
+      () => memoryClient,
+      "memory",
+      memoryCursor,
+      recoverRemoteClientsAfterSessionError,
+    );
+    const resources = dedupeResources([
+      ...indexerRes.resources,
+      ...memoryRes.resources,
+    ]);
+    const nextCursorObj = {
+      i: indexerRes.nextCursor || "",
+      m: memoryRes.nextCursor || "",
+    };
+    const nextCursor =
+      nextCursorObj.i || nextCursorObj.m ? encodeCompositeCursor(nextCursorObj) : "";
+    debugLog(`[ctxce] resources/list: returning ${resources.length} resources`);
+    return nextCursor ? { resources, nextCursor } : { resources };
+  });
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async (request) => {
+    await initializeRemoteClients(false);
+    await ensureRemoteDefaults(false);
+    const cursor =
+      request && request.params && typeof request.params.cursor === "string"
+        ? request.params.cursor
+        : null;
+    const decoded = decodeCompositeCursor(cursor);
+    const indexerCursor =
+      decoded && typeof decoded.i === "string" ? decoded.i : cursor;
+    const memoryCursor =
+      decoded && typeof decoded.m === "string" ? decoded.m : cursor;
+    if (cursor && decoded === null) {
+      debugLog("[ctxce] resources/templates/list: received non-composite cursor; forwarding to both upstreams.");
+    }
+    const indexerRes = await listResourceTemplatesSafe(
+      () => indexerClient,
+      "indexer",
+      indexerCursor,
+      recoverRemoteClientsAfterSessionError,
+    );
+    const memoryRes = await listResourceTemplatesSafe(
+      () => memoryClient,
+      "memory",
+      memoryCursor,
+      recoverRemoteClientsAfterSessionError,
+    );
+    const resourceTemplates = dedupeResourceTemplates([
+      ...indexerRes.resourceTemplates,
+      ...memoryRes.resourceTemplates,
+    ]);
+    const nextCursorObj = {
+      i: indexerRes.nextCursor || "",
+      m: memoryRes.nextCursor || "",
+    };
+    const nextCursor =
+      nextCursorObj.i || nextCursorObj.m ? encodeCompositeCursor(nextCursorObj) : "";
+    debugLog(`[ctxce] resources/templates/list: returning ${resourceTemplates.length} templates`);
+    return nextCursor ? { resourceTemplates, nextCursor } : { resourceTemplates };
+  });
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    await refreshSessionAndSyncDefaults();
+    const params = request.params || {};
+    const timeoutMs = getBridgeToolTimeoutMs();
+    const uri =
+      params && typeof params.uri === "string" ? params.uri : "<missing-uri>";
+    debugLog(`[ctxce] resources/read: ${uri}`);
+
+    const tryRead = async (client, label) => {
+      if (!client) {
+        return null;
+      }
+      try {
+        return await client.readResource(params, { timeout: timeoutMs });
+      } catch (err) {
+        debugLog(`[ctxce] resources/read failed on ${label}: ` + String(err));
+        return null;
+      }
+    };
+
+    const indexerResult = await tryRead(indexerClient, "indexer");
+    if (indexerResult) {
+      return indexerResult;
+    }
+    const memoryResult = await tryRead(memoryClient, "memory");
+    if (memoryResult) {
+      return memoryResult;
+    }
+    throw new Error(`Resource ${uri} not available on any configured MCP server`);
   });
 
   // tools/call → proxied to indexer or memory server
@@ -701,16 +1102,8 @@ async function createBridgeServer(options) {
 
     debugLog(`[ctxce] tools/call: ${name || "<no-name>"}`);
 
-    // Refresh session before each call; re-init clients if session changes.
-    const freshSession = resolveSessionId() || sessionId;
-    if (freshSession && freshSession !== sessionId) {
-      sessionId = freshSession;
-      try {
-        await initializeRemoteClients(true);
-      } catch (err) {
-        debugLog("[ctxce] Failed to reinitialize clients after session refresh: " + String(err));
-      }
-    }
+    await refreshSessionAndSyncDefaults();
+
     if (sessionId && (args === undefined || args === null || typeof args === "object")) {
       const obj = args && typeof args === "object" ? { ...args } : {};
       if (!Object.prototype.hasOwnProperty.call(obj, "session")) {
@@ -732,8 +1125,6 @@ async function createBridgeServer(options) {
       }
       return indexerResult;
     }
-
-    await initializeRemoteClients(false);
 
     const timeoutMs = getBridgeToolTimeoutMs();
     const maxAttempts = getBridgeRetryAttempts();
@@ -770,6 +1161,7 @@ async function createBridgeServer(options) {
             String(err),
           );
           await initializeRemoteClients(true);
+          await ensureRemoteDefaults(true);
           sessionRetried = true;
           continue;
         }
@@ -843,6 +1235,13 @@ export async function runHttpMcpServer(options) {
     typeof options.port === "number"
       ? options.port
       : Number.parseInt(process.env.CTXCE_HTTP_PORT || "30810", 10) || 30810;
+  // TODO(auth): replace this boolean toggle with explicit auth modes (none|required).
+  // In required mode, enforce Bearer auth on /mcp with consistent 401 challenges and
+  // only advertise OAuth metadata/endpoints when authentication is mandatory.
+  // In local/dev mode, leaving OAuth discovery off avoids clients entering an
+  // unnecessary OAuth path for otherwise unauthenticated bridge usage.
+  const oauthEnabled = String(process.env.CTXCE_ENABLE_OAUTH || "").trim().toLowerCase();
+  const oauthEndpointsEnabled = oauthEnabled === "1" || oauthEnabled === "true" || oauthEnabled === "yes";
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -865,34 +1264,36 @@ export async function runHttpMcpServer(options) {
       // OAuth 2.0 Endpoints (RFC9728 Protected Resource Metadata + RFC7591)
       // ================================================================
 
-      // OAuth metadata endpoint (RFC9728)
-      if (parsedUrl.pathname === "/.well-known/oauth-authorization-server") {
-        oauthHandler.handleOAuthMetadata(req, res, issuerUrl);
-        return;
-      }
+      if (oauthEndpointsEnabled) {
+        // OAuth metadata endpoint (RFC9728)
+        if (parsedUrl.pathname === "/.well-known/oauth-authorization-server") {
+          oauthHandler.handleOAuthMetadata(req, res, issuerUrl);
+          return;
+        }
 
-      // OAuth Dynamic Client Registration endpoint (RFC7591)
-      if (parsedUrl.pathname === "/oauth/register" && req.method === "POST") {
-        oauthHandler.handleOAuthRegister(req, res);
-        return;
-      }
+        // OAuth Dynamic Client Registration endpoint (RFC7591)
+        if (parsedUrl.pathname === "/oauth/register" && req.method === "POST") {
+          oauthHandler.handleOAuthRegister(req, res);
+          return;
+        }
 
-      // OAuth authorize endpoint
-      if (parsedUrl.pathname === "/oauth/authorize") {
-        oauthHandler.handleOAuthAuthorize(req, res, parsedUrl.searchParams);
-        return;
-      }
+        // OAuth authorize endpoint
+        if (parsedUrl.pathname === "/oauth/authorize") {
+          oauthHandler.handleOAuthAuthorize(req, res, parsedUrl.searchParams);
+          return;
+        }
 
-      // Store session endpoint (helper for login page)
-      if (parsedUrl.pathname === "/oauth/store-session" && req.method === "POST") {
-        oauthHandler.handleOAuthStoreSession(req, res);
-        return;
-      }
+        // Store session endpoint (helper for login page)
+        if (parsedUrl.pathname === "/oauth/store-session" && req.method === "POST") {
+          oauthHandler.handleOAuthStoreSession(req, res);
+          return;
+        }
 
-      // OAuth token endpoint
-      if (parsedUrl.pathname === "/oauth/token" && req.method === "POST") {
-        oauthHandler.handleOAuthToken(req, res);
-        return;
+        // OAuth token endpoint
+        if (parsedUrl.pathname === "/oauth/token" && req.method === "POST") {
+          oauthHandler.handleOAuthToken(req, res);
+          return;
+        }
       }
 
       // ================================================================
@@ -1058,4 +1459,3 @@ function detectRepoName(workspace, config) {
   const leaf = workspace ? path.basename(workspace) : "";
   return leaf && SLUGGED_REPO_RE.test(leaf) ? leaf : null;
 }
-

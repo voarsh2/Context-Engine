@@ -13,9 +13,7 @@ import json
 import tempfile
 from pathlib import Path
 
-# Ensure project root is in path
 ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT))
 
 from scripts.benchmarks.common import (
     get_env_snapshot,

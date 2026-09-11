@@ -9,7 +9,7 @@ This document provides comprehensive API documentation for all MCP (Model Contex
 **On this page:**
 - [Overview](#overview)
 - [Memory Server API](#memory-server-api) - `memory_store()`, `memory_find()`
-- [Indexer Server API](#indexer-server-api) - `repo_search()`, `context_search()`, `context_answer()`, `info_request()`, etc.
+- [Indexer Server API](#indexer-server-api) - `repo_search()`, `context_search()`, `context_answer()`, etc.
 - [Response Schemas](#response-schemas)
 - [Error Handling](#error-handling)
 
@@ -153,7 +153,7 @@ Search stored memories using hybrid retrieval (semantic + lexical search).
 
 ### repo_search()
 
-Perform hybrid code search combining dense semantic, lexical BM25, and optional neural reranking.
+Perform code search using the configured retrieval mode. Dense semantic search can be used on its own, or combined with lexical fusion and optional neural reranking when those features are enabled.
 
 **Core Parameters:**
 - `query` (str or list[str], required): Search query or list of queries for query fusion
@@ -172,6 +172,10 @@ Perform hybrid code search combining dense semantic, lexical BM25, and optional 
 - `path_glob` (str or list[str], optional): Glob patterns for path filtering
 - `under` (str, optional): Limit search to specific directory path
 - `not_glob` (str or list[str], optional): Exclude paths matching these patterns
+- `profile` (str, optional): Apply a focused path profile before search:
+  - `"tests"`: Prefer common test file paths
+  - `"config"`: Prefer common configuration files
+  - `"code"`: Prefer source-code files
 
 **Code Structure Filters:**
 - `symbol` (str, optional): Search for specific function, class, or variable names
@@ -386,132 +390,6 @@ All `repo_search` parameters supported for context retrieval.
 }
 ```
 
-### info_request()
-
-Simplified codebase retrieval with optional explanation mode. Drop-in replacement for basic codebase retrieval tools with human-readable result descriptions.
-
-**Primary Parameters:**
-- `info_request` (str, required): Natural language description of the code you're looking for
-- `information_request` (str): Alias for `info_request`
-
-**Explanation Mode:**
-- `include_explanation` (bool, default false): Add summary, primary_locations, related_concepts, grouped_results, and confidence metrics
-- `include_relationships` (bool, default false): Add imports_from, calls, related_paths to each result
-
-**Filter Parameters:**
-- `limit` (int): Maximum results (smart defaults: 15 for short queries, 8 for questions, 10 otherwise)
-- `language` (str, optional): Filter by programming language
-- `under` (str, optional): Limit search to specific directory
-- `repo` (str or list[str], optional): Filter by repository name(s)
-- `path_glob` (str or list[str], optional): Glob patterns for file paths
-
-**Snippet Options:**
-- `include_snippet` (bool, default true): Include code snippets
-- `context_lines` (int, default 5): Lines of context around matches
-
-**Returns (basic mode):**
-```json
-{
-  "ok": true,
-  "results": [
-    {
-      "score": 0.85,
-      "path": "/work/src/hooks/useAuth.tsx",
-      "symbol": "useAuth",
-      "start_line": 15,
-      "end_line": 45,
-      "information": "Found 'useAuth' in useAuth.tsx (lines 15-45)",
-      "relevance_score": 0.85,
-      "snippet": "export function useAuth() { ... }"
-    }
-  ],
-  "total": 10,
-  "search_strategy": "hybrid+rerank"
-}
-```
-
-**Returns (with `include_explanation: true`):**
-```json
-{
-  "ok": true,
-  "results": [...],
-  "total": 10,
-  "search_strategy": "hybrid+rerank+lang:typescript",
-  "summary": "Found 10 results related to 'authentication hook' across 5 files",
-  "primary_locations": [
-    "/work/src/hooks/useAuth.tsx",
-    "/work/src/context/AuthContext.tsx"
-  ],
-  "related_concepts": ["auth", "hook", "context", "session", "token"],
-  "grouped_results": {
-    "by_file": {
-      "/work/src/hooks/useAuth.tsx": {
-        "count": 3,
-        "top_symbols": ["useAuth", "AuthProvider", "useSession"]
-      }
-    }
-  },
-  "confidence": {
-    "level": "high",
-    "score": 0.78,
-    "top_score": 0.85,
-    "symbol_matches": 2
-  },
-  "query_understanding": {
-    "intent": "search_for_code",
-    "detected_language": "typescript",
-    "detected_symbols": ["useAuth"],
-    "search_strategy": "hybrid+rerank+lang:typescript"
-  }
-}
-```
-
-**Returns (with `include_relationships: true`):**
-```json
-{
-  "results": [
-    {
-      "information": "Found 'useAuth' in useAuth.tsx (lines 15-45)",
-      "relationships": {
-        "imports_from": ["react", "@/context/AuthContext"],
-        "calls": ["useState", "useContext", "fetchUser"],
-        "symbol_path": "useAuth",
-        "related_paths": ["/work/src/context/AuthContext.tsx"]
-      }
-    }
-  ]
-}
-```
-
-**Smart Limits:**
-- Short queries (1-2 words): 15 results for broader coverage
-- Question queries ("how does", "what is"): 8 results for focused answers
-- Default: 10 results
-
-**Search Strategy Labels:**
-- `hybrid` - Base hybrid search (dense + lexical)
-- `+rerank` - Neural reranker applied
-- `+repo_filtered` - Filtered to specific repo(s)
-- `+lang:python` - Filtered by language
-- `+path_filtered` - Filtered by directory
-
-**Environment Variables:**
-- `INFO_REQUEST_LIMIT=10` - Default result limit
-- `INFO_REQUEST_CONTEXT_LINES=5` - Default context lines
-- `INFO_REQUEST_EXPLAIN_DEFAULT=0` - Enable explanation mode by default
-- `INFO_REQUEST_RELATIONSHIPS=0` - Enable relationships by default
-
-**Example:**
-```json
-{
-  "info_request": "authentication middleware",
-  "include_explanation": true,
-  "include_relationships": true,
-  "language": "python",
-  "limit": 5
-}
-```
-
 ### qdrant_index()
 
 Index or reindex code from the mounted workspace.
@@ -700,10 +578,6 @@ Supports three runtime backends via `REFRAG_RUNTIME`:
 On decoder error, falls back to suffix-based expansion with `"decoder_used": "fallback"`.
 If expansion fails entirely, returns `"ok": false` with an error message.
 
-### code_search()
-
-Exact alias of `repo_search()` for discoverability. Same parameters and return shape.
-
 ### qdrant_index_root()
 
 Index the entire workspace root (`/work`).
@@ -713,75 +587,6 @@ Index the entire workspace root (`/work`).
 - `collection` (str, optional): Target collection name
 
 **Returns:** Subprocess result with indexing status.
-
-### search_tests_for()
-
-Find test files related to a query. Presets common test file globs.
-
-**Parameters:**
-- `query` (str or list[str], required): Search query
-- `limit` (int, optional): Max results
-- `include_snippet` (bool, optional): Include code snippets
-- `language` (str, optional): Filter by language
-
-**Returns:** Same shape as `repo_search()`.
-
-### search_config_for()
-
-Find configuration files related to a query. Presets config file globs (yaml/json/toml/etc).
-
-**Parameters:** Same as `search_tests_for()`.
-
-**Returns:** Same shape as `repo_search()`.
-
-### search_callers_for()
-
-Heuristic search for callers/usages of a symbol.
-
-**Parameters:**
-- `query` (str, required): Symbol name to find callers for
-- `limit` (int, optional): Max results
-- `language` (str, optional): Filter by language
-
-**Returns:** Same shape as `repo_search()`.
-
-### search_importers_for()
-
-Find files likely importing or referencing a module/symbol.
-
-**Parameters:** Same as `search_callers_for()`.
-
-**Returns:** Same shape as `repo_search()`.
-
-### pattern_search()
-
-Find structurally similar code patterns across languages. Requires `PATTERN_VECTORS=1`.
-
-**Parameters:**
-- `query` (str, required): Code snippet OR natural language pattern description
-- `language` (str, default "python"): Language hint for code queries
-- `limit` (int, default 10): Maximum results
-- `min_score` (float, default 0.3): Similarity threshold
-- `include_snippet` (bool): Include code in results
-- `target_languages` (list[str]): Filter target languages
-
-**Response:**
-```json
-{
-  "ok": true,
-  "results": [{"path": "...", "start_line": 45, "score": 0.94, "control_flow_signature": "L2_2_B0_T2_M0__C_TL"}],
-  "total": 5,
-  "query_signature": "L2_2_B0_T2_M0__C_TL",
-  "query_mode": "code"
-}
-```
-
-**Signature format:** `L{loop_depth}_{count}_B{branches}_T{try}_M{match}_{flags}` where flags include `TL` (retry pattern), `BL` (filter pattern).
-
-**Example:**
-```json
-{"query": "for i in range(3): try: fetch() except: sleep(i)", "include_snippet": true}
-```
 
 ### symbol_graph()
 

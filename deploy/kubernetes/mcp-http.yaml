@@ -40,7 +40,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/mcp_memory_server.py
+        - -m
+        - scripts.mcp_memory_server
+        workingDir: /app
         ports:
         - name: http
           containerPort: 8000
@@ -59,6 +61,11 @@ spec:
             configMapKeyRef:
               name: context-engine-config
               key: COLLECTION_NAME
+        - name: MULTI_REPO_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: context-engine-config
+              key: MULTI_REPO_MODE
         - name: EMBEDDING_MODEL
           valueFrom:
             configMapKeyRef:
@@ -227,7 +234,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/mcp_indexer_server.py
+        - -m
+        - scripts.mcp_indexer_server
+        workingDir: /app
         ports:
         - name: http
           containerPort: 8001
@@ -246,6 +255,11 @@ spec:
             configMapKeyRef:
               name: context-engine-config
               key: COLLECTION_NAME
+        - name: MULTI_REPO_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: context-engine-config
+              key: MULTI_REPO_MODE
         - name: EMBEDDING_MODEL
           valueFrom:
             configMapKeyRef:

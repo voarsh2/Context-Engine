@@ -40,7 +40,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/mcp_indexer_server.py
+        - -m
+        - scripts.mcp_indexer_server
+        workingDir: /app
         ports:
         - name: sse
           containerPort: 8001

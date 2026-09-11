@@ -9,7 +9,7 @@
 
 ## Context-Engine
 
-Open-source, self-improving code search that gets smarter every time you use it.
+Open-source code search engine for AI coding agents — hybrid retrieval with cross-encoder reranking.
 
 <p align="center">
   <img src="useage.png" alt="Context-Engine Usage" width="50%"/>
@@ -60,7 +60,6 @@ HOST_INDEX_PATH=/path/to/your/project docker compose run --rm indexer
 | **Large file chunks** → returns entire files | **Precise spans**: Returns 5-50 line chunks, not whole files |
 | **Lost context** → missing relevant code | **Hybrid search**: Semantic + lexical + cross-encoder reranking |
 | **Cloud dependency** → vendor lock-in | **Local stack**: Docker Compose on your machine |
-| **Static knowledge** → never improves | **Adaptive learning**: Gets smarter with every use |
 | **Tool limits** → only works in specific IDEs | **MCP native**: Works with any MCP-compatible tool |
 
 ---
@@ -72,7 +71,7 @@ HOST_INDEX_PATH=/path/to/your/project docker compose run --rm indexer
 - **Universal compatibility**: Claude Code, Windsurf, Cursor, Cline, etc.
 - **Auto-syncing**: Extension watches for changes and re-indexes automatically
 - **Memory system**: Store team knowledge alongside your code
-- **Optional LLM features**: Local decoder (llama.cpp), cloud integration (GLM, MiniMax), adaptive rerank learning
+- **Optional LLM features**: Local decoder (llama.cpp), cloud integration (GLM, MiniMax)
 
 ### Works With Your Local Files
 No complicated path setup - Context-Engine automatically handles the mapping between your local files and the search index.
@@ -144,10 +143,9 @@ See [docs/vscode-extension.md](docs/vscode-extension.md) for full documentation.
 ## MCP Tools
 
 **Search** (Indexer MCP):
-- `repo_search` — Hybrid code search with filters
+- `repo_search` — Code search with filters and optional profiles
 - `context_search` — Blend code + memory results
 - `context_answer` — LLM-generated answers with citations
-- `search_tests_for`, `search_config_for`, `search_callers_for`
 
 **Memory** (Memory MCP):
 - `store` — Save knowledge with metadata
@@ -190,7 +188,6 @@ flowchart LR
     M[Memory MCP]
     Q[(Qdrant)]
     L[[LLM Decoder]]
-    W[[Learning Worker]]
   end
   V -->|sync| U
   U --> I
@@ -199,8 +196,6 @@ flowchart LR
   I --> Q
   M --> Q
   I -.-> L
-  I -.-> W
-  W -.-> Q
 ```
 
 ---

@@ -87,13 +87,13 @@ class TestUnifiedCache(unittest.TestCase):
         """Test TTL-based expiration."""
         cache = UnifiedCache("test_ttl", max_size=10, eviction_policy=EvictionPolicy.TTL, default_ttl=0.1)
 
-        # Set value with short TTL
-        cache.set("key1", "value1", ttl=0.1)
-        self.assertEqual(cache.get("key1"), "value1")
+        with patch("scripts.cache_manager.time.time") as fake_time:
+            fake_time.return_value = 1000.0
+            cache.set("key1", "value1", ttl=0.1)
+            self.assertEqual(cache.get("key1"), "value1")
 
-        # Wait for expiration
-        time.sleep(0.2)
-        self.assertIsNone(cache.get("key1"))  # Should be expired
+            fake_time.return_value = 1000.2
+            self.assertIsNone(cache.get("key1"))  # Should be expired
 
     def test_cache_statistics(self):
         """Test cache statistics tracking."""
@@ -149,27 +149,29 @@ class TestUnifiedCache(unittest.TestCase):
         """Test the cached decorator."""
         call_count = 0
 
-        @cached("test_decorator", ttl=1.0)
-        def expensive_function(x):
-            nonlocal call_count
-            call_count += 1
-            return x * 2
+        with patch("scripts.cache_manager.time.time") as fake_time:
+            fake_time.return_value = 1000.0
 
-        # First call should compute
-        result1 = expensive_function(5)
-        self.assertEqual(result1, 10)
-        self.assertEqual(call_count, 1)
+            @cached("test_decorator", ttl=1.0)
+            def expensive_function(x):
+                nonlocal call_count
+                call_count += 1
+                return x * 2
 
-        # Second call should use cache
-        result2 = expensive_function(5)
-        self.assertEqual(result2, 10)
-        self.assertEqual(call_count, 1)  # Should not increase
+            # First call should compute
+            result1 = expensive_function(5)
+            self.assertEqual(result1, 10)
+            self.assertEqual(call_count, 1)
 
-        # Wait for expiration and call again
-        time.sleep(1.1)
-        result3 = expensive_function(5)
-        self.assertEqual(result3, 10)
-        self.assertEqual(call_count, 2)  # Should recompute
+            # Second call should use cache
+            result2 = expensive_function(5)
+            self.assertEqual(result2, 10)
+            self.assertEqual(call_count, 1)  # Should not increase
+
+            fake_time.return_value = 1001.1
+            result3 = expensive_function(5)
+            self.assertEqual(result3, 10)
+            self.assertEqual(call_count, 2)  # Should recompute
 
 
 class TestRequestDeduplication(unittest.TestCase):
@@ -304,42 +306,46 @@ class TestRequestDeduplication(unittest.TestCase):
 
         request = {'queries': ['test'], 'limit': 10}
 
-        # First request should be unique
-        is_dup1, fp1 = deduplicator.is_duplicate(request)
-        self.assertFalse(is_dup1)
+        with patch("scripts.deduplication.time.time") as fake_time:
+            fake_time.return_value = 1000.0
 
-        # Wait for expiration
-        time.sleep(0.2)
+            # First request should be unique
+            is_dup1, fp1 = deduplicator.is_duplicate(request)
+            self.assertFalse(is_dup1)
 
-        # Same request should be unique again after expiration
-        is_dup2, fp2 = deduplicator.is_duplicate(request)
-        self.assertFalse(is_dup2)
+            fake_time.return_value = 1000.2
+
+            # Same request should be unique again after expiration
+            is_dup2, fp2 = deduplicator.is_duplicate(request)
+            self.assertFalse(is_dup2)
 
     def test_deduplicate_request_decorator(self):
         """Test the deduplicate_request decorator."""
         call_count = 0
 
-        @deduplicate_request(ttl=1.0)
-        def expensive_search(query):
-            nonlocal call_count
-            call_count += 1
-            return f"search_result_for_{query}"
+        with patch("scripts.deduplication.time.time") as fake_time:
+            fake_time.return_value = 1000.0
 
-        # First call should execute
-        result1 = expensive_search("test")
-        self.assertEqual(result1, "search_result_for_test")
-        self.assertEqual(call_count, 1)
+            @deduplicate_request(ttl=1.0)
+            def expensive_search(query):
+                nonlocal call_count
+                call_count += 1
+                return f"search_result_for_{query}"
 
-        # Second identical call should be deduplicated
-        result2 = expensive_search("test")
-        self.assertIsNone(result2)  # Decorator returns None for duplicates
-        self.assertEqual(call_count, 1)  # Should not increase
+            # First call should execute
+            result1 = expensive_search("test")
+            self.assertEqual(result1, "search_result_for_test")
+            self.assertEqual(call_count, 1)
 
-        # Wait for expiration and call again
-        time.sleep(1.1)
-        result3 = expensive_search("test")
-        self.assertEqual(result3, "search_result_for_test")
-        self.assertEqual(call_count, 2)
+            # Second identical call should be deduplicated
+            result2 = expensive_search("test")
+            self.assertIsNone(result2)  # Decorator returns None for duplicates
+            self.assertEqual(call_count, 1)  # Should not increase
+
+            fake_time.return_value = 1001.1
+            result3 = expensive_search("test")
+            self.assertEqual(result3, "search_result_for_test")
+            self.assertEqual(call_count, 2)
 
 
 class TestCacheIntegration(unittest.TestCase):

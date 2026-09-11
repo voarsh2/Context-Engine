@@ -152,11 +152,9 @@ def _get_micro_defaults() -> tuple[int, int, int, int]:
     """
     micro_enabled = os.environ.get("INDEX_MICRO_CHUNKS", "1").strip().lower() in {"1", "true", "yes", "on"}
 
-    try:
-        from scripts.refrag_glm import detect_glm_runtime
-        is_glm = detect_glm_runtime()
-    except ImportError:
-        is_glm = False
+    from scripts.refrag_glm import detect_glm_runtime
+
+    is_glm = detect_glm_runtime()
 
     if is_glm:
         if micro_enabled:

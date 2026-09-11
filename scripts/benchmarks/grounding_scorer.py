@@ -13,15 +13,12 @@ import asyncio
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 # Load environment variables from .env
 try:
@@ -110,9 +107,9 @@ GROUNDING_TEST_QUERIES = [
         "expected_files": ["hybrid_search.py", "ranking.py"],
     },
     {
-        "query": "What is the purpose of the recursive reranker's latent state z?",
-        "expected_topics": ["latent", "state", "refinement", "TRM", "iteration"],
-        "expected_files": ["rerank_recursive", "core.py"],
+        "query": "How does relevance feedback recall adjacent code?",
+        "expected_topics": ["feedback", "ratings", "graph", "caller", "relevance"],
+        "expected_files": ["relevance_feedback.py", "search.py"],
     },
     {
         "query": "How does context_answer handle insufficient context?",

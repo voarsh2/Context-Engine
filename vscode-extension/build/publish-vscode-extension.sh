@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_SCRIPT="$SCRIPT_DIR/build.sh"
 OUT_DIR="$SCRIPT_DIR/../out"
-BUNDLE_DEPS="${1:-}"
 
 if [[ ! -f "$BUILD_SCRIPT" ]]; then
   echo "Build script not found: $BUILD_SCRIPT" >&2
@@ -18,7 +17,7 @@ fi
 
 export VSCE_STORE="${VSCE_STORE:-file}"
 
-"$BUILD_SCRIPT" "$BUNDLE_DEPS"
+"$BUILD_SCRIPT"
 
 VSIX_PATH=""
 if compgen -G "$OUT_DIR/*.vsix" >/dev/null; then

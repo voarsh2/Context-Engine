@@ -221,68 +221,41 @@ _ANY_DEPTH_EXCLUDE_DIR_NAMES = {
 
 
 # ---------------------------------------------------------------------------
-# Workspace state function imports (optional)
+# Workspace state function imports
 # ---------------------------------------------------------------------------
-# These are imported at module load time for convenience, with fallbacks
-try:
-    from scripts.workspace_state import (
-        is_multi_repo_mode,
-        get_collection_name,
-        logical_repo_reuse_enabled,
-    )
-except ImportError:
-    is_multi_repo_mode = None  # type: ignore
-    get_collection_name = None  # type: ignore
+from scripts.workspace_state import (
+    is_multi_repo_mode,
+    get_collection_name,
+    logical_repo_reuse_enabled,
+    log_activity,
+    get_cached_file_hash,
+    set_cached_file_hash,
+    remove_cached_file,
+    update_indexing_status,
+    update_workspace_state,
+    get_cached_symbols,
+    set_cached_symbols,
+    remove_cached_symbols,
+    compare_symbol_changes,
+    get_cached_pseudo,
+    set_cached_pseudo,
+    update_symbols_with_pseudo,
+    get_workspace_state,
+    get_cached_file_meta,
+    indexing_lock,
+    file_indexing_lock,
+    is_file_locked,
+)
 
-    def logical_repo_reuse_enabled() -> bool:  # type: ignore[no-redef]
-        return False
+def _detect_repo_for_file(path):
+    """Defer watcher routing import to avoid the ingest/watch bootstrap cycle."""
+    from scripts.watch_index_core.routing import _detect_repo_for_file as _impl
 
-# Import watcher's repo detection for surgical fix
-try:
-    from scripts.watch_index_core.routing import _detect_repo_for_file, _get_collection_for_file
-except ImportError:
-    _detect_repo_for_file = None  # type: ignore
-    _get_collection_for_file = None  # type: ignore
+    return _impl(path)
 
-# Import other workspace state functions (optional)
-try:
-    from scripts.workspace_state import (
-        log_activity,
-        get_cached_file_hash,
-        set_cached_file_hash,
-        remove_cached_file,
-        update_indexing_status,
-        update_workspace_state,
-        get_cached_symbols,
-        set_cached_symbols,
-        remove_cached_symbols,
-        compare_symbol_changes,
-        get_cached_pseudo,
-        set_cached_pseudo,
-        update_symbols_with_pseudo,
-        get_workspace_state,
-        get_cached_file_meta,
-        indexing_lock,
-        file_indexing_lock,
-        is_file_locked,
-    )
-except ImportError:
-    # State integration is optional; continue if not available
-    log_activity = None  # type: ignore
-    get_cached_file_hash = None  # type: ignore
-    set_cached_file_hash = None  # type: ignore
-    remove_cached_file = None  # type: ignore
-    update_indexing_status = None  # type: ignore
-    update_workspace_state = None  # type: ignore
-    get_cached_symbols = None  # type: ignore
-    set_cached_symbols = None  # type: ignore
-    remove_cached_symbols = None  # type: ignore
-    get_cached_pseudo = None  # type: ignore
-    set_cached_pseudo = None  # type: ignore
-    update_symbols_with_pseudo = None  # type: ignore
-    compare_symbol_changes = None  # type: ignore
-    get_workspace_state = None  # type: ignore
-    get_cached_file_meta = None  # type: ignore
-    indexing_lock = None  # type: ignore
-    file_indexing_lock = None  # type: ignore
-    is_file_locked = None  # type: ignore
+
+def _get_collection_for_file(path):
+    """Defer watcher routing import to avoid the ingest/watch bootstrap cycle."""
+    from scripts.watch_index_core.routing import _get_collection_for_file as _impl
+
+    return _impl(path)

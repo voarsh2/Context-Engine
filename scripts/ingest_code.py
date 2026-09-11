@@ -24,17 +24,11 @@ This façade:
 from __future__ import annotations
 
 import os
-import sys
 import hashlib
 import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
-
-# Ensure project root is on sys.path when run as a script
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from qdrant_client import QdrantClient, models
 
@@ -203,6 +197,7 @@ from scripts.ingest.qdrant import (
 
 from scripts.ingest.pipeline import (
     _detect_repo_name_from_path,
+    is_text_like_language,
     detect_language,
     build_information,
     pseudo_backfill_tick,
@@ -211,6 +206,15 @@ from scripts.ingest.pipeline import (
     _index_single_file_inner,
     index_repo,
     process_file_with_smart_reindexing,
+)
+
+# ---------------------------------------------------------------------------
+# Graph edges (optional accelerator)
+# ---------------------------------------------------------------------------
+from scripts.ingest.graph_edges import (
+    graph_edges_backfill_tick,
+    delete_edges_by_path as delete_graph_edges_by_path,
+    upsert_file_edges as upsert_graph_edges_for_file,
 )
 # ---------------------------------------------------------------------------
 # Re-exports from ingest/cli.py
@@ -222,11 +226,9 @@ from scripts.ingest.cli import (
 # ---------------------------------------------------------------------------
 # Additional imports for backward compatibility
 # ---------------------------------------------------------------------------
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
+from scripts.embedder import get_embedding_model as _get_embedding_model
+
+_EMBEDDER_FACTORY = True
 
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
@@ -240,11 +242,9 @@ from scripts.utils import sanitize_vector_name as _sanitize_vector_name
 from scripts.utils import lex_hash_vector_text as _lex_hash_vector_text
 from scripts.utils import lex_sparse_vector_text as _lex_sparse_vector_text
 
-try:
-    from scripts.ast_analyzer import get_ast_analyzer, chunk_code_semantically
-    _AST_ANALYZER_AVAILABLE = True
-except ImportError:
-    _AST_ANALYZER_AVAILABLE = False
+from scripts.ast_analyzer import get_ast_analyzer, chunk_code_semantically
+
+_AST_ANALYZER_AVAILABLE = True
 
 try:
     from tqdm import tqdm
@@ -332,12 +332,17 @@ __all__ = [
     "embed_batch",
     # Pipeline
     "_detect_repo_name_from_path",
+    "is_text_like_language",
     "detect_language",
     "build_information",
     "index_single_file",
     "index_repo",
     "process_file_with_smart_reindexing",
     "pseudo_backfill_tick",
+    # Graph edges (optional)
+    "graph_edges_backfill_tick",
+    "delete_graph_edges_by_path",
+    "upsert_graph_edges_for_file",
     # CLI
     "main",
     # Backward compat

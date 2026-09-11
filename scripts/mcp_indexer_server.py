@@ -29,19 +29,8 @@ from __future__ import annotations
 # CRITICAL: OpenLit must be initialized BEFORE any qdrant_client imports
 # to properly instrument vector DB calls. This import must come first!
 # ---------------------------------------------------------------------------
-import os as _os
-import sys as _sys
-_roots_env = _os.environ.get("WORK_ROOTS", "")
-_roots = [p.strip() for p in _roots_env.split(",") if p.strip()] or ["/work", "/app"]
-for _root in _roots:
-    if _root and _root not in _sys.path:
-        _sys.path.insert(0, _root)
+from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
 
-# Now import OpenLit init (before any other scripts imports)
-try:
-    from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
-except ImportError:
-    pass  # OpenLit not available
 import json
 import asyncio
 import re
@@ -68,31 +57,13 @@ import time
 from typing import Any, Dict, Optional, List, Tuple
 
 from pathlib import Path
-import sys
 
-# Import structured logging and error handling (after sys.path setup)
-# Will be imported after sys.path is configured below
-
-import contextlib
-
-# Ensure code roots are on sys.path so absolute imports like 'from scripts.x import y' work
-# when this file is executed directly (sys.path[0] may be /work/scripts).
-# Supports multiple roots via WORK_ROOTS env (comma-separated), defaults to /work and /app.
-_roots_env = os.environ.get("WORK_ROOTS", "")
-_roots = [p.strip() for p in _roots_env.split(",") if p.strip()] or ["/work", "/app"]
-try:
-    for _root in _roots:
-        if _root and _root not in sys.path:
-            sys.path.insert(0, _root)
-except Exception:
-    pass
+import qdrant_client
 
 # Note: OpenLit initialization is handled by early import of scripts.openlit_init
 # at the top of this file (before any qdrant_client imports)
 
-# Session state imported from mcp_workspace shim (-> scripts.mcp.workspace)
-# Must be after sys.path setup
-from scripts.mcp_workspace import (
+from scripts.mcp_impl.workspace import (
     _MEM_COLL_CACHE,
     SESSION_DEFAULTS,
     SESSION_DEFAULTS_BY_SESSION,
@@ -100,31 +71,20 @@ from scripts.mcp_workspace import (
     _SESSION_CTX_LOCK,
 )
 
-# Import structured logging and error handling (after sys.path setup)
-try:
-    from scripts.logger import (
-        get_logger,
-        ContextLogger,
-        RetrievalError,
-        IndexingError,
-        DecoderError,
-        ValidationError,
-        ConfigurationError,
-        safe_int,
-        safe_float,
-        safe_bool,
-    )
+from scripts.logger import (
+    get_logger,
+    ContextLogger,
+    RetrievalError,
+    IndexingError,
+    DecoderError,
+    ValidationError,
+    ConfigurationError,
+    safe_int,
+    safe_float,
+    safe_bool,
+)
 
-    logger = get_logger(__name__)
-except ImportError:
-    # Fallback if logger module not available
-    import logging
-
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
-
-    # Import safe conversion functions from utils (single source of truth)
-    from scripts.mcp_impl.utils import safe_int, safe_float, safe_bool
+logger = get_logger(__name__)
 
 
 from scripts.mcp_auth import (
@@ -135,7 +95,7 @@ from scripts.mcp_auth import (
 # ---------------------------------------------------------------------------
 # Re-exports from extracted modules (backwards compatibility)
 # ---------------------------------------------------------------------------
-from scripts.mcp_utils import (
+from scripts.mcp_impl.utils import (
     _coerce_bool,
     _coerce_int,
     _coerce_str,
@@ -152,7 +112,7 @@ from scripts.mcp_utils import (
     _primary_identifier_from_queries,
 )
 
-from scripts.mcp_toon import (
+from scripts.mcp_impl.toon import (
     _is_toon_output_enabled,
     _should_use_toon,
     _format_results_as_toon,
@@ -162,21 +122,8 @@ from scripts.mcp_toon import (
 # Import implementations from extracted modules
 from scripts.mcp_impl.context_search import _context_search_impl
 from scripts.mcp_impl.query_expand import _expand_query_impl
-from scripts.mcp_impl.search import _repo_search_impl
-from scripts.mcp_impl.info_request import (
-    _extract_symbols_from_query,
-    _extract_related_concepts,
-    _format_information_field,
-    _extract_relationships,
-    _calculate_confidence,
-)
+from scripts.mcp_impl.search import _repo_search_impl, enrich_feedback_rating
 from scripts.mcp_impl.admin_tools import _collection_map_impl
-from scripts.mcp_impl.search_specialized import (
-    _search_tests_for_impl,
-    _search_config_for_impl,
-    _search_callers_for_impl,
-    _search_importers_for_impl,
-)
 from scripts.mcp_impl.search_history import (
     _search_commits_for_impl,
     _change_history_for_path_impl,
@@ -185,31 +132,18 @@ from scripts.mcp_impl.symbol_graph import (
     _symbol_graph_impl,
     _format_symbol_graph_toon,
 )
-from scripts.mcp_impl.pattern_search import _pattern_search_impl
 
 # Global lock to guard temporary env toggles used during ReFRAG retrieval/decoding
 _ENV_LOCK = threading.Lock()
 
 # Shared utilities (lex hashing, snippet highlighter)
-try:
-    from scripts.utils import highlight_snippet as _do_highlight_snippet
-except Exception as e:
-    logger.warning(f"Failed to import rich for syntax highlighting: {e}")
-    _do_highlight_snippet = None  # fallback guarded at call site
+from scripts.utils import highlight_snippet as _do_highlight_snippet
 
 
 # Back-compat shim for tests expecting _highlight_snippet in this module
 # Delegates to scripts.utils.highlight_snippet when available
-try:
-
-    def _highlight_snippet(snippet, tokens):  # type: ignore
-        return (
-            _do_highlight_snippet(snippet, tokens) if _do_highlight_snippet else snippet
-        )
-except Exception:
-
-    def _highlight_snippet(snippet, tokens):  # type: ignore
-        return snippet
+def _highlight_snippet(snippet, tokens):  # type: ignore
+    return _do_highlight_snippet(snippet, tokens)
 
 
 try:
@@ -243,7 +177,7 @@ DEFAULT_COLLECTION = (
 try:
     from scripts.workspace_state import get_collection_name as _ws_get_collection_name  # type: ignore
 
-    if DEFAULT_COLLECTION in {"", "default-collection", "my-collection", "codebase"}:
+    if DEFAULT_COLLECTION in {"", "codebase"}:
         resolved = _ws_get_collection_name(None)
         if resolved:
             DEFAULT_COLLECTION = resolved
@@ -281,15 +215,14 @@ os.environ.setdefault(
 )  # Disable strict identifier requirement
 
 
-# --- TOON functions imported from scripts.mcp_toon ---
+# --- TOON functions imported from scripts.mcp_impl.toon ---
 # (see imports at top of file for backwards compatibility re-exports)
 
-# --- Workspace state functions imported from mcp_workspace shim ---
-from scripts.mcp_workspace import (
+# --- Workspace state functions imported from workspace helper module ---
+from scripts.mcp_impl.workspace import (
     _state_file_path,
     _read_ws_state,
     _default_collection,
-    _work_script,
 )
 
 # Disable DNS rebinding protection - breaks Docker internal networking (Host: mcp:8000)
@@ -299,6 +232,23 @@ _security_settings = (
     else None
 )
 mcp = FastMCP(APP_NAME, transport_security=_security_settings)
+
+# Minimal resource so MCP clients can verify resource wiring.
+@mcp.resource(
+    "resource://context-engine/indexer/info",
+    name="context-engine-indexer-info",
+    title="Context Engine Indexer Info",
+    description="Basic metadata about the running indexer MCP server.",
+    mime_type="application/json",
+)
+def _indexer_info_resource():
+    return {
+        "app": APP_NAME,
+        "host": HOST,
+        "port": PORT,
+        "qdrant_url": QDRANT_URL,
+        "default_collection": DEFAULT_COLLECTION,
+    }
 
 
 # Capture tool registry automatically by wrapping the decorator once
@@ -441,98 +391,26 @@ def _start_readyz_server():
         return False
 
 
-# Import the new subprocess manager
-try:
-    from scripts.subprocess_manager import run_subprocess_async
-except ImportError:
-    # Fallback if subprocess_manager not available
-    logger.warning("subprocess_manager not available, using fallback implementation")
-
-    async def run_subprocess_async(
-        cmd: List[str],
-        timeout: Optional[float] = None,
-        env: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        """Fallback subprocess runner if subprocess_manager is not available."""
-        proc: Optional[asyncio.subprocess.Process] = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            # Default timeout from env if not provided by caller
-            if timeout is None:
-                timeout = MCP_TOOL_TIMEOUT_SECS
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
-                code = proc.returncode
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return {
-                    "ok": False,
-                    "code": -1,
-                    "stdout": "",
-                    "stderr": f"Command timed out after {timeout}s",
-                }
-            stdout = (stdout_b or b"").decode("utf-8", errors="ignore")
-            stderr = (stderr_b or b"").decode("utf-8", errors="ignore")
-
-            def _cap_tail(s: str) -> str:
-                if not s:
-                    return s
-                return (
-                    s
-                    if len(s) <= MAX_LOG_TAIL
-                    else ("...[tail truncated]\n" + s[-MAX_LOG_TAIL:])
-                )
-
-            return {
-                "ok": code == 0,
-                "code": code,
-                "stdout": _cap_tail(stdout),
-                "stderr": _cap_tail(stderr),
-            }
-        except Exception as e:
-            return {"ok": False, "code": -2, "stdout": "", "stderr": str(e)}
-        finally:
-            try:
-                if proc is not None:
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-                    if proc.stderr is not None:
-                        proc.stderr.close()
-                    # Ensure the process is reaped
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
-            except Exception:
-                pass
+from scripts.subprocess_manager import run_subprocess_async
 
 
-# --- Admin tool helpers imported from mcp_admin_tools shim ---
-from scripts.mcp_admin_tools import (
+# --- Admin tool helpers imported from admin helper module ---
+from scripts.mcp_impl.admin_tools import (
     _EMBED_MODEL_CACHE,
     _EMBED_MODEL_LOCKS,
     _run_async,
     _get_embedding_model,
-    _invalidate_router_scratchpad,
     _detect_current_repo,
 )
 
 # Lenient argument normalization to tolerate buggy clients (e.g., JSON-in-kwargs, booleans where strings expected)
-# Note: _maybe_parse_jsonish and other parsing helpers are now imported from scripts.mcp_utils
+# Note: _maybe_parse_jsonish and other parsing helpers are now imported from scripts.mcp_impl.utils
 from typing import Any as _Any, Dict as _Dict
 
 # Extra parsing helpers for quirky clients that send stringified kwargs
 import urllib.parse as _urlparse, ast as _ast
 
-# --- Utility functions imported from scripts.mcp_utils ---
+# --- Utility functions imported from scripts.mcp_impl.utils ---
 # (see imports at top of file for backwards compatibility re-exports:
 #  _parse_kv_string, _coerce_value_string, _to_str_list_relaxed,
 #  _extract_kwargs_payload, _looks_jsonish_string, _coerce_bool,
@@ -588,7 +466,7 @@ async def qdrant_index_root(
             )  # type: ignore
 
             if _ws_is_multi_repo_mode():
-                coll = _ws_get_collection_name("/work") or _default_collection()
+                coll = _default_collection()
             else:
                 coll = _ws_get_collection_name(None) or _default_collection()
         except Exception:
@@ -600,18 +478,12 @@ async def qdrant_index_root(
     env["QDRANT_URL"] = QDRANT_URL
     env["COLLECTION_NAME"] = coll
 
-    cmd = ["python", _work_script("ingest_code.py"), "--root", "/work"]
+    cmd = ["python", "-m", "scripts.ingest_code", "--root", "/work"]
     if recreate:
         cmd.append("--recreate")
 
     res = await _run_async(cmd, env=env)
     ret = {"args": {"root": "/work", "collection": coll, "recreate": recreate}, **res}
-    try:
-        if ret.get("ok") and int(ret.get("code", 1)) == 0:
-            if _invalidate_router_scratchpad("/work"):
-                ret["invalidated_router_scratchpad"] = True
-    except Exception:
-        pass
     return ret
 
 
@@ -630,17 +502,13 @@ async def qdrant_list(kwargs: Any = None) -> Dict[str, Any]:
     - {"collections": [str, ...]} or {"error": "..."}
     """
     try:
-        from qdrant_client import QdrantClient
-
-        client = QdrantClient(
+        client = qdrant_client.QdrantClient(
             url=QDRANT_URL,
             api_key=os.environ.get("QDRANT_API_KEY"),
             timeout=float(os.environ.get("QDRANT_TIMEOUT", "20") or 20),
         )
         cols_info = await asyncio.to_thread(client.get_collections)
         return {"collections": [c.name for c in cols_info.collections]}
-    except ImportError:
-        return {"error": "qdrant_client is not installed in this container"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -759,10 +627,9 @@ async def qdrant_status(
         pass
     coll = collection or _default_collection()
     try:
-        from qdrant_client import QdrantClient
         import datetime as _dt
 
-        client = QdrantClient(
+        client = qdrant_client.QdrantClient(
             url=QDRANT_URL,
             api_key=os.environ.get("QDRANT_API_KEY"),
             timeout=float(os.environ.get("QDRANT_TIMEOUT", "20") or 20),
@@ -909,7 +776,7 @@ async def qdrant_index(
             )  # type: ignore
 
             if _ws_is_multi_repo_mode():
-                coll = _ws_get_collection_name(root) or _default_collection()
+                coll = _default_collection()
             else:
                 coll = _ws_get_collection_name(None) or _default_collection()
         except Exception:
@@ -923,7 +790,8 @@ async def qdrant_index(
 
     cmd = [
         "python",
-        _work_script("ingest_code.py"),
+        "-m",
+        "scripts.ingest_code",
         "--root",
         root,
     ]
@@ -932,12 +800,6 @@ async def qdrant_index(
 
     res = await _run_async(cmd, env=env)
     ret = {"args": {"root": root, "collection": coll, "recreate": recreate}, **res}
-    try:
-        if ret.get("ok") and int(ret.get("code", 1)) == 0:
-            if _invalidate_router_scratchpad("/work"):
-                ret["invalidated_router_scratchpad"] = True
-    except Exception:
-        pass
     return ret
 
 
@@ -1028,7 +890,7 @@ async def qdrant_prune(kwargs: Any = None, **ignored: Any) -> Dict[str, Any]:
     env = os.environ.copy()
     env["PRUNE_ROOT"] = "/work"
 
-    cmd = ["python", _work_script("prune.py")]
+    cmd = ["python", "-m", "scripts.prune"]
     res = await _run_async(cmd, env=env)
     return res
 
@@ -1036,7 +898,7 @@ async def qdrant_prune(kwargs: Any = None, **ignored: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Code signal detection imported from mcp_code_signals shim
 # ---------------------------------------------------------------------------
-from scripts.mcp_code_signals import (
+from scripts.mcp_impl.code_signals import (
     _CODE_INTENT_CACHE,
     _CODE_INTENT_LOCK,
     _CODE_QUERY_ARCHETYPES,
@@ -1068,6 +930,7 @@ async def repo_search(
     collection: Any = None,
     workspace_path: Any = None,
     mode: Any = None,
+    profile: Any = None,
     session: Any = None,
     ctx: Context = None,
     language: Any = None,
@@ -1082,6 +945,7 @@ async def repo_search(
     case: Any = None,
     repo: Any = None,
     compact: Any = None,
+    debug: Any = None,
     output_format: Any = None,
     args: Any = None,
     kwargs: Any = None,
@@ -1098,12 +962,14 @@ async def repo_search(
     - per_path: int (default 2). Max results per file.
     - include_snippet/context_lines: return inline snippets near hits when true.
     - rerank_*: ONNX reranker is ON by default for best relevance; timeouts fall back to hybrid.
+    - profile: Optional useful path profile: tests, config, or code.
+    - debug: bool (default false). Include verbose internal fields (components, rerank_counters, etc).
     - output_format: "json" (default) or "toon" for token-efficient TOON format.
     - collection: str. Target collection; defaults to workspace state or env COLLECTION_NAME.
     - repo: str or list[str]. Filter by repo name(s). Use "*" to search all repos.
 
     Returns:
-    - Dict with keys: results, total, used_rerank, rerank_counters
+    - Dict with keys: results, total, used_rerank, [rerank_counters if debug=true]
     """
     return await _repo_search_impl(
         query=query,
@@ -1120,6 +986,7 @@ async def repo_search(
         collection=collection,
         workspace_path=workspace_path,
         mode=mode,
+        profile=profile,
         session=session,
         ctx=ctx,
         language=language,
@@ -1134,6 +1001,7 @@ async def repo_search(
         case=case,
         repo=repo,
         compact=compact,
+        debug=debug,
         output_format=output_format,
         args=args,
         kwargs=kwargs,
@@ -1195,6 +1063,7 @@ async def repo_search_compat(**arguments) -> Dict[str, Any]:
             "not_": not_value,
             "case": args.get("case"),
             "compact": args.get("compact"),
+            "debug": args.get("debug"),
             "mode": args.get("mode"),
             "repo": args.get("repo"),  # Cross-codebase isolation
             "output_format": args.get("output_format"),  # "json" or "toon"
@@ -1256,138 +1125,8 @@ async def context_answer_compat(arguments: Any = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Specialized search tools - thin wrappers delegating to extracted impls
+# symbol_graph - graph query tool
 # ---------------------------------------------------------------------------
-@mcp.tool()
-async def search_tests_for(
-    query: Any = None,
-    limit: Any = None,
-    include_snippet: Any = None,
-    context_lines: Any = None,
-    under: Any = None,
-    language: Any = None,
-    session: Any = None,
-    compact: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Find test files related to a query.
-
-    What it does:
-    - Presets common test file globs and forwards to repo_search
-    - Accepts extra filters via kwargs (e.g., language, under, case)
-
-    Parameters:
-    - query: str or list[str]; limit; include_snippet/context_lines; under; language; compact
-
-    Returns: repo_search result shape.
-    """
-    return await _search_tests_for_impl(
-        query=query,
-        limit=limit,
-        include_snippet=include_snippet,
-        context_lines=context_lines,
-        under=under,
-        language=language,
-        session=session,
-        compact=compact,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
-@mcp.tool()
-async def search_config_for(
-    query: Any = None,
-    limit: Any = None,
-    include_snippet: Any = None,
-    context_lines: Any = None,
-    under: Any = None,
-    session: Any = None,
-    compact: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Find likely configuration files for a service/query.
-
-    What it does:
-    - Presets config file globs (yaml/json/toml/etc.) and forwards to repo_search
-    - Accepts extra filters via kwargs
-
-    Returns: repo_search result shape.
-    """
-    return await _search_config_for_impl(
-        query=query,
-        limit=limit,
-        include_snippet=include_snippet,
-        context_lines=context_lines,
-        under=under,
-        session=session,
-        compact=compact,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
-@mcp.tool()
-async def search_callers_for(
-    query: Any = None,
-    limit: Any = None,
-    language: Any = None,
-    session: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Heuristic search for callers/usages of a symbol.
-
-    When to use:
-    - You want files that reference/invoke a function/class
-
-    Notes:
-    - Thin wrapper over repo_search today; pass language or path_glob to narrow
-    - Returns repo_search result shape
-    """
-    return await _search_callers_for_impl(
-        query=query,
-        limit=limit,
-        language=language,
-        session=session,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
-@mcp.tool()
-async def search_importers_for(
-    query: Any = None,
-    limit: Any = None,
-    language: Any = None,
-    session: Any = None,
-    kwargs: Any = None,
-    ctx: Context = None,
-) -> Dict[str, Any]:
-    """Find files likely importing or referencing a module/symbol.
-
-    What it does:
-    - Presets code globs across common languages; forwards to repo_search
-    - Accepts additional filters via kwargs (e.g., under, case)
-
-    Returns: repo_search result shape.
-    """
-    return await _search_importers_for_impl(
-        query=query,
-        limit=limit,
-        language=language,
-        session=session,
-        kwargs=kwargs,
-        ctx=ctx,
-        repo_search_fn=repo_search,
-    )
-
-
 @mcp.tool()
 async def symbol_graph(
     symbol: str = None,
@@ -1395,6 +1134,7 @@ async def symbol_graph(
     limit: Any = None,
     language: Any = None,
     under: Any = None,
+    collection: Any = None,
     session: Any = None,
     output_format: Any = None,
     ctx: Context = None,
@@ -1411,7 +1151,8 @@ async def symbol_graph(
     - query_type: str. One of "callers", "definition", "importers".
     - limit: int (default 20). Maximum results to return.
     - language: str (optional). Filter by programming language.
-    - under: str (optional). Filter by path prefix.
+    - under: str (optional). Filter by recursive workspace subtree (e.g., "scripts" -> scripts/**).
+    - collection: str (optional). Target collection; defaults to env/WS collection.
     - output_format: "json" (default) or "toon" for token-efficient format.
 
     Returns:
@@ -1434,6 +1175,7 @@ async def symbol_graph(
         limit=_limit,
         language=str(language).strip() if language else None,
         under=str(under).strip() if under else None,
+        collection=str(collection).strip() if collection else None,
         session=str(session).strip() if session else None,
         ctx=ctx,
     )
@@ -1510,8 +1252,8 @@ async def change_history_for_path(
         search_commits_fn=search_commits_for,
     )
 
-# --- context_answer helpers imported from mcp_context_answer shim ---
-from scripts.mcp_context_answer import (
+# --- context_answer helpers imported from context_answer helper module ---
+from scripts.mcp_impl.context_answer import (
     _cleanup_answer,
     _answer_style_guidance,
     _strip_preamble_labels,
@@ -1617,275 +1359,6 @@ async def context_answer(
         prepare_filters_and_retrieve_fn=_ca_prepare_filters_and_retrieve,
     )
  
-@mcp.tool()
-async def code_search(
-    query: Any = None,
-    limit: Any = None,
-    per_path: Any = None,
-    include_snippet: Any = None,
-    context_lines: Any = None,
-    rerank_enabled: Any = None,
-    rerank_top_n: Any = None,
-    rerank_return_m: Any = None,
-    rerank_timeout_ms: Any = None,
-    highlight_snippet: Any = None,
-    collection: Any = None,
-    language: Any = None,
-    under: Any = None,
-    kind: Any = None,
-    symbol: Any = None,
-    path_regex: Any = None,
-    path_glob: Any = None,
-    not_glob: Any = None,
-    ext: Any = None,
-    not_: Any = None,
-    case: Any = None,
-    session: Any = None,
-    compact: Any = None,
-    kwargs: Any = None,
-) -> Dict[str, Any]:
-    """Exact alias of repo_search (hybrid code search with reranking enabled by default).
-
-    Prefer repo_search; this name exists for discoverability in some IDEs/agents.
-    Same parameters and return shape as repo_search.
-    Reranking (rerank_enabled=true) is ON by default for optimal result quality.
-    """
-    return await repo_search(
-        query=query,
-        limit=limit,
-        per_path=per_path,
-        include_snippet=include_snippet,
-        context_lines=context_lines,
-        rerank_enabled=rerank_enabled,
-        rerank_top_n=rerank_top_n,
-        rerank_return_m=rerank_return_m,
-        rerank_timeout_ms=rerank_timeout_ms,
-        highlight_snippet=highlight_snippet,
-        collection=collection,
-        language=language,
-        under=under,
-        kind=kind,
-        symbol=symbol,
-        path_regex=path_regex,
-        path_glob=path_glob,
-        not_glob=not_glob,
-        ext=ext,
-        not_=not_,
-        case=case,
-        session=session,
-        compact=compact,
-        kwargs=kwargs,
-    )
-
-
-# ---------------------------------------------------------------------------
-# info_request: Simplified codebase retrieval with explanation mode
-# (helpers imported from scripts.mcp_impl.info_request)
-# ---------------------------------------------------------------------------
-@mcp.tool()
-async def info_request(
-    # Primary parameter
-    info_request: str = None,
-    information_request: str = None,  # Alias
-    # Explanation mode
-    include_explanation: bool = None,
-    # Relationship mapping
-    include_relationships: bool = None,
-    # Auth/session (passed through to repo_search)
-    session: str = None,
-    # Optional filters (pass-through to repo_search)
-    limit: int = None,
-    language: str = None,
-    under: str = None,
-    repo: Any = None,
-    path_glob: Any = None,
-    # Additional options
-    include_snippet: bool = None,
-    context_lines: int = None,
-    # Output format
-    output_format: Any = None,  # "json" (default) or "toon" for token-efficient format
-    kwargs: Any = None,
-) -> Dict[str, Any]:
-    """Simplified codebase retrieval with optional explanation mode.
-
-    When to use:
-    - Simple, single-parameter code search with human-readable descriptions
-    - When you want optional explanation mode for richer context
-    - Drop-in replacement for basic codebase retrieval tools
-
-    Key parameters:
-    - info_request: str. Natural language description of the code you're looking for.
-    - information_request: str. Alias for info_request.
-    - include_explanation: bool (default false). Add summary, primary_locations, related_concepts.
-    - include_relationships: bool (default false). Add imports_from, calls, related_paths to results.
-    - limit: int (default 10). Maximum results to return.
-    - language: str. Filter by programming language.
-    - under: str. Limit search to specific directory.
-    - repo: str or list[str]. Filter by repository name(s).
-    - output_format: "json" (default) or "toon" for token-efficient TOON format.
-
-    Returns:
-    - Compact mode (default): results with information field and relevance_score alias
-    - Explanation mode: adds summary, primary_locations, related_concepts, query_understanding
-
-    Example:
-    - {"info_request": "database connection pooling"}
-    - {"info_request": "authentication middleware", "include_explanation": true}
-    """
-    # Resolve query from either parameter
-    query = info_request or information_request
-    if not query or not str(query).strip():
-        return {"ok": False, "error": "info_request parameter is required", "results": []}
-    query = str(query).strip()
-
-    # Resolve defaults from env
-    _default_limit = safe_int(
-        os.environ.get("INFO_REQUEST_LIMIT", "10"), default=10, logger=logger
-    )
-    _default_context = safe_int(
-        os.environ.get("INFO_REQUEST_CONTEXT_LINES", "5"), default=5, logger=logger
-    )
-    _default_explain = str(
-        os.environ.get("INFO_REQUEST_EXPLAIN_DEFAULT", "0")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    _default_relationships = str(
-        os.environ.get("INFO_REQUEST_RELATIONSHIPS", "0")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-
-    # Apply defaults
-    eff_limit = limit if limit is not None else _default_limit
-    eff_context = context_lines if context_lines is not None else _default_context
-    eff_snippet = include_snippet if include_snippet is not None else True
-    eff_explain = include_explanation if include_explanation is not None else _default_explain
-    eff_relationships = include_relationships if include_relationships is not None else _default_relationships
-
-    # Smart limits based on query characteristics (only if user didn't override)
-    if limit is None:
-        query_words = len(query.split())
-        query_lower = query.lower()
-        if query_words <= 2:  # Short query like "auth handler"
-            eff_limit = 15  # More results for broad queries
-        elif "how does" in query_lower or "what is" in query_lower:
-            eff_limit = 8   # Questions need focused results
-
-    # Call repo_search (always JSON - we format TOON ourselves after enhancement)
-    search_result = await repo_search(
-        query=query,
-        limit=eff_limit,
-        per_path=3,  # Better default for info requests
-        session=session,
-        include_snippet=eff_snippet,
-        context_lines=eff_context,
-        language=language,
-        under=under,
-        repo=repo,
-        path_glob=path_glob,
-        output_format="json",  # Always get JSON to iterate results
-        kwargs=kwargs,
-    )
-
-    # Extract results
-    results = search_result.get("results", [])
-    total = search_result.get("total", len(results))
-    used_rerank = search_result.get("used_rerank", False)
-
-    # Enhance each result with information field and optional relationships
-    enhanced_results = []
-    for r in results:
-        enhanced = dict(r)
-        enhanced["information"] = _format_information_field(r)
-        enhanced["relevance_score"] = r.get("score", 0.0)  # Alias
-        # Add relationships if requested
-        if eff_relationships:
-            enhanced["relationships"] = _extract_relationships(r)
-        enhanced_results.append(enhanced)
-
-    # Build better search strategy string
-    strategy_parts = ["hybrid"]
-    if used_rerank:
-        strategy_parts.append("rerank")
-    if repo:
-        strategy_parts.append("repo_filtered")
-    if language:
-        strategy_parts.append(f"lang:{language}")
-    if under:
-        strategy_parts.append("path_filtered")
-    search_strategy = "+".join(strategy_parts)
-
-    # Build response
-    response: Dict[str, Any] = {
-        "ok": True,
-        "results": enhanced_results,
-        "total": total,
-        "search_strategy": search_strategy,
-    }
-
-    # Add explanation if requested
-    if eff_explain:
-        # Primary locations: unique file paths
-        seen_paths = set()
-        primary_locations = []
-        for r in results:
-            p = r.get("path", "")
-            if p and p not in seen_paths:
-                seen_paths.add(p)
-                primary_locations.append(p)
-                if len(primary_locations) >= 5:
-                    break
-
-        # Related concepts
-        related_concepts = _extract_related_concepts(query, results)
-
-        # Detected symbols from query
-        detected_symbols = _extract_symbols_from_query(query)
-
-        # Summary
-        n_files = len(seen_paths)
-        summary = f"Found {total} results related to '{query}' across {n_files} file{'s' if n_files != 1 else ''}"
-
-        # Group results by file
-        files_map: Dict[str, list] = {}
-        for r in enhanced_results:
-            p = r.get("path", "")
-            if p not in files_map:
-                files_map[p] = []
-            files_map[p].append({
-                "symbol": r.get("symbol", ""),
-                "line": r.get("start_line", 0),
-                "score": r.get("score", 0.0),
-            })
-
-        grouped_results = {
-            "by_file": {
-                path: {
-                    "count": len(items),
-                    "top_symbols": [i["symbol"] for i in sorted(items, key=lambda x: -x["score"])[:3] if i["symbol"]],
-                }
-                for path, items in files_map.items()
-            }
-        }
-
-        # Calculate confidence
-        confidence = _calculate_confidence(query, enhanced_results)
-
-        response["summary"] = summary
-        response["primary_locations"] = primary_locations
-        response["related_concepts"] = related_concepts
-        response["grouped_results"] = grouped_results
-        response["confidence"] = confidence
-        response["query_understanding"] = {
-            "intent": "search_for_code",
-            "detected_language": language or None,
-            "detected_symbols": detected_symbols,
-            "search_strategy": search_strategy,
-        }
-
-    # Apply TOON formatting if requested or enabled globally
-    if _should_use_toon(output_format):
-        return _format_results_as_toon(response, compact=False)  # Keep info_request fields
-    return response
-
-
 # ---------------------------------------------------------------------------
 # context_search - thin wrapper delegating to _context_search_impl
 # ---------------------------------------------------------------------------
@@ -2004,80 +1477,140 @@ async def expand_query(
     return await _expand_query_impl(query=query, max_new=max_new, session=session)
 
 
-# ---------------------------------------------------------------------------
-# Pattern Search - Structural code similarity (conditional on PATTERN_VECTORS=1)
-# ---------------------------------------------------------------------------
-_PATTERN_SEARCH_ENABLED = str(os.environ.get("PATTERN_VECTORS", "")).strip().lower() in {
-    "1", "true", "yes", "on"
-}
+@mcp.tool()
+async def rate_search_results(
+    query: str,
+    ratings: list,
+    collection: Optional[str] = None,
+    session: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Provide relevance feedback on search results to improve future rankings.
 
-if _PATTERN_SEARCH_ENABLED:
-    @mcp.tool()
-    async def pattern_search(
-        query: Any = None,
-        language: Any = None,
-        limit: Any = None,
-        min_score: Any = None,
-        include_snippet: Any = None,
-        context_lines: Any = None,
-        target_languages: Any = None,
-        output_format: Any = None,
-        compact: Any = None,
-        aroma_rerank: Any = None,
-        aroma_alpha: Any = None,
-        query_mode: Any = None,
-    ) -> Dict[str, Any]:
-        """Find structurally similar code patterns across all languages.
+    Call this after using repo_search to tell the system which results were useful.
+    The system learns per-collection ranking weights from your feedback.
 
-        Accepts EITHER code examples OR natural language descriptions - auto-detects which.
+    Parameters:
+    - query: str. The original search query these ratings apply to.
+    - ratings: list of {result_id, relevance}. Each entry rates one search result.
+        - result_id: str. The result_id from a repo_search result entry.
+        - relevance: int. 0=not used, 1=glanced/relevant, 2=directly used/excellent match.
+        - target_id, impression_id, path, container_path, symbol, kind, repo, file_hash:
+          optional. Usually omitted; the server fills them from recent repo_search results.
+        - related_symbols: list[str] (optional). Logged for future graph experiments; not used by the current trainer.
+    - collection: str (optional). Target collection; defaults to workspace state.
+    - session: str (optional). Auth session token.
 
-        When to use:
-        - Find code with similar control flow (retry loops, error handling, etc.)
-        - Cross-language pattern matching (Python pattern → Go/Rust/Java matches)
-        - Detect code duplication based on structure, not syntax
-        - Search by pattern description ("retry with backoff", "resource cleanup")
+    Returns:
+    - {ok: true, rated: N} on success
+    - {ok: false, error: "..."} on failure
 
-        Key parameters:
-        - query: str. Code snippet OR natural language description of pattern.
-        - query_mode: str. "code", "description", or "auto" (default). Explicit override for detection.
-        - language: str. Language hint for code examples (also triggers code mode in auto).
-        - limit: int (default 10). Maximum results to return.
-        - min_score: float (default 0.3). Minimum similarity score threshold.
-        - include_snippet: bool (default false). Include code snippets in results.
-        - target_languages: list[str]. Filter to specific target languages.
-        - output_format: "json" (default) or "toon" for token-efficient format.
-        - compact: bool. If true with TOON, use minimal fields.
-        - aroma_rerank: bool (default true). Enable AROMA-style pruning and reranking.
-        - aroma_alpha: float (default 0.6). Weight for pruned similarity vs original score.
-
-        Returns:
-        - {ok, results: [{path, start_line, end_line, score, language, ...}], total, query_signature}
-
-        Examples:
-        - pattern_search(query="for i in range(3): try: ... except: time.sleep(2**i)")
-        - pattern_search(query="retry with exponential backoff", query_mode="description")
-        - pattern_search(query="if err != nil { return err }", language="go")
-        """
-        return await _pattern_search_impl(
-            query=query,
-            language=language,
-            limit=limit,
-            min_score=min_score,
-            include_snippet=include_snippet,
-            context_lines=context_lines,
-            hybrid=None,
-            semantic_weight=None,
-            collection=None,
-            target_languages=target_languages,
-            output_format=output_format,
-            compact=compact,
-            aroma_rerank=aroma_rerank,
-            aroma_alpha=aroma_alpha,
-            query_mode=query_mode,
-            coerce_bool_fn=_coerce_bool,
-            coerce_int_fn=_coerce_int,
-            coerce_float_fn=lambda v, d: safe_float(v, default=d, logger=logger, context="pattern_search"),
+    Example:
+        repo_search returns result_id "abc123"
+        rate_search_results(
+            query="process events",
+            ratings=[{
+                "result_id": "abc123",
+                "relevance": 2
+            }]
         )
+        → rates abc123 at 2 for this collection's future searches.
+    """
+    import json as _json
+    import time as _time
+
+    sess = _require_auth_session(session)
+
+    if not query or not str(query).strip():
+        return {"ok": False, "error": "query is required"}
+
+    if not ratings or not isinstance(ratings, list):
+        return {"ok": False, "error": "ratings must be a non-empty list"}
+
+    try:
+        _c = (collection or "").strip()
+    except Exception:
+        _c = ""
+    if _c:
+        coll = _c
+    else:
+        try:
+            from scripts.workspace_state import (
+                get_collection_name as _ws_get_collection_name,
+                is_multi_repo_mode as _ws_is_multi_repo_mode,
+            )
+            if _ws_is_multi_repo_mode():
+                coll = _default_collection()
+            else:
+                coll = _ws_get_collection_name(None) or _default_collection()
+        except Exception:
+            coll = _default_collection()
+
+    _require_collection_access((sess or {}).get("user_id") if sess else None, coll, "write")
+
+    validated_ratings = []
+    for r in ratings:
+        if not isinstance(r, dict):
+            continue
+        r = enrich_feedback_rating(r, coll)
+        result_id = str(r.get("result_id", "")).strip()
+        relevance = r.get("relevance")
+        if not result_id or relevance is None:
+            continue
+        try:
+            relevance = int(relevance)
+        except (ValueError, TypeError):
+            continue
+        if relevance not in (0, 1, 2):
+            continue
+        entry = {"result_id": result_id, "relevance": relevance}
+        for key in (
+            "target_id",
+            "impression_id",
+            "path",
+            "host_path",
+            "container_path",
+            "symbol",
+            "kind",
+            "repo",
+            "file_hash",
+            "symbol_content_hash",
+        ):
+            val = r.get(key)
+            if val is not None and str(val).strip():
+                entry[key] = str(val).strip()
+        related = r.get("related_symbols")
+        if isinstance(related, list) and len(related) > 0:
+            entry["related_symbols"] = [str(s) for s in related[:10]]
+        validated_ratings.append(entry)
+
+    if not validated_ratings:
+        return {"ok": False, "error": "no valid ratings provided"}
+
+    try:
+        from scripts.rerank_tools.events import _ensure_events_dir, append_event_line
+        from datetime import datetime as _datetime
+
+        events_dir = _ensure_events_dir()
+        safe_coll = "".join(c if c.isalnum() or c in "-_" else "_" for c in coll)
+        hour_suffix = _datetime.now(tz=None).strftime("%Y%m%d%H")
+        events_file = events_dir / f"events_{safe_coll}_{hour_suffix}.ndjson"
+
+        event = {
+            "ts": _time.time(),
+            "type": "relevance_feedback",
+            "query": str(query).strip(),
+            "collection": coll,
+            "ratings": validated_ratings,
+            "source": "mcp_tool",
+        }
+        if sess:
+            event["session_user"] = (sess or {}).get("user_id", "anonymous")
+
+        append_event_line(events_file, _json.dumps(event))
+
+        return {"ok": True, "rated": len(validated_ratings), "collection": coll}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to log feedback: {e}"}
 
 
 _relax_var_kwarg_defaults()
@@ -2102,7 +1635,6 @@ if __name__ == "__main__":
     logger.info(f"  Embedding Model: {os.environ.get('EMBEDDING_MODEL', 'BAAI/bge-base-en-v1.5')}")
     logger.info(f"  Embedding Provider: {os.environ.get('EMBEDDING_PROVIDER', 'fastembed')}")
     logger.info(f"  ReFRAG Decoder: {os.environ.get('REFRAG_DECODER', '1')}")
-    logger.info(f"  Rerank Learning: {os.environ.get('RERANK_LEARNING', '1')}")
     logger.info(f"  Semantic Chunks: {os.environ.get('INDEX_SEMANTIC_CHUNKS', '1')}")
     logger.info(f"  Micro Chunks: {os.environ.get('INDEX_MICRO_CHUNKS', '1')}")
     logger.info(f"  Micro Chunk Tokens: {os.environ.get('MICRO_CHUNK_TOKENS', '128')}")
@@ -2118,7 +1650,7 @@ if __name__ == "__main__":
     logger.info(f"  Reranker Enabled: {os.environ.get('RERANKER_ENABLED', '0')}")
     logger.info(f"  Rerank Top N: {os.environ.get('RERANK_TOP_N', '20')}")
     logger.info(f"  Rerank Timeout MS: {os.environ.get('RERANK_TIMEOUT_MS', '500')}")
-    logger.info(f"  Pattern Search: {'enabled' if _PATTERN_SEARCH_ENABLED else 'disabled (set PATTERN_VECTORS=1)'}")
+    logger.info(f"  TOON Enabled: {os.environ.get('TOON_ENABLED', '0')}")
     logger.info("=" * 60)
 
     # Optional warmups: gated by env flags to avoid delaying readiness on fresh containers
@@ -2153,7 +1685,7 @@ if __name__ == "__main__":
                 "on",
             }:
                 try:
-                    from scripts.rerank_local import _get_rerank_session  # type: ignore
+                    from scripts.rerank_tools.local import _get_rerank_session  # type: ignore
 
                     _ = _get_rerank_session()
                 except Exception:
@@ -2165,7 +1697,8 @@ if __name__ == "__main__":
                 _env["COLLECTION_NAME"] = _default_collection()
                 _cmd = [
                     "python",
-                    "/work/scripts/rerank_local.py",
+                    "-m",
+                    "scripts.rerank_tools.local",
                     "--query",
                     "warmup",
                     "--topk",

@@ -1,4 +1,6 @@
 import importlib
+import sys
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,11 +23,6 @@ def test_env_gate_blocks_delete_endpoint(monkeypatch):
         return Response(content=f"{title}: {message}", status_code=status_code)
 
     monkeypatch.setattr(srv, "render_admin_error", _fake_render_admin_error)
-
-    def _should_not_be_called(**_kwargs):
-        raise AssertionError("delete_collection_everywhere should not be called when env gate is off")
-
-    monkeypatch.setattr(srv, "delete_collection_everywhere", _should_not_be_called)
 
     client = TestClient(srv.app)
     resp = client.post("/admin/collections/delete", data={"collection": "c1", "delete_fs": ""})
@@ -50,6 +47,72 @@ def test_admin_role_gate_blocks_non_admin(monkeypatch):
     resp = client.post("/admin/collections/delete", data={"collection": "c1"})
     assert resp.status_code == 403
     assert resp.json().get("detail") == "Admin required"
+
+
+@pytest.mark.unit
+def test_delete_redirect_includes_graph_deleted_param(monkeypatch):
+    monkeypatch.setenv("CTXCE_AUTH_ENABLED", "1")
+    monkeypatch.setenv("CTXCE_ADMIN_COLLECTION_DELETE_ENABLED", "1")
+
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+
+    monkeypatch.setattr(srv, "_require_admin_session", lambda _req: {"user_id": "admin"})
+
+    def _fake_delete_collection_everywhere(**_kwargs):
+        return {"qdrant_deleted": True, "qdrant_graph_deleted": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.collection_admin",
+        types.SimpleNamespace(delete_collection_everywhere=_fake_delete_collection_everywhere),
+    )
+
+    client = TestClient(srv.app)
+    resp = client.post("/admin/collections/delete", data={"collection": "c1", "delete_fs": ""}, follow_redirects=False)
+    assert resp.status_code == 302
+    loc = resp.headers.get("location") or ""
+    assert "deleted=c1" in loc
+    assert "graph_deleted=1" in loc
+
+
+@pytest.mark.unit
+def test_clear_journal_endpoint_clears_mapped_collection(monkeypatch):
+    monkeypatch.setenv("CTXCE_AUTH_ENABLED", "1")
+
+    srv = importlib.import_module("scripts.upload_service")
+    srv = importlib.reload(srv)
+
+    calls = {}
+    monkeypatch.setattr(srv, "_require_admin_session", lambda _req: {"user_id": "admin"})
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.indexing_admin",
+        types.SimpleNamespace(
+            resolve_collection_root=lambda **_kwargs: (
+                "/work/repo-1234567890abcdef",
+                "repo-1234567890abcdef",
+            )
+        ),
+    )
+
+    def _clear_index_journal_entries(**kwargs):
+        calls.update(kwargs)
+        return 3
+
+    monkeypatch.setattr(srv, "clear_index_journal_entries", _clear_index_journal_entries)
+
+    client = TestClient(srv.app)
+    resp = client.post("/admin/collections/clear-journal", data={"collection": "c1"}, follow_redirects=False)
+
+    assert resp.status_code == 302
+    loc = resp.headers.get("location") or ""
+    assert "journal_cleared=c1" in loc
+    assert "journal_removed=3" in loc
+    assert calls == {
+        "workspace_path": "/work/repo-1234567890abcdef",
+        "repo_name": "repo-1234567890abcdef",
+    }
 
 
 @pytest.mark.unit

@@ -9,6 +9,7 @@ This module provides functionality to track workspace-specific state including:
 - Multi-repo support with per-repo state files
 """
 import json
+import logging
 import os
 import re
 import uuid
@@ -22,6 +23,8 @@ import time
 
 _CANONICAL_SLUG_RE = re.compile(r"^.+-[0-9a-f]{16}$")
 _SLUGGED_REPO_RE = re.compile(r"^.+-[0-9a-f]{16}(?:_old)?$")
+INTERNAL_STATE_TOP_LEVEL_DIRS = frozenset({".codebase", ".git", "__pycache__"})
+logger = logging.getLogger(__name__)
 _managed_slug_cache_lock = threading.Lock()
 _managed_slug_cache: set[str] = set()
 _managed_slug_cache_neg: set[str] = set()
@@ -112,7 +115,7 @@ def _server_managed_slug_from_path(path: Path) -> Optional[str]:
             return None
 
     work_dir = Path(os.environ.get("WORK_DIR") or os.environ.get("WORKDIR") or "/work")
-    marker = work_dir / ".codebase" / "repos" / slug / ".ctxce_managed_upload"
+    marker = work_dir / STATE_DIRNAME / "repos" / slug / ".ctxce_managed_upload"
     try:
         is_managed = marker.exists()
     except OSError:
@@ -134,7 +137,8 @@ ActivityAction = Literal['indexed', 'deleted', 'skipped', 'scan-completed', 'ini
 STATE_DIRNAME = ".codebase"
 STATE_FILENAME = "state.json"
 CACHE_FILENAME = "cache.json"
-PLACEHOLDER_COLLECTION_NAMES = {"", "default-collection", "my-collection"}
+INDEX_JOURNAL_FILENAME = "index_journal.json"
+PLACEHOLDER_COLLECTION_NAMES = {"", "codebase"}
 
 class IndexingProgress(TypedDict, total=False):
     files_processed: int
@@ -184,6 +188,63 @@ class StagingInfo(TypedDict, total=False):
     repo_name: Optional[str]
 
 
+class MaintenanceInfo(TypedDict, total=False):
+    last_empty_dir_sweep_at: Optional[str]
+    last_consistency_audit_at: Optional[str]
+    last_consistency_audit_summary: Optional[Dict[str, Any]]
+
+
+class IndexJournalRecord(TypedDict, total=False):
+    path: str
+    op_type: str
+    content_hash: Optional[str]
+    status: str
+    attempts: int
+    created_at: str
+    updated_at: str
+    last_error: Optional[str]
+
+
+_INDEX_JOURNAL_STATUSES = frozenset({"pending", "in_progress", "failed", "done"})
+
+
+def _normalize_index_journal_status(value: Any, *, invalid: str = "pending") -> str:
+    status = str(value or "pending").strip().lower()
+    return status if status in _INDEX_JOURNAL_STATUSES else invalid
+
+
+def _coerce_index_journal_attempts(
+    value: Any,
+    *,
+    path: Optional[str] = None,
+    warn: bool = False,
+) -> int:
+    try:
+        attempts = int(value or 0)
+    except (ValueError, TypeError):
+        attempts = 0
+        if warn:
+            logger.warning(
+                "workspace_state::invalid_journal_attempts",
+                extra={"attempts": value, "path": path or ""},
+            )
+    return max(0, attempts)
+
+
+def _index_journal_retry_delay_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("INDEX_JOURNAL_RETRY_DELAY_SECS", "5") or 5))
+    except Exception:
+        return 5.0
+
+
+def _index_journal_max_attempts() -> int:
+    try:
+        return max(0, int(os.environ.get("INDEX_JOURNAL_MAX_ATTEMPTS", "0") or 0))
+    except Exception:
+        return 0
+
+
 class WorkspaceState(TypedDict, total=False):
     created_at: str
     updated_at: str
@@ -204,6 +265,7 @@ class WorkspaceState(TypedDict, total=False):
     active_repo_slug: Optional[str]
     serving_repo_slug: Optional[str]
     staging: Optional[StagingInfo]
+    maintenance: Optional[MaintenanceInfo]
 
 def is_multi_repo_mode() -> bool:
     """Check if multi-repo mode is enabled."""
@@ -226,6 +288,16 @@ def logical_repo_reuse_enabled() -> bool:
         "on",
     }
 
+
+def bindmount_repo_detection_enabled() -> bool:
+    """Allow git-based repo inference for bindmount-style deployments."""
+    return os.environ.get("CTXCE_BINDMOUNT_REPO_DETECTION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 _state_lock = threading.Lock()
 # Track last-used timestamps for cleanup of idle workspace locks
 _state_locks: Dict[str, threading.RLock] = {}
@@ -233,7 +305,26 @@ _state_lock_last_used: Dict[str, float] = {}
 
 def _resolve_workspace_root() -> str:
     """Determine the default workspace root path."""
-    return os.environ.get("WORKSPACE_PATH") or os.environ.get("WATCH_ROOT") or "/work"
+    return (
+        os.environ.get("CTXCE_METADATA_ROOT")
+        or os.environ.get("WORKSPACE_PATH")
+        or os.environ.get("WATCH_ROOT")
+        or "/work"
+    )
+
+
+def _configured_workspace_roots() -> List[Path]:
+    roots: List[Path] = []
+    for key in ("CTXCE_METADATA_ROOT", "WORKSPACE_PATH", "WATCH_ROOT", "WORK_DIR", "WORKDIR"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            roots.append(Path(raw).resolve())
+        except Exception:
+            roots.append(Path(raw))
+    return roots
+
 
 def _resolve_repo_context(
     workspace_path: Optional[str] = None,
@@ -247,13 +338,46 @@ def _resolve_repo_context(
             return resolved_workspace, repo_name
 
         if workspace_path:
-            detected = _detect_repo_name_from_path(Path(workspace_path))
-            if detected:
-                return resolved_workspace, detected
+            try:
+                requested = Path(workspace_path).resolve()
+                workspace_root = Path(_resolve_workspace_root()).resolve()
+            except Exception:
+                requested = Path(workspace_path)
+                workspace_root = Path(_resolve_workspace_root())
+            if requested != workspace_root:
+                if any(requested == root for root in _configured_workspace_roots()):
+                    return resolved_workspace, None
+                detected = _detect_repo_name_from_path(requested)
+                if detected:
+                    return resolved_workspace, detected
 
         return resolved_workspace, None
 
     return resolved_workspace, repo_name
+
+
+def _get_repo_workspace_dir(
+    repo_name: str,
+    workspace_path: Optional[str] = None,
+) -> Path:
+    try:
+        base_dir = Path(workspace_path or _resolve_workspace_root()).resolve()
+    except Exception:
+        base_dir = Path(workspace_path or _resolve_workspace_root()).absolute()
+    if base_dir.name == repo_name:
+        return base_dir
+    host_index_path = (os.environ.get("HOST_INDEX_PATH") or "").strip()
+    if host_index_path:
+        host_index_root = Path(host_index_path)
+        if not host_index_root.is_absolute():
+            host_index_root = base_dir / host_index_root
+        candidate = host_index_root.resolve() / repo_name
+        if candidate.exists() or (candidate / STATE_DIRNAME).exists():
+            return candidate
+    dev_workspace_candidate = base_dir / "dev-workspace" / repo_name
+    if dev_workspace_candidate.exists() or (dev_workspace_candidate / STATE_DIRNAME).exists():
+        return dev_workspace_candidate
+    return base_dir / repo_name
 
 def _get_state_lock(workspace_path: Optional[str] = None, repo_name: Optional[str] = None) -> threading.RLock:
     """Get or create a lock for the workspace or repo state and track usage."""
@@ -268,12 +392,51 @@ def _get_state_lock(workspace_path: Optional[str] = None, repo_name: Optional[st
         _state_lock_last_used[key] = time.time()
         return _state_locks[key]
 
-def _get_repo_state_dir(repo_name: str) -> Path:
+def _get_repo_state_dir(
+    repo_name: str,
+    workspace_path: Optional[str] = None,
+) -> Path:
     """Get the state directory for a repository."""
-    base_dir = Path(os.environ.get("WORKSPACE_PATH") or os.environ.get("WATCH_ROOT") or "/work")
+    workspace_root = Path(_resolve_workspace_root()).resolve()
+    base_dir = Path(workspace_path or str(workspace_root)).resolve()
+    global_repo_state_dir = workspace_root / STATE_DIRNAME / "repos" / repo_name
     if is_multi_repo_mode():
-        return base_dir / STATE_DIRNAME / "repos" / repo_name
+        # Canonical multi-repo metadata layout is shared under workspace root.
+        return global_repo_state_dir
     return base_dir / STATE_DIRNAME
+
+
+def _is_repo_local_metadata_path(path: Path) -> bool:
+    try:
+        parts = path.resolve().parts
+    except Exception:
+        parts = path.parts
+    try:
+        idx = parts.index(STATE_DIRNAME)
+    except ValueError:
+        return False
+    if idx > 0 and _SLUGGED_REPO_RE.match(parts[idx - 1] or ""):
+        return True
+    if "repos" in parts:
+        ridx = parts.index("repos")
+        if ridx + 1 < len(parts) and _SLUGGED_REPO_RE.match(parts[ridx + 1] or ""):
+            return True
+    return False
+
+
+def _apply_runtime_metadata_mode(path: Path) -> None:
+    try:
+        is_dir = path.is_dir()
+    except Exception:
+        is_dir = False
+    if _is_repo_local_metadata_path(path):
+        mode = 0o777 if is_dir else 0o666
+    else:
+        mode = 0o775 if is_dir else 0o664
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
 
 def _get_state_path(workspace_path: str) -> Path:
     """Get the path to the state.json file for a workspace."""
@@ -592,15 +755,13 @@ def _git_remote_repo_name(repo_path: Path) -> Optional[str]:
 
 
 def _detect_repo_name_from_path(path: Path) -> str:
-    """Detect repository name from path using git remote origin URL.
+    """Detect repository name from managed upload/workspace path structure.
 
-    This ensures consistency with how the MCP server detects repos during search.
     Priority:
-    1. Fast-path for server-managed uploads and workspace-relative paths
-    2. Git remote origin URL (canonical repo name like 'Context-Engine')
-    3. Git toplevel directory name (folder name like 'Context-Engine-hash')
-    4. Walk up to find .git and return that folder name
-    5. Return parent folder name as fallback
+    1. Server-managed upload slug markers
+    2. Workspace-relative first path segment
+    3. Bindmount git inference when CTXCE_BINDMOUNT_REPO_DETECTION=1
+    4. Structure/name fallback
     """
     slug = _server_managed_slug_from_path(path)
     if slug:
@@ -623,29 +784,29 @@ def _detect_repo_name_from_path(path: Path) -> str:
         rel = resolved.relative_to(ws_root)
         if rel.parts:
             candidate = rel.parts[0]
-            if candidate not in {".codebase", ".git", "__pycache__"}:
+            if candidate not in INTERNAL_STATE_TOP_LEVEL_DIRS:
                 return candidate
     except Exception:
         pass
 
-    try:
-        base = path if path.is_dir() else path.parent
-        git_name = _git_remote_repo_name(base)
-        if git_name:
-            return git_name
-    except Exception:
-        pass
-    try:
-        # Walk up to find .git
-        cur = path if path.is_dir() else path.parent
-        for p in [cur] + list(cur.parents):
-            try:
-                if (p / ".git").exists():
-                    return p.name
-            except Exception:
-                continue
-    except Exception:
-        pass
+    if bindmount_repo_detection_enabled():
+        try:
+            base = path if path.is_dir() else path.parent
+            git_name = _git_remote_repo_name(base)
+            if git_name:
+                return git_name
+        except Exception:
+            pass
+        try:
+            cur = path if path.is_dir() else path.parent
+            for p in [cur] + list(cur.parents):
+                try:
+                    if (p / ".git").exists():
+                        return p.name
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     try:
         structure_name = _detect_repo_name_from_path_by_structure(path)
@@ -672,12 +833,7 @@ def _atomic_write_state(state_path: Path, state: WorkspaceState) -> None:
         with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
         temp_path.replace(state_path)
-        # Ensure state/cache files are group-writable so multiple processes
-        # (upload service, watcher, indexer) can update them.
-        try:
-            os.chmod(state_path, 0o664)
-        except PermissionError:
-            pass
+        _apply_runtime_metadata_mode(state_path)
     except Exception:
         # Clean up temp file if something went wrong
         try:
@@ -705,7 +861,7 @@ def get_workspace_state(
         lock_scope_path: Path
 
         if is_multi_repo_mode() and repo_name:
-            state_dir = _get_repo_state_dir(repo_name)
+            state_dir = _get_repo_state_dir(repo_name, workspace_path)
             try:
                 ws_root = Path(_resolve_workspace_root())
                 ws_dir = ws_root / repo_name
@@ -717,12 +873,7 @@ def get_workspace_state(
             except Exception:
                 return {}
             state_dir.mkdir(parents=True, exist_ok=True)
-            # Ensure repo state dir is group-writable so root upload service and
-            # non-root watcher/indexer processes can both write state/cache files.
-            try:
-                os.chmod(state_dir, 0o775)
-            except Exception:
-                pass
+            _apply_runtime_metadata_mode(state_dir)
             state_path = state_dir / STATE_FILENAME
             lock_scope_path = state_dir
         else:
@@ -802,7 +953,7 @@ def update_workspace_state(
             # Allow updates when the repo state dir exists, even if the workspace
             # directory is not present (e.g. dev-remote simulations where only
             # .codebase state is persisted).
-            state_dir = _get_repo_state_dir(repo_name)
+            state_dir = _get_repo_state_dir(repo_name, workspace_path)
             if not (ws_root / repo_name).exists() and not state_dir.exists():
                 return {}
         except Exception:
@@ -823,8 +974,9 @@ def update_workspace_state(
         state["updated_at"] = datetime.now().isoformat()
 
         if is_multi_repo_mode() and repo_name:
-            state_dir = _get_repo_state_dir(repo_name)
+            state_dir = _get_repo_state_dir(repo_name, workspace_path)
             state_dir.mkdir(parents=True, exist_ok=True)
+            _apply_runtime_metadata_mode(state_dir)
             state_path = state_dir / STATE_FILENAME
         else:
             try:
@@ -1245,8 +1397,9 @@ def log_activity(
                 return
         except Exception:
             return
-        state_dir = _get_repo_state_dir(repo_name)
+        state_dir = _get_repo_state_dir(repo_name, workspace_path)
         state_dir.mkdir(parents=True, exist_ok=True)
+        _apply_runtime_metadata_mode(state_dir)
         state_path = state_dir / STATE_FILENAME
         lock_path = state_path.with_suffix(".lock")
 
@@ -1331,6 +1484,37 @@ def _collection_name_for_repo_slug(normalized_repo: str, *, is_old_slug: bool) -
     return None
 
 
+def _coerce_collection_repo_name(repo_name: Optional[str]) -> Optional[str]:
+    if not repo_name:
+        return None
+
+    value = str(repo_name).strip()
+    if not value:
+        return None
+
+    if "/" not in value and "\\" not in value:
+        return value
+
+    try:
+        path = Path(value).resolve()
+    except Exception:
+        path = Path(value)
+
+    try:
+        workspace_root = Path(_resolve_workspace_root()).resolve()
+    except Exception:
+        workspace_root = Path(_resolve_workspace_root())
+
+    try:
+        if path == workspace_root:
+            return None
+    except Exception:
+        pass
+
+    detected = _extract_repo_name_from_path(str(path))
+    return detected or None
+
+
 def get_collection_name(repo_name: Optional[str] = None) -> str:
     """Get collection name for repository or workspace.
 
@@ -1338,7 +1522,7 @@ def get_collection_name(repo_name: Optional[str] = None) -> str:
     1. Explicit COLLECTION_NAME env var - master override when set to a real value
        (if repo_name is an *_old clone, append _old to the override unless already present)
     2. Derive from repo slug (including *_old suffix handling)
-    3. Fallback: "global-collection"
+    3. Fallback: DEFAULT_COLLECTION, COLLECTION_NAME, or "codebase"
 
     This ensures COLLECTION_NAME works as a master override in both local dev
     and container environments, while still allowing deterministic derivation
@@ -1355,6 +1539,7 @@ def get_collection_name(repo_name: Optional[str] = None) -> str:
             pass
         return env_coll
 
+    repo_name = _coerce_collection_repo_name(repo_name)
     normalized = _normalize_repo_name_for_collection(repo_name) if repo_name else None
     is_old_slug = False
     try:
@@ -1369,8 +1554,7 @@ def get_collection_name(repo_name: Optional[str] = None) -> str:
     if derived:
         return derived
 
-    # Default fallback
-    return "global-collection"
+    return os.environ.get("DEFAULT_COLLECTION") or os.environ.get("COLLECTION_NAME") or "codebase"
 
 def _detect_repo_name_from_path_by_structure(path: Path) -> str:
     """Detect repository name from path structure (fallback when git is unavailable)."""
@@ -1405,7 +1589,7 @@ def _detect_repo_name_from_path_by_structure(path: Path) -> str:
             continue
 
         repo_name = rel_path.parts[0]
-        if repo_name in (".codebase", ".git", "__pycache__"):
+        if repo_name in INTERNAL_STATE_TOP_LEVEL_DIRS:
             continue
 
         repo_path = base / repo_name
@@ -1425,7 +1609,8 @@ def _normalize_repo_slug(candidate: Optional[str]) -> Optional[str]:
 def _extract_repo_name_from_path(workspace_path: str) -> str:
     """Extract repository slug or canonical name from workspace path.
 
-    Accepts canonical slugs (repo-hash), `_old` slugs, and falls back to git remote name.
+    Accepts managed upload slugs and workspace-relative repo paths. Git-based
+    bindmount inference is opt-in via CTXCE_BINDMOUNT_REPO_DETECTION=1.
     """
     if not workspace_path:
         return ""
@@ -1440,13 +1625,29 @@ def _extract_repo_name_from_path(workspace_path: str) -> str:
         return slug
 
     try:
-        repo_path = path if path.is_dir() else path.parent
-        if (repo_path / ".git").exists():
-            name = _git_remote_repo_name(repo_path)
-            if name:
-                return name
+        workspace_root = Path(_resolve_workspace_root()).resolve()
+    except Exception:
+        workspace_root = Path(_resolve_workspace_root())
+
+    try:
+        rel = path.relative_to(workspace_root)
+        if not rel.parts:
+            return ""
+        candidate = rel.parts[0]
+        if candidate not in INTERNAL_STATE_TOP_LEVEL_DIRS:
+            return candidate
     except Exception:
         pass
+
+    if bindmount_repo_detection_enabled():
+        try:
+            repo_path = path if path.is_dir() else path.parent
+            if (repo_path / ".git").exists():
+                name = _git_remote_repo_name(repo_path)
+                if name:
+                    return name
+        except Exception:
+            pass
 
     try:
         candidate = _normalize_repo_slug(path.name)
@@ -1575,10 +1776,483 @@ def _write_cache(workspace_path: str, cache: Dict[str, Any]) -> None:
                     pass
 
 
-def get_cached_file_hash(file_path: str, repo_name: Optional[str] = None) -> str:
+def _get_index_journal_path(
+    workspace_path: Optional[str] = None, repo_name: Optional[str] = None
+) -> Path:
+    workspace_path, repo_name = _resolve_repo_context(workspace_path, repo_name)
+    if repo_name:
+        state_dir = _get_repo_state_dir(repo_name, workspace_path)
+    else:
+        state_dir = _get_global_state_dir(workspace_path)
+    return state_dir / INDEX_JOURNAL_FILENAME
+
+
+def _discover_journal_repositories(
+    workspace_path: Optional[str] = None,
+) -> List[tuple[str, Optional[str]]]:
+    """Find repository journals visible from a workspace or metadata root."""
+    root_path = Path(workspace_path or _resolve_workspace_root()).resolve()
+    multi_repo_mode = is_multi_repo_mode()
+    repo_candidates: set[str] = set()
+
+    # A status query should only inspect repositories with an actual journal.
+    # The workspace can contain arbitrary sibling directories and scanning all
+    # of them made the operator-facing status path noisy and unnecessarily slow.
+    try:
+        for repo_root in root_path.iterdir():
+            if not repo_root.is_dir():
+                continue
+            if (repo_root / STATE_DIRNAME / INDEX_JOURNAL_FILENAME).is_file():
+                repo_candidates.add(repo_root.name)
+    except OSError:
+        pass
+
+    state_roots = [root_path / STATE_DIRNAME / "repos"]
+    try:
+        metadata_state_root = (
+            Path(_resolve_workspace_root()).resolve() / STATE_DIRNAME / "repos"
+        )
+        if metadata_state_root != state_roots[0]:
+            state_roots.append(metadata_state_root)
+    except OSError:
+        pass
+
+    for state_root in state_roots:
+        try:
+            if not state_root.exists():
+                continue
+            for state_dir in state_root.iterdir():
+                if state_dir.is_dir() and (
+                    state_dir / INDEX_JOURNAL_FILENAME
+                ).is_file():
+                    repo_candidates.add(state_dir.name)
+        except OSError:
+            continue
+
+    return [
+        (
+            candidate,
+            None if multi_repo_mode else str(root_path / candidate),
+        )
+        for candidate in sorted(repo_candidates)
+    ]
+
+
+def _read_index_journal_file_uncached(journal_path: Path) -> Dict[str, Any]:
+    try:
+        with journal_path.open("r", encoding="utf-8-sig") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            operations = obj.get("operations", {})
+            if isinstance(operations, dict):
+                return obj
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    now = datetime.now().isoformat()
+    return {"version": 1, "operations": {}, "created_at": now, "updated_at": now}
+
+
+def _write_index_journal(
+    workspace_path: Optional[str],
+    repo_name: Optional[str],
+    journal: Dict[str, Any],
+) -> None:
+    workspace_path, repo_name = _resolve_repo_context(workspace_path, repo_name)
+    lock = _get_state_lock(workspace_path, repo_name)
+    with lock:
+        journal_path = _get_index_journal_path(workspace_path, repo_name)
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        _apply_runtime_metadata_mode(journal_path.parent)
+        lock_path = journal_path.with_suffix(journal_path.suffix + ".lock")
+        with _cross_process_lock(lock_path):
+            tmp = journal_path.with_suffix(f".tmp.{uuid.uuid4().hex[:8]}")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(journal, f, ensure_ascii=False, indent=2)
+                tmp.replace(journal_path)
+                _apply_runtime_metadata_mode(journal_path)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def _update_index_journal(
+    workspace_path: Optional[str],
+    repo_name: Optional[str],
+    mutator,
+) -> Dict[str, Any]:
+    workspace_path, repo_name = _resolve_repo_context(workspace_path, repo_name)
+    lock = _get_state_lock(workspace_path, repo_name)
+    with lock:
+        journal_path = _get_index_journal_path(workspace_path, repo_name)
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        _apply_runtime_metadata_mode(journal_path.parent)
+        lock_path = journal_path.with_suffix(journal_path.suffix + ".lock")
+        with _cross_process_lock(lock_path):
+            journal = _read_index_journal_file_uncached(journal_path)
+            mutator(journal)
+            journal["updated_at"] = datetime.now().isoformat()
+            tmp = journal_path.with_suffix(f".tmp.{uuid.uuid4().hex[:8]}")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(journal, f, ensure_ascii=False, indent=2)
+                tmp.replace(journal_path)
+                _apply_runtime_metadata_mode(journal_path)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return journal
+
+
+def upsert_index_journal_entries(
+    entries: List[Dict[str, Any]],
+    *,
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Persist or replace repo-scoped index journal entries keyed by normalized path."""
+    normalized_entries: List[IndexJournalRecord] = []
+    now = datetime.now().isoformat()
+    for entry in entries or []:
+        path = _normalize_cache_key_path(str(entry.get("path") or ""))
+        op_type = str(entry.get("op_type") or "").strip().lower()
+        if not path or op_type not in {"upsert", "delete"}:
+            continue
+        content_hash = str(entry.get("content_hash") or "").strip() or None
+        status = _normalize_index_journal_status(entry.get("status"))
+        attempts = _coerce_index_journal_attempts(entry.get("attempts", 0))
+        last_error = entry.get("last_error")
+        if last_error is not None:
+            last_error = str(last_error)
+        normalized_entries.append(
+            {
+                "path": path,
+                "op_type": op_type,
+                "content_hash": content_hash,
+                "status": status,
+                "attempts": attempts,
+                "created_at": str(entry.get("created_at") or now),
+                "updated_at": str(entry.get("updated_at") or now),
+                "last_error": last_error,
+            }
+        )
+
+    def _mutate(journal: Dict[str, Any]) -> None:
+        ops = journal.setdefault("operations", {})
+        if not isinstance(ops, dict):
+            ops = {}
+            journal["operations"] = ops
+        for entry in normalized_entries:
+            ops[entry["path"]] = entry
+
+    return _update_index_journal(workspace_path, repo_name, _mutate)
+
+
+def clear_index_journal_entries(
+    *,
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Remove all operations from a workspace/repo index journal."""
+    removed = 0
+
+    def _mutate(journal: Dict[str, Any]) -> None:
+        nonlocal removed
+        ops = journal.get("operations", {})
+        if isinstance(ops, dict):
+            removed = len(ops)
+        journal["operations"] = {}
+
+    _update_index_journal(workspace_path, repo_name, _mutate)
+    return removed
+
+
+def update_index_journal_entries_status(
+    entries: List[Dict[str, Any]],
+    *,
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+    remove_on_done: bool = True,
+) -> Dict[str, Any]:
+    """Update many journal records with one read/modify/write transaction."""
+    updates: Dict[str, Dict[str, Any]] = {}
+    for entry in entries or []:
+        normalized_path = _normalize_cache_key_path(str(entry.get("path") or ""))
+        if not normalized_path:
+            continue
+        status = _normalize_index_journal_status(entry.get("status"), invalid="failed")
+        updates[normalized_path] = {
+            "status": status,
+            "error": str(entry.get("error") or "").strip() or None,
+            "remove_on_done": bool(entry.get("remove_on_done", remove_on_done)),
+        }
+
+    def _mutate(journal: Dict[str, Any]) -> None:
+        ops = journal.setdefault("operations", {})
+        if not isinstance(ops, dict):
+            ops = {}
+            journal["operations"] = ops
+        now = datetime.now().isoformat()
+        for normalized_path, update in updates.items():
+            rec = ops.get(normalized_path)
+            if not isinstance(rec, dict):
+                continue
+            status = update["status"]
+            if status == "done" and update["remove_on_done"]:
+                ops.pop(normalized_path, None)
+                continue
+            rec["status"] = status
+            rec["updated_at"] = now
+            rec["attempts"] = _coerce_index_journal_attempts(rec.get("attempts")) + 1
+            rec["last_error"] = update["error"]
+            ops[normalized_path] = rec
+
+    return _update_index_journal(workspace_path, repo_name, _mutate)
+
+
+def get_index_journal_summary(
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return compact, operator-friendly journal counts and retry details."""
+    workspace_path, repo_name = _resolve_repo_context(workspace_path, repo_name)
+
+    # In multi-repo mode the watcher owns the workspace root and each repo has
+    # its own journal. Aggregate the root view so an operator can inspect one
+    # status endpoint without knowing every repo slug first.
+    if is_multi_repo_mode() and not repo_name:
+        root_path = Path(workspace_path).resolve()
+        repositories: Dict[str, Dict[str, Any]] = {}
+        for candidate, candidate_workspace_path in _discover_journal_repositories(workspace_path):
+            repositories[candidate] = get_index_journal_summary(
+                workspace_path=candidate_workspace_path or str(root_path),
+                repo_name=candidate,
+            )
+        if repositories:
+            aggregate_counts = {
+                "pending": 0,
+                "in_progress": 0,
+                "failed": 0,
+                "done": 0,
+                "unknown": 0,
+            }
+            sample_errors: List[Dict[str, Any]] = []
+            oldest_retryable_at: Optional[str] = None
+            max_attempts = 0
+            total = 0
+            retryable = 0
+            outstanding = 0
+            exhausted = 0
+            updated_at = ""
+            for candidate, summary in repositories.items():
+                total += int(summary.get("total") or 0)
+                retryable += int(summary.get("retryable") or 0)
+                outstanding += int(summary.get("outstanding") or 0)
+                exhausted += int(summary.get("exhausted") or 0)
+                for status, count in aggregate_counts.items():
+                    aggregate_counts[status] += int((summary.get("counts") or {}).get(status) or 0)
+                candidate_oldest = str(summary.get("oldest_retryable_at") or "")
+                if candidate_oldest and (not oldest_retryable_at or candidate_oldest < oldest_retryable_at):
+                    oldest_retryable_at = candidate_oldest
+                max_attempts = max(max_attempts, int(summary.get("max_attempts") or 0))
+                updated_at = max(updated_at, str(summary.get("updated_at") or ""))
+                for error in summary.get("sample_errors") or []:
+                    if len(sample_errors) >= 5:
+                        break
+                    sample_errors.append({"repo": candidate, **error})
+            return {
+                "journal_path": str(root_path / STATE_DIRNAME / "repos"),
+                "total": total,
+                "counts": aggregate_counts,
+                "retryable": retryable,
+                "outstanding": outstanding,
+                "exhausted": exhausted,
+                "oldest_retryable_at": oldest_retryable_at,
+                "max_attempts": max_attempts,
+                "sample_errors": sample_errors,
+                "updated_at": updated_at,
+                "repositories": repositories,
+            }
+
+    journal_path = _get_index_journal_path(workspace_path, repo_name)
+    journal = _read_index_journal_file_uncached(journal_path)
+    operations = journal.get("operations", {})
+    if not isinstance(operations, dict):
+        operations = {}
+
+    counts = {"pending": 0, "in_progress": 0, "failed": 0, "done": 0, "unknown": 0}
+    retryable = 0
+    exhausted = 0
+    oldest_updated_at: Optional[str] = None
+    max_attempts = 0
+    journal_max_attempts = _index_journal_max_attempts()
+    sample_errors: List[Dict[str, Any]] = []
+    for raw_path, raw_record in operations.items():
+        if not isinstance(raw_record, dict):
+            counts["unknown"] += 1
+            continue
+        status = _normalize_index_journal_status(
+            raw_record.get("status"), invalid="unknown"
+        )
+        counts[status] += 1
+        attempts = _coerce_index_journal_attempts(raw_record.get("attempts"))
+        max_attempts = max(max_attempts, attempts)
+        if status in {"pending", "failed"}:
+            if journal_max_attempts > 0 and attempts >= journal_max_attempts:
+                exhausted += 1
+            else:
+                retryable += 1
+                updated_at = str(raw_record.get("updated_at") or raw_record.get("created_at") or "")
+                if updated_at and (oldest_updated_at is None or updated_at < oldest_updated_at):
+                    oldest_updated_at = updated_at
+            error = str(raw_record.get("last_error") or "").strip()
+            if error and len(sample_errors) < 5:
+                sample_errors.append({"path": str(raw_record.get("path") or raw_path), "error": error})
+
+    return {
+        "journal_path": str(journal_path),
+        "total": len(operations),
+        "counts": counts,
+        "retryable": retryable,
+        "outstanding": sum(
+            count for status, count in counts.items() if status != "done"
+        ),
+        "exhausted": exhausted,
+        "oldest_retryable_at": oldest_updated_at,
+        "max_attempts": max_attempts,
+        "sample_errors": sample_errors,
+        "updated_at": str(journal.get("updated_at") or ""),
+    }
+
+
+def list_pending_index_journal_entries(
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> List[IndexJournalRecord]:
+    """Return watcher-retryable journal records for a workspace or specific repo."""
+    workspace_path, repo_name = _resolve_repo_context(workspace_path, repo_name)
+    retry_delay = _index_journal_retry_delay_seconds()
+    max_attempts = _index_journal_max_attempts()
+    now = datetime.now()
+
+    def _read_repo_journal_entries(
+        target_repo_name: Optional[str],
+        *,
+        target_workspace_path: Optional[str] = None,
+    ) -> List[IndexJournalRecord]:
+        journal = _read_index_journal_file_uncached(
+            _get_index_journal_path(target_workspace_path or workspace_path, target_repo_name)
+        )
+        merged_ops = journal.get("operations", {})
+        if not isinstance(merged_ops, dict):
+            merged_ops = {}
+        result: List[IndexJournalRecord] = []
+        for rec in merged_ops.values():
+            if not isinstance(rec, dict):
+                continue
+            status = _normalize_index_journal_status(
+                rec.get("status"), invalid="unknown"
+            )
+            if status not in {"pending", "failed"}:
+                continue
+            attempts = _coerce_index_journal_attempts(
+                rec.get("attempts"), path=str(rec.get("path") or ""), warn=True
+            )
+            if max_attempts > 0 and attempts >= max_attempts:
+                continue
+            if status == "failed" and retry_delay > 0:
+                updated_at = str(rec.get("updated_at") or "").strip()
+                if updated_at:
+                    try:
+                        last = datetime.fromisoformat(updated_at)
+                        if (now - last).total_seconds() < retry_delay:
+                            continue
+                    except Exception:
+                        pass
+            p = _normalize_cache_key_path(str(rec.get("path") or ""))
+            op_type = str(rec.get("op_type") or "").strip().lower()
+            if not p or op_type not in {"upsert", "delete"}:
+                continue
+            result.append(
+                {
+                    "path": p,
+                    "op_type": op_type,
+                    "content_hash": str(rec.get("content_hash") or "").strip() or None,
+                    "status": status,
+                    "attempts": attempts,
+                    "created_at": str(rec.get("created_at") or ""),
+                    "updated_at": str(rec.get("updated_at") or ""),
+                    "last_error": str(rec.get("last_error") or "").strip() or None,
+                }
+            )
+        return result
+
+    if repo_name:
+        return _read_repo_journal_entries(repo_name)
+
+    result: List[IndexJournalRecord] = []
+    for candidate, candidate_workspace_path in _discover_journal_repositories(workspace_path):
+        result.extend(
+            _read_repo_journal_entries(
+                candidate,
+                target_workspace_path=candidate_workspace_path,
+            )
+        )
+
+    if result:
+        return result
+    return _read_repo_journal_entries(None)
+
+
+def update_index_journal_entry_status(
+    path: str,
+    *,
+    status: str,
+    error: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+    remove_on_done: bool = True,
+) -> Dict[str, Any]:
+    """Update or clear a repo-scoped journal entry after processing."""
+    normalized_path = _normalize_cache_key_path(path)
+    status = _normalize_index_journal_status(status, invalid="failed")
+    now = datetime.now().isoformat()
+
+    def _mutate(journal: Dict[str, Any]) -> None:
+        ops = journal.setdefault("operations", {})
+        if not isinstance(ops, dict):
+            ops = {}
+            journal["operations"] = ops
+        rec = ops.get(normalized_path)
+        if not isinstance(rec, dict):
+            return
+        if status == "done" and remove_on_done:
+            ops.pop(normalized_path, None)
+            return
+        rec["status"] = status
+        rec["updated_at"] = now
+        rec["attempts"] = _coerce_index_journal_attempts(
+            rec.get("attempts"), path=normalized_path, warn=True
+        ) + 1
+        rec["last_error"] = str(error or "").strip() or None
+        ops[normalized_path] = rec
+
+    return _update_index_journal(workspace_path, repo_name, _mutate)
+
+
+def get_cached_file_hash(
+    file_path: str,
+    repo_name: Optional[str] = None,
+    metadata_root: Optional[str] = None,
+) -> str:
     """Get cached file hash for tracking changes."""
+    root = metadata_root or _resolve_workspace_root()
     if is_multi_repo_mode() and repo_name:
-        state_dir = _get_repo_state_dir(repo_name)
+        state_dir = _get_repo_state_dir(repo_name, root)
         cache_path = state_dir / CACHE_FILENAME
 
         cache = _read_cache_file_cached(cache_path)
@@ -1589,19 +2263,23 @@ def get_cached_file_hash(file_path: str, repo_name: Optional[str] = None) -> str
             return str(val.get("hash") or "")
         return str(val or "")
     else:
-        cache = _read_cache_cached(_resolve_workspace_root())
+        cache = _read_cache_cached(root)
         fp = _normalize_cache_key_path(file_path)
         val = cache.get("file_hashes", {}).get(fp, "")
         if isinstance(val, dict):
             return str(val.get("hash") or "")
         return str(val or "")
 
-    return ""
 
-
-def set_cached_file_hash(file_path: str, file_hash: str, repo_name: Optional[str] = None) -> None:
+def set_cached_file_hash(
+    file_path: str,
+    file_hash: str,
+    repo_name: Optional[str] = None,
+    metadata_root: Optional[str] = None,
+) -> None:
     """Set cached file hash for tracking changes."""
     fp = _normalize_cache_key_path(file_path)
+    root = metadata_root or _resolve_workspace_root()
 
     st_size: Optional[int] = None
     st_mtime: Optional[int] = None
@@ -1615,14 +2293,15 @@ def set_cached_file_hash(file_path: str, file_hash: str, repo_name: Optional[str
 
     if is_multi_repo_mode() and repo_name:
         try:
-            ws_root = Path(_resolve_workspace_root())
+            ws_root = Path(root)
             if not (ws_root / repo_name).exists():
                 return
         except Exception:
             return
-        state_dir = _get_repo_state_dir(repo_name)
+        state_dir = _get_repo_state_dir(repo_name, str(ws_root))
         cache_path = state_dir / CACHE_FILENAME
         state_dir.mkdir(parents=True, exist_ok=True)
+        _apply_runtime_metadata_mode(state_dir)
 
         if cache_path.exists():
             cache = _read_cache_file_cached(cache_path)
@@ -1659,7 +2338,7 @@ def set_cached_file_hash(file_path: str, file_hash: str, repo_name: Optional[str
         _memoize_cache_obj(cache_path, cache)
         return
 
-    cache = _read_cache_cached(_resolve_workspace_root())
+    cache = _read_cache_cached(root)
     existing = cache.get("file_hashes", {}).get(fp)
     if isinstance(existing, dict) and st_size is not None and st_mtime is not None:
         if (
@@ -1683,14 +2362,14 @@ def set_cached_file_hash(file_path: str, file_hash: str, repo_name: Optional[str
         pass
     cache.setdefault("file_hashes", {})[fp] = entry
     cache["updated_at"] = datetime.now().isoformat()
-    _write_cache(_resolve_workspace_root(), cache)
-    _memoize_cache_obj(_get_cache_path(_resolve_workspace_root()), cache)
+    _write_cache(root, cache)
+    _memoize_cache_obj(_get_cache_path(root), cache)
 
 
 def get_cached_file_meta(file_path: str, repo_name: Optional[str] = None) -> Dict[str, Any]:
     fp = _normalize_cache_key_path(file_path)
     if is_multi_repo_mode() and repo_name:
-        state_dir = _get_repo_state_dir(repo_name)
+        state_dir = _get_repo_state_dir(repo_name, _resolve_workspace_root())
         cache_path = state_dir / CACHE_FILENAME
 
         cache = _read_cache_file_cached(cache_path)
@@ -1711,10 +2390,15 @@ def get_cached_file_meta(file_path: str, repo_name: Optional[str] = None) -> Dic
     return {}
 
 
-def remove_cached_file(file_path: str, repo_name: Optional[str] = None) -> None:
+def remove_cached_file(
+    file_path: str,
+    repo_name: Optional[str] = None,
+    metadata_root: Optional[str] = None,
+) -> None:
     """Remove file entry from cache."""
+    root = metadata_root or _resolve_workspace_root()
     if is_multi_repo_mode() and repo_name:
-        state_dir = _get_repo_state_dir(repo_name)
+        state_dir = _get_repo_state_dir(repo_name, root)
         cache_path = state_dir / CACHE_FILENAME
 
         if cache_path.exists():
@@ -1730,13 +2414,13 @@ def remove_cached_file(file_path: str, repo_name: Optional[str] = None) -> None:
                 _memoize_cache_obj(cache_path, cache)
         return
 
-    cache = _read_cache_cached(_resolve_workspace_root())
+    cache = _read_cache_cached(root)
     fp = _normalize_cache_key_path(file_path)
     if fp in cache.get("file_hashes", {}):
         cache["file_hashes"].pop(fp, None)
         cache["updated_at"] = datetime.now().isoformat()
-        _write_cache(_resolve_workspace_root(), cache)
-        _memoize_cache_obj(_get_cache_path(_resolve_workspace_root()), cache)
+        _write_cache(root, cache)
+        _memoize_cache_obj(_get_cache_path(root), cache)
 
 
 def cleanup_old_cache_locks(max_idle_seconds: int = 900) -> int:
@@ -1780,42 +2464,65 @@ def cleanup_old_cache_locks(max_idle_seconds: int = 900) -> int:
 
 
 def get_collection_mappings(search_root: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Enumerate collection mappings with origin metadata."""
+    """Enumerate collection mappings with origin metadata.
+
+    `search_root` may point at either workspace root (`/work`) or codebase root
+    (`/work/.codebase`).
+    """
 
     root_path = Path(search_root or _resolve_workspace_root()).resolve()
+    if root_path.name == STATE_DIRNAME:
+        workspace_root = root_path.parent
+        codebase_root = root_path
+    else:
+        workspace_root = root_path
+        codebase_root = root_path / STATE_DIRNAME
     mappings: List[Dict[str, Any]] = []
 
     try:
         if is_multi_repo_mode():
-            repos_root = root_path / STATE_DIRNAME / "repos"
+            seen_state_files: set[str] = set()
+
+            def _append_repo_mapping(repo_name: str, state_path: Path) -> None:
+                if not state_path.exists():
+                    return
+                try:
+                    state_key = str(state_path.resolve())
+                except Exception:
+                    state_key = str(state_path)
+                if state_key in seen_state_files:
+                    return
+                seen_state_files.add(state_key)
+
+                try:
+                    with open(state_path, "r", encoding="utf-8-sig") as f:
+                        state = json.load(f) or {}
+                except Exception as e:
+                    print(f"[workspace_state] Failed to read repo state from {state_path}: {e}")
+                    return
+
+                origin = state.get("origin", {}) or {}
+                repo_workspace_dir = _get_repo_workspace_dir(repo_name, str(workspace_root))
+                mappings.append(
+                    {
+                        "repo_name": repo_name,
+                        "collection_name": state.get("qdrant_collection")
+                        or get_collection_name(repo_name),
+                        "container_path": origin.get("container_path")
+                        or str(repo_workspace_dir.resolve()),
+                        "source_path": origin.get("source_path"),
+                        "state_file": str(state_path),
+                        "updated_at": state.get("updated_at"),
+                    }
+                )
+
+            # Shared metadata root (`<workspace>/.codebase/repos/<repo>/state.json`)
+            repos_root = codebase_root / "repos"
             if repos_root.exists():
                 for repo_dir in sorted(p for p in repos_root.iterdir() if p.is_dir()):
-                    repo_name = repo_dir.name
-                    state_path = repo_dir / STATE_FILENAME
-                    if not state_path.exists():
-                        continue
-                    try:
-                        with open(state_path, "r", encoding="utf-8-sig") as f:
-                            state = json.load(f) or {}
-                    except Exception as e:
-                        print(f"[workspace_state] Failed to read repo state from {state_path}: {e}")
-                        continue
-
-                    origin = state.get("origin", {}) or {}
-                    mappings.append(
-                        {
-                            "repo_name": repo_name,
-                            "collection_name": state.get("qdrant_collection")
-                            or get_collection_name(repo_name),
-                            "container_path": origin.get("container_path")
-                            or str((Path(_resolve_workspace_root()) / repo_name).resolve()),
-                            "source_path": origin.get("source_path"),
-                            "state_file": str(state_path),
-                            "updated_at": state.get("updated_at"),
-                        }
-                    )
+                    _append_repo_mapping(repo_dir.name, repo_dir / STATE_FILENAME)
         else:
-            state_path = root_path / STATE_DIRNAME / STATE_FILENAME
+            state_path = codebase_root / STATE_FILENAME
             if state_path.exists():
                 try:
                     with open(state_path, "r", encoding="utf-8-sig") as f:
@@ -1824,14 +2531,14 @@ def get_collection_mappings(search_root: Optional[str] = None) -> List[Dict[str,
                     state = {}
 
                 origin = state.get("origin", {}) or {}
-                repo_name = origin.get("repo_name") or Path(root_path).name
+                repo_name = origin.get("repo_name") or Path(workspace_root).name
                 mappings.append(
                     {
                         "repo_name": repo_name,
                         "collection_name": state.get("qdrant_collection")
                         or get_collection_name(repo_name),
                         "container_path": origin.get("container_path")
-                        or str(root_path),
+                        or str(workspace_root),
                         "source_path": origin.get("source_path"),
                         "state_file": str(state_path),
                         "updated_at": state.get("updated_at"),
@@ -2116,6 +2823,8 @@ def set_cached_symbols(file_path: str, symbols: dict, file_hash: str) -> None:
     """Save symbol metadata for a file. Extends existing to include pseudo data."""
     cache_path = _get_symbol_cache_path(file_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _apply_runtime_metadata_mode(cache_path.parent)
+    temp_path = cache_path.with_suffix(f".tmp.{uuid.uuid4().hex[:8]}")
 
     try:
         cache_data = {
@@ -2125,18 +2834,16 @@ def set_cached_symbols(file_path: str, symbols: dict, file_hash: str) -> None:
             "symbols": symbols
         }
 
-        with open(cache_path, 'w', encoding='utf-8') as f:
+        with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, indent=2)
-
-        # Ensure symbol cache files are group-writable so both indexer and
-        # watcher processes (potentially different users sharing a group)
-        # can update them on shared volumes.
-        try:
-            os.chmod(cache_path, 0o664)
-        except PermissionError:
-            pass
+        temp_path.replace(cache_path)
+        _apply_runtime_metadata_mode(cache_path)
     except Exception as e:
         print(f"[SYMBOL_CACHE_WARNING] Failed to save symbol cache for {file_path}: {e}")
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def get_cached_pseudo(file_path: str, symbol_id: str) -> tuple[str, list[str]]:
@@ -2236,7 +2943,7 @@ def clear_symbol_cache(
 
     target_dirs: List[Path] = []
     if is_multi_repo_mode() and repo_name:
-        target_dirs.append(_get_repo_state_dir(repo_name) / "symbols")
+        target_dirs.append(_get_repo_state_dir(repo_name, workspace_path) / "symbols")
     else:
         try:
             cache_parent = _get_cache_path(workspace_root).parent
@@ -2288,6 +2995,53 @@ def compare_symbol_changes(old_symbols: dict, new_symbols: dict) -> tuple[list, 
     unchanged = []
     changed = []
 
+    # Primary key should not be absolute start_line alone; leading comments/import
+    # shifts can move every symbol without changing their bodies. Prefer exact id
+    # first, then fall back to stable metadata matching.
+    old_symbols = old_symbols or {}
+    new_symbols = new_symbols or {}
+    remaining_old_by_exact = dict(old_symbols)
+    remaining_old_by_signature: Dict[tuple[str, str, str], list[str]] = {}
+    remaining_old_by_name_kind: Dict[tuple[str, str], list[str]] = {}
+
+    for old_symbol_id, old_info in remaining_old_by_exact.items():
+        kind = str(old_info.get("type") or "")
+        name = str(old_info.get("name") or "")
+        content_hash = str(old_info.get("content_hash") or "")
+        if kind and name and content_hash:
+            remaining_old_by_signature.setdefault((kind, name, content_hash), []).append(
+                old_symbol_id
+            )
+        if kind and name:
+            remaining_old_by_name_kind.setdefault((kind, name), []).append(old_symbol_id)
+
+    def _consume_old_symbol(old_id: str, old_info: dict) -> None:
+        remaining_old_by_exact.pop(old_id, None)
+
+        old_kind = str(old_info.get("type") or "")
+        old_name = str(old_info.get("name") or "")
+        old_hash = str(old_info.get("content_hash") or "")
+
+        if old_kind and old_name and old_hash:
+            sig = (old_kind, old_name, old_hash)
+            sig_ids = remaining_old_by_signature.get(sig) or []
+            if old_id in sig_ids:
+                sig_ids.remove(old_id)
+                if sig_ids:
+                    remaining_old_by_signature[sig] = sig_ids
+                else:
+                    remaining_old_by_signature.pop(sig, None)
+
+        if old_kind and old_name:
+            nk = (old_kind, old_name)
+            nk_ids = remaining_old_by_name_kind.get(nk) or []
+            if old_id in nk_ids:
+                nk_ids.remove(old_id)
+                if nk_ids:
+                    remaining_old_by_name_kind[nk] = nk_ids
+                else:
+                    remaining_old_by_name_kind.pop(nk, None)
+
     for symbol_id, symbol_info in new_symbols.items():
         if symbol_id in old_symbols:
             old_info = old_symbols[symbol_id]
@@ -2296,6 +3050,26 @@ def compare_symbol_changes(old_symbols: dict, new_symbols: dict) -> tuple[list, 
                 unchanged.append(symbol_id)
             else:
                 changed.append(symbol_id)
+            _consume_old_symbol(symbol_id, old_info)
+            continue
+
+        kind = str(symbol_info.get("type") or "")
+        name = str(symbol_info.get("name") or "")
+        content_hash = str(symbol_info.get("content_hash") or "")
+        signature = (kind, name, content_hash)
+        matched_old_ids = remaining_old_by_signature.get(signature) or []
+        if matched_old_ids:
+            old_id = matched_old_ids.pop(0)
+            if not matched_old_ids:
+                remaining_old_by_signature.pop(signature, None)
+            _consume_old_symbol(old_id, old_symbols.get(old_id, {}))
+            unchanged.append(symbol_id)
+            continue
+
+        # Same logical symbol name/type exists but content differs: changed.
+        if kind and name and remaining_old_by_name_kind.get((kind, name)):
+            remaining_old_by_name_kind.pop((kind, name), None)
+            changed.append(symbol_id)
         else:
             # New symbol
             changed.append(symbol_id)
@@ -2537,6 +3311,3 @@ def _list_workspaces_from_qdrant(seen_paths: set) -> List[Dict[str, Any]]:
         pass
 
     return workspaces
-
-
-# Add missing functions that callers expect (already defined above)

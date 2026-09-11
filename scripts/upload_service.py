@@ -45,20 +45,12 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, sta
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from scripts.upload_delta_bundle import get_workspace_key, process_delta_bundle
-
-from scripts.indexing_admin import (
-    build_admin_collections_view,
-    resolve_collection_root,
-    spawn_ingest_code,
-    recreate_collection_qdrant,
+from scripts.upload_delta_bundle import (
+    apply_delta_operations,
+    get_workspace_key,
+    plan_delta_upload,
+    process_delta_bundle,
 )
-
-try:
-    from scripts.workspace_state import is_staging_enabled
-except Exception:
-    is_staging_enabled = None  # type: ignore
-
 
 from pydantic import BaseModel, Field
 from scripts.auth_backend import (
@@ -81,74 +73,32 @@ from scripts.auth_backend import (
     revoke_collection_access,
 )
 
-try:
-    from scripts.collection_admin import delete_collection_everywhere, copy_collection_qdrant
-except Exception:
-    delete_collection_everywhere = None
-    copy_collection_qdrant = None
-try:
-    from scripts.admin_ui import (
-        render_admin_acl,
-        render_admin_bootstrap,
-        render_admin_error,
-        render_admin_login,
-    )
-except Exception:
+from scripts.admin_ui import (
+    render_admin_acl,
+    render_admin_bootstrap,
+    render_admin_error,
+    render_admin_login,
+)
 
-    def _admin_ui_unavailable(*args, **kwargs):
-        raise HTTPException(status_code=500, detail="Admin UI unavailable")
-
-    render_admin_acl = _admin_ui_unavailable
-    render_admin_bootstrap = _admin_ui_unavailable
-    render_admin_error = _admin_ui_unavailable
-    render_admin_login = _admin_ui_unavailable
-
-# Import staging/indexing admin helpers
-try:
-    from scripts.indexing_admin import (
-        start_staging_rebuild,
-        activate_staging_rebuild,
-        abort_staging_rebuild,
-    )
-except ImportError:
-    start_staging_rebuild = None  # type: ignore
-    activate_staging_rebuild = None  # type: ignore
-    abort_staging_rebuild = None  # type: ignore
-
-# Import existing workspace state and indexing functions
-try:
-    from scripts.workspace_state import (
-        log_activity,
-        get_collection_name,
-        get_cached_file_hash,
-        set_cached_file_hash,
-        _extract_repo_name_from_path,
-        update_repo_origin,
-        get_collection_mappings,
-        find_collection_for_logical_repo,
-        update_workspace_state,
-        set_staging_state,
-        update_staging_status,
-        clear_staging_collection,
-        logical_repo_reuse_enabled,
-        get_collection_state_snapshot,
-    )
-except ImportError:
-    # Fallback for testing without full environment
-    log_activity = None
-    get_collection_name = None
-    get_cached_file_hash = None
-    set_cached_file_hash = None
-    _extract_repo_name_from_path = None
-    update_repo_origin = None
-    get_collection_mappings = None
-    find_collection_for_logical_repo = None
-    update_workspace_state = None
-    set_staging_state = None
-    update_staging_status = None
-    clear_staging_collection = None
-    def logical_repo_reuse_enabled() -> bool:  # type: ignore[no-redef]
-        return False
+from scripts.workspace_state import (
+    is_staging_enabled,
+    log_activity,
+    get_collection_name,
+    get_cached_file_hash,
+    set_cached_file_hash,
+    _extract_repo_name_from_path,
+    update_repo_origin,
+    get_collection_mappings,
+    find_collection_for_logical_repo,
+    update_workspace_state,
+    set_staging_state,
+    update_staging_status,
+    clear_staging_collection,
+    clear_index_journal_entries,
+    get_index_journal_summary,
+    logical_repo_reuse_enabled,
+    get_collection_state_snapshot,
+)
 
 
 # Configure logging
@@ -182,6 +132,15 @@ CTXCE_MCP_ACL_ENFORCE = (
 )
 BRIDGE_STATE_TOKEN = (os.environ.get("CTXCE_BRIDGE_STATE_TOKEN") or "").strip()
 
+
+# Admin collection operations import Qdrant clients, subprocess indexing helpers,
+# and collection-copy/delete wiring. Keep those off the upload/status import path.
+def _indexing_admin():
+    from scripts import indexing_admin
+
+    return indexing_admin
+
+
 # FastAPI app
 app = FastAPI(
     title="Context-Engine Delta Upload Service",
@@ -200,6 +159,7 @@ app.add_middleware(
 
 # In-memory sequence tracking (in production, use persistent storage)
 _sequence_tracker: Dict[str, int] = {}
+_upload_result_tracker: Dict[str, Dict[str, Any]] = {}
 
 
 def _int_env(name: str, default: int) -> int:
@@ -223,6 +183,40 @@ class UploadResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     next_sequence: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+
+
+class PlanRequest(BaseModel):
+    workspace_path: str
+    collection_name: Optional[str] = None
+    source_path: Optional[str] = None
+    logical_repo_id: Optional[str] = None
+    session: Optional[str] = None
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    operations: List[Dict[str, Any]] = Field(default_factory=list)
+    file_hashes: Dict[str, str] = Field(default_factory=dict)
+
+
+class PlanResponse(BaseModel):
+    success: bool
+    workspace_path: str
+    needed_files: Dict[str, List[str]]
+    operation_counts_preview: Dict[str, int]
+    needed_size_bytes: int
+    replica_targets: List[str]
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
+    fallback_used: bool = False
+    error: Optional[Dict[str, Any]] = None
+
+
+class ApplyOperationsRequest(BaseModel):
+    workspace_path: str
+    collection_name: Optional[str] = None
+    source_path: Optional[str] = None
+    logical_repo_id: Optional[str] = None
+    session: Optional[str] = None
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    operations: List[Dict[str, Any]] = Field(default_factory=list)
+    file_hashes: Dict[str, str] = Field(default_factory=dict)
 
 class StatusResponse(BaseModel):
     workspace_path: str
@@ -407,9 +401,8 @@ def _resolve_bridge_state_target(
     repo = (repo_name or "").strip() or None
 
     if collection:
-        if resolve_collection_root is None:
-            raise HTTPException(status_code=400, detail="collection mapping unavailable")
-        root, resolved_repo = resolve_collection_root(collection=collection, work_dir=WORK_DIR)
+        indexing_admin = _indexing_admin()
+        root, resolved_repo = indexing_admin.resolve_collection_root(collection=collection, work_dir=WORK_DIR)
         if not root:
             raise HTTPException(status_code=404, detail="collection mapping not found")
         workspace_path = root
@@ -480,34 +473,83 @@ async def _process_bundle_background(
     sequence_number: Optional[int],
     bundle_id: Optional[str],
 ) -> None:
+    key = get_workspace_key(workspace_path)
     try:
         start_time = datetime.now()
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": None,
+            "processing_time_ms": None,
+            "status": "processing",
+            "completed_at": None,
+        }
         operations_count = await asyncio.to_thread(
             process_delta_bundle, workspace_path, bundle_path, manifest
         )
-        if sequence_number is not None:
-            key = get_workspace_key(workspace_path)
-            _sequence_tracker[key] = sequence_number
-        if log_activity:
-            try:
-                repo = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
-                log_activity(
-                    repo_name=repo,
-                    action="uploaded",
-                    file_path=bundle_id,
-                    details={
-                        "bundle_id": bundle_id,
-                        "operations": operations_count,
-                        "source": "delta_upload",
-                    },
-                )
-            except Exception as activity_err:
-                logger.debug(f"[upload_service] Failed to log activity for bundle {bundle_id}: {activity_err}")
-        processing_time = (datetime.now() - start_time).total_seconds() * 1000
-        logger.info(
-            f"[upload_service] Finished processing bundle {bundle_id} seq {sequence_number} in {int(processing_time)}ms"
+        processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        failed_count = int((operations_count or {}).get("failed") or 0)
+        applied_count = int(
+            (operations_count or {}).get("created", 0)
+            + (operations_count or {}).get("updated", 0)
+            + (operations_count or {}).get("deleted", 0)
+            + (operations_count or {}).get("moved", 0)
         )
+        status_value = "completed" if failed_count == 0 else "failed"
+        if sequence_number is not None and failed_count == 0:
+            _sequence_tracker[key] = sequence_number
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": operations_count,
+            "processing_time_ms": processing_time,
+            "status": status_value,
+            "failed_count": failed_count,
+            "partial": bool(failed_count > 0 and applied_count > 0),
+            "completed_at": datetime.now().isoformat(),
+        }
+        try:
+            repo = _extract_repo_name_from_path(workspace_path)
+            log_activity(
+                repo_name=repo,
+                action="uploaded",
+                file_path=bundle_id,
+                details={
+                    "bundle_id": bundle_id,
+                    "operations": operations_count,
+                    "source": "delta_upload",
+                },
+            )
+        except Exception as activity_err:
+            logger.debug(f"[upload_service] Failed to log activity for bundle {bundle_id}: {activity_err}")
+        if failed_count > 0:
+            logger.warning(
+                "[upload_service] Finished processing bundle %s seq %s with failures in %sms "
+                "failed=%d ops=%s",
+                bundle_id,
+                sequence_number,
+                processing_time,
+                failed_count,
+                operations_count,
+            )
+        else:
+            logger.info(
+                f"[upload_service] Finished processing bundle {bundle_id} seq {sequence_number} "
+                f"in {processing_time}ms ops={operations_count}"
+            )
     except Exception as e:
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": None,
+            "processing_time_ms": None,
+            "status": "error",
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e),
+        }
         logger.error(f"[upload_service] Error in background processing for bundle {bundle_id}: {e}")
     finally:
         try:
@@ -707,8 +749,9 @@ async def admin_acl_page(request: Request):
         logger.error(f"[upload_service] Failed to load admin UI data: {e}")
         raise HTTPException(status_code=500, detail="Failed to load admin data")
 
+    indexing_admin = _indexing_admin()
     enriched = await asyncio.to_thread(
-        build_admin_collections_view, collections=collections, work_dir=WORK_DIR
+        indexing_admin.build_admin_collections_view, collections=collections, work_dir=WORK_DIR
     )
 
     resp = render_admin_acl(
@@ -753,8 +796,9 @@ async def admin_collections_status(request: Request):
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to load collections")
 
+    indexing_admin = _indexing_admin()
     enriched = await asyncio.to_thread(
-        lambda: build_admin_collections_view(collections=collections, work_dir=WORK_DIR)
+        lambda: indexing_admin.build_admin_collections_view(collections=collections, work_dir=WORK_DIR)
     )
     return JSONResponse({"collections": enriched})
 
@@ -774,7 +818,8 @@ async def admin_reindex_collection(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -784,7 +829,7 @@ async def admin_reindex_collection(
         )
 
     try:
-        spawn_ingest_code(
+        indexing_admin.spawn_ingest_code(
             root=root,
             work_dir=WORK_DIR,
             collection=name,
@@ -810,9 +855,6 @@ async def bridge_collection_state(
     workspace: Optional[str] = None,
     repo_name: Optional[str] = None,
 ):
-    if get_collection_state_snapshot is None:
-        raise HTTPException(status_code=503, detail="workspace_state helper unavailable")
-
     _bridge_state_authorized(request)
 
     workspace_path, repo = _resolve_bridge_state_target(collection=collection, workspace=workspace, repo_name=repo_name)
@@ -821,7 +863,7 @@ async def bridge_collection_state(
     if not snapshot:
         raise HTTPException(status_code=404, detail="Workspace state not found")
 
-    if not (is_staging_enabled() if callable(is_staging_enabled) else False):
+    if not is_staging_enabled():
         # Classic mode: ignore any serving_* overrides from staging/migration.
         snapshot = dict(snapshot)
         snapshot.pop("serving_collection", None)
@@ -856,7 +898,8 @@ async def admin_recreate_collection(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -866,12 +909,12 @@ async def admin_recreate_collection(
         )
 
     try:
-        recreate_collection_qdrant(
+        indexing_admin.recreate_collection_qdrant(
             qdrant_url=QDRANT_URL,
             api_key=os.environ.get("QDRANT_API_KEY") or None,
             collection=name,
         )
-        spawn_ingest_code(
+        indexing_admin.spawn_ingest_code(
             root=root,
             work_dir=WORK_DIR,
             collection=name,
@@ -888,6 +931,50 @@ async def admin_recreate_collection(
         )
 
     return RedirectResponse(url="/admin/acl", status_code=302)
+
+
+@app.post("/admin/collections/clear-journal")
+async def admin_clear_collection_journal(
+    request: Request,
+    collection: str = Form(...),
+):
+    _require_admin_session(request)
+    name = (collection or "").strip()
+    if not name:
+        return render_admin_error(
+            request,
+            title="Clear Journal Failed",
+            message="collection is required",
+            back_href="/admin/acl",
+        )
+
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    if not root:
+        return render_admin_error(
+            request,
+            title="Clear Journal Failed",
+            message="No workspace mapping found for collection",
+            back_href="/admin/acl",
+        )
+
+    try:
+        removed = clear_index_journal_entries(workspace_path=root, repo_name=repo_name)
+    except Exception as e:
+        return render_admin_error(
+            request,
+            title="Clear Journal Failed",
+            message=str(e),
+            back_href="/admin/acl",
+        )
+
+    try:
+        from urllib.parse import urlencode
+
+        url = "/admin/acl?" + urlencode({"journal_cleared": name, "journal_removed": str(removed)})
+    except Exception:
+        url = "/admin/acl"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/admin/collections/delete")
@@ -920,14 +1007,6 @@ async def admin_delete_collection(
             back_href="/admin/acl",
         )
 
-    if delete_collection_everywhere is None:
-        return render_admin_error(
-            request,
-            title="Delete Collection Failed",
-            message="Collection delete helper unavailable",
-            back_href="/admin/acl",
-        )
-
     # Default is Qdrant-only (no filesystem cleanup). Users must explicitly opt in.
     try:
         cleanup_fs = (delete_fs or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -935,7 +1014,10 @@ async def admin_delete_collection(
         cleanup_fs = False
 
     try:
-        delete_collection_everywhere(
+        # Collection deletion imports Qdrant admin helpers only on the admin route.
+        from scripts.collection_admin import delete_collection_everywhere
+
+        out = delete_collection_everywhere(
             collection=name,
             work_dir=WORK_DIR,
             qdrant_url=QDRANT_URL,
@@ -949,7 +1031,23 @@ async def admin_delete_collection(
             back_href="/admin/acl",
         )
 
-    return RedirectResponse(url="/admin/acl", status_code=302)
+    graph_deleted: Optional[str] = None
+    try:
+        if isinstance(out, dict) and not name.endswith("_graph"):
+            graph_deleted = "1" if bool(out.get("qdrant_graph_deleted")) else "0"
+    except Exception:
+        graph_deleted = None
+
+    try:
+        from urllib.parse import urlencode
+
+        params = {"deleted": name}
+        if graph_deleted is not None:
+            params["graph_deleted"] = graph_deleted
+        url = "/admin/acl?" + urlencode(params)
+    except Exception:
+        url = "/admin/acl"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/admin/staging/start")
@@ -958,7 +1056,7 @@ async def admin_start_staging(
     collection: str = Form(...),
 ):
     _require_admin_session(request)
-    if not (is_staging_enabled() if callable(is_staging_enabled) else False):
+    if not is_staging_enabled():
         return render_admin_error(
             request,
             title="Start Staging Failed",
@@ -975,18 +1073,11 @@ async def admin_start_staging(
             back_href="/admin/acl",
         )
 
-    if start_staging_rebuild is None:
-        return render_admin_error(
-            request,
-            title="Start Staging Failed",
-            message="Staging helper unavailable",
-            back_href="/admin/acl",
-        )
-
     root: Optional[str] = None
     repo_name: Optional[str] = None
     try:
-        root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+        indexing_admin = _indexing_admin()
+        root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     except Exception:
         root, repo_name = None, None
     if not root:
@@ -1014,12 +1105,10 @@ async def admin_start_staging(
         },
     }
 
-    if set_staging_state:
-        try:
-            set_staging_state(workspace_path=root, repo_name=repo_name, staging=staging_payload)
-        except Exception as set_err:
-            logger.warning(f"[admin] Failed to persist queued staging state for {name}: {set_err}")
-    elif update_workspace_state:
+    try:
+        set_staging_state(workspace_path=root, repo_name=repo_name, staging=staging_payload)
+    except Exception as set_err:
+        logger.warning(f"[admin] Failed to persist queued staging state for {name}: {set_err}")
         try:
             update_workspace_state(
                 workspace_path=root,
@@ -1029,30 +1118,29 @@ async def admin_start_staging(
         except Exception as set_err:
             logger.warning(f"[admin] Failed to update workspace state for queued staging {name}: {set_err}")
 
-    if update_staging_status:
-        try:
-            update_staging_status(
-                workspace_path=root,
-                repo_name=repo_name,
-                status={"state": "queued", "queued_at": now, "request_id": request_id},
-            )
-        except Exception as status_err:
-            logger.debug(f"[admin] Failed to mark staging status queued for {name}: {status_err}")
+    try:
+        update_staging_status(
+            workspace_path=root,
+            repo_name=repo_name,
+            status={"state": "queued", "queued_at": now, "request_id": request_id},
+        )
+    except Exception as status_err:
+        logger.debug(f"[admin] Failed to mark staging status queued for {name}: {status_err}")
 
     try:
         async def _bg_start() -> None:
             try:
                 staging_collection = await asyncio.to_thread(
-                    start_staging_rebuild, collection=name, work_dir=WORK_DIR
+                    indexing_admin.start_staging_rebuild, collection=name, work_dir=WORK_DIR
                 )
                 logger.info(f"[admin] Started staging rebuild for {name} -> {staging_collection}")
             except Exception as e:
                 logger.error(f"[admin] Background staging start failed for {name}: {e}")
                 # Ensure we don't leave the workspace stuck in a queued staging state.
                 try:
-                    if clear_staging_collection:
+                    try:
                         clear_staging_collection(workspace_path=root, repo_name=repo_name)
-                    elif update_workspace_state:
+                    except Exception:
                         update_workspace_state(
                             workspace_path=root,
                             repo_name=repo_name,
@@ -1081,7 +1169,7 @@ async def admin_activate_staging(
     collection: str = Form(...),
 ):
     _require_admin_session(request)
-    if not (is_staging_enabled() if callable(is_staging_enabled) else False):
+    if not is_staging_enabled():
         return render_admin_error(
             request,
             title="Activate Staging Failed",
@@ -1097,18 +1185,11 @@ async def admin_activate_staging(
             back_href="/admin/acl",
         )
 
-    if activate_staging_rebuild is None:
-        return render_admin_error(
-            request,
-            title="Activate Staging Failed",
-            message="Staging helper unavailable",
-            back_href="/admin/acl",
-        )
-
     try:
         async def _bg_activate() -> None:
             try:
-                await asyncio.to_thread(activate_staging_rebuild, collection=name, work_dir=WORK_DIR)
+                indexing_admin = _indexing_admin()
+                await asyncio.to_thread(indexing_admin.activate_staging_rebuild, collection=name, work_dir=WORK_DIR)
                 logger.info(f"[admin] Activated staging for {name}")
             except Exception as e:
                 logger.error(f"[admin] Background staging activate failed for {name}: {e}")
@@ -1140,7 +1221,8 @@ async def admin_abort_staging(
             back_href="/admin/acl",
         )
 
-    root, repo_name = resolve_collection_root(collection=name, work_dir=WORK_DIR)
+    indexing_admin = _indexing_admin()
+    root, repo_name = indexing_admin.resolve_collection_root(collection=name, work_dir=WORK_DIR)
     if not root:
         return render_admin_error(
             request,
@@ -1150,21 +1232,13 @@ async def admin_abort_staging(
         )
 
     try:
-        if abort_staging_rebuild is not None:
-            # Run abort to completion so we always clear staging metadata before returning.
-            await asyncio.to_thread(
-                abort_staging_rebuild,
-                collection=name,
-                work_dir=WORK_DIR,
-                delete_collection=True,
-            )
-            logger.info(f"[admin] Aborted staging rebuild for {name}")
-        elif clear_staging_collection:
-            # Fallback for older deployments: clear staging metadata only.
-            clear_staging_collection(workspace_path=root, repo_name=repo_name)
-            logger.info(f"[admin] Aborted staging for {name} (metadata only)")
-        else:
-            raise RuntimeError("staging abort helpers unavailable")
+        await asyncio.to_thread(
+            indexing_admin.abort_staging_rebuild,
+            collection=name,
+            work_dir=WORK_DIR,
+            delete_collection=True,
+        )
+        logger.info(f"[admin] Aborted staging rebuild for {name}")
     except Exception as e:
         return render_admin_error(
             request,
@@ -1193,20 +1267,15 @@ async def admin_copy_collection(
             back_href="/admin/acl",
         )
 
-    if copy_collection_qdrant is None:
-        return render_admin_error(
-            request,
-            title="Copy Collection Failed",
-            message="copy helper unavailable",
-            back_href="/admin/acl",
-        )
-
     try:
         allow_overwrite = str(overwrite or "").strip().lower() in {"1", "true", "yes", "on"}
     except Exception:
         allow_overwrite = False
 
     try:
+        # Collection copy imports Qdrant admin helpers only on the admin route.
+        from scripts.collection_admin import copy_collection_qdrant
+
         new_name = copy_collection_qdrant(
             source=name,
             target=(target or None),
@@ -1222,7 +1291,60 @@ async def admin_copy_collection(
             back_href="/admin/acl",
         )
 
-    return RedirectResponse(url="/admin/acl", status_code=302)
+    graph_copied: Optional[str] = None
+    try:
+        if not name.endswith("_graph") and not str(new_name).endswith("_graph"):
+            used_pooled = True
+            try:
+                # Qdrant client pool is only needed to verify the copied graph collection.
+                from scripts.qdrant_client_manager import pooled_qdrant_client
+
+                with pooled_qdrant_client(
+                    url=QDRANT_URL,
+                    api_key=os.environ.get("QDRANT_API_KEY"),
+                ) as cli:
+                    try:
+                        cli.get_collection(collection_name=f"{new_name}_graph")
+                        graph_copied = "1"
+                    except Exception:
+                        graph_copied = "0"
+            except Exception:
+                # Failed to acquire pooled client; fall back to non-pooled
+                used_pooled = False
+            if not used_pooled:
+                try:
+                    from qdrant_client import QdrantClient  # type: ignore
+
+                    cli = QdrantClient(
+                        url=QDRANT_URL,
+                        api_key=os.environ.get("QDRANT_API_KEY"),
+                        timeout=float(os.environ.get("QDRANT_TIMEOUT", "5") or 5),
+                    )
+                    try:
+                        cli.get_collection(collection_name=f"{new_name}_graph")
+                        graph_copied = "1"
+                    except Exception:
+                        graph_copied = "0"
+                    finally:
+                        try:
+                            cli.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    graph_copied = "0"
+    except Exception:
+        graph_copied = None
+
+    try:
+        from urllib.parse import urlencode
+
+        params = {"copied": name, "new": new_name}
+        if graph_copied is not None:
+            params["graph_copied"] = graph_copied
+        url = "/admin/acl?" + urlencode(params)
+    except Exception:
+        url = "/admin/acl"
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/admin/users")
@@ -1347,34 +1469,427 @@ async def get_status(workspace_path: str):
     """Get upload status for workspace."""
     try:
         # Get collection name
-        if get_collection_name:
-            repo_name = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
-            collection_name = get_collection_name(repo_name)
-        else:
-            collection_name = DEFAULT_COLLECTION
+        try:
+            is_workspace_root = Path(workspace_path).resolve() == Path(WORK_DIR).resolve()
+        except Exception:
+            is_workspace_root = False
+        repo_name = None if is_workspace_root else _extract_repo_name_from_path(workspace_path)
+        collection_name = get_collection_name(repo_name)
+
+        try:
+            journal_summary = get_index_journal_summary(
+                workspace_path=workspace_path,
+                repo_name=repo_name or None,
+            )
+        except Exception as journal_exc:
+            logger.warning(
+                "[upload_service] Failed to read journal summary for %s: %s",
+                workspace_path,
+                journal_exc,
+            )
+            journal_summary = {
+                "total": 0,
+                "retryable": 0,
+                "outstanding": 0,
+                "exhausted": 0,
+                "counts": {},
+                "sample_errors": [],
+            }
 
         # Get last sequence
         last_sequence = get_last_sequence(workspace_path)
+        key = get_workspace_key(workspace_path)
+        upload_result = _upload_result_tracker.get(key, {})
 
-        last_upload = None
+        last_upload = upload_result.get("completed_at")
+        upload_status = str(upload_result.get("status") or "")
+        workspace_status = "processing" if upload_status == "processing" else "ready"
 
         return StatusResponse(
             workspace_path=workspace_path,
             collection_name=collection_name,
             last_sequence=last_sequence,
             last_upload=last_upload,
-            pending_operations=0,
-            status="ready",
+            pending_operations=int(
+                journal_summary.get(
+                    "outstanding",
+                    journal_summary.get("retryable", 0),
+                )
+                or 0
+            ),
+            status=workspace_status,
             server_info={
                 "version": "1.0.0",
                 "max_bundle_size_mb": MAX_BUNDLE_SIZE_MB,
-                "supported_formats": ["tar.gz"]
+                "supported_formats": ["tar.gz"],
+                "last_bundle_id": upload_result.get("bundle_id"),
+                "last_processing_time_ms": upload_result.get("processing_time_ms"),
+                "last_processed_operations": upload_result.get("processed_operations"),
+                "last_upload_status": upload_status or None,
+                "last_error": upload_result.get("error"),
+                "journal": journal_summary,
             }
         )
 
     except Exception as e:
         logger.error(f"Error getting status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _resolve_collection_for_request(
+    workspace_path: str,
+    client_collection_name: Optional[str],
+    logical_repo_id: Optional[str],
+    source_path: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    """
+    Resolve collection name and repo_name for upload/plan/apply requests.
+
+    Returns:
+        Tuple of (collection_name, repo_name)
+    """
+    # Resolve collection name for ACL enforcement
+    collection_name: Optional[str] = None
+    repo_name: Optional[str] = None
+
+    repo_source = (source_path or "").strip() or workspace_path
+    repo_name = _extract_repo_name_from_path(repo_source)
+    if not repo_name:
+        repo_name = Path(repo_source).name
+
+    resolved_collection: Optional[str] = None
+
+    # Resolve collection name, preferring server-side mapping for logical_repo_id when enabled
+    if logical_repo_reuse_enabled() and logical_repo_id:
+        try:
+            existing = find_collection_for_logical_repo(logical_repo_id, search_root=WORK_DIR)
+        except Exception:
+            existing = None
+        if existing:
+            resolved_collection = existing
+
+    # Latent migration: when no explicit mapping exists yet for this logical_repo_id, but there is a
+    # single existing collection mapping, prefer reusing it rather than creating a fresh collection.
+    if logical_repo_reuse_enabled() and logical_repo_id and resolved_collection is None:
+        try:
+            mappings = get_collection_mappings(search_root=WORK_DIR) or []
+        except Exception:
+            mappings = []
+
+        if len(mappings) == 1:
+            canonical = mappings[0]
+            canonical_coll = canonical.get("collection_name")
+            if canonical_coll:
+                resolved_collection = canonical_coll
+                try:
+                    update_workspace_state(
+                        workspace_path=canonical.get("container_path") or canonical.get("state_file"),
+                        updates={"logical_repo_id": logical_repo_id},
+                        repo_name=canonical.get("repo_name"),
+                    )
+                except Exception as migrate_err:
+                    logger.debug(
+                        f"[upload_service] Failed to migrate logical_repo_id for existing mapping: {migrate_err}"
+                    )
+
+    # Upload-managed requests are server-owned; ignore client-supplied collection routing.
+    if resolved_collection is not None:
+        collection_name = resolved_collection
+    else:
+        collection_name = get_collection_name(repo_name) if repo_name else DEFAULT_COLLECTION
+
+    return collection_name, repo_name
+
+
+@app.post("/api/v1/delta/plan", response_model=PlanResponse)
+async def plan_delta(request: PlanRequest):
+    """Plan which file bodies are needed before uploading content."""
+    try:
+        workspace = Path(request.workspace_path)
+        if not workspace.is_absolute():
+            workspace = Path(WORK_DIR) / workspace
+        workspace_path = str(workspace.resolve())
+
+        if AUTH_ENABLED:
+            session_value = str(request.session or "").strip()
+            try:
+                record = validate_session(session_value)
+            except AuthDisabledError:
+                record = None
+            except Exception as e:
+                logger.error(f"[upload_service] Failed to validate auth session for plan: {e}")
+                raise HTTPException(status_code=500, detail="Failed to validate auth session")
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired session",
+                )
+
+        # Resolve collection name for ACL enforcement
+        collection_name, repo_name = _resolve_collection_for_request(
+            workspace_path=workspace_path,
+            client_collection_name=request.collection_name,
+            logical_repo_id=request.logical_repo_id,
+            source_path=request.source_path,
+        )
+
+        # Enforce collection write access for plan/apply when auth is enabled
+        if AUTH_ENABLED and CTXCE_MCP_ACL_ENFORCE:
+            if not collection_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Collection resolution failed for ACL enforcement",
+                )
+            uid = str((record or {}).get("user_id") or "").strip()
+            if not uid:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired session",
+                )
+            try:
+                allowed = has_collection_access(uid, str(collection_name), "write")
+            except AuthDisabledError:
+                allowed = True
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"User does not have write access to collection '{collection_name}'",
+                )
+
+        plan = plan_delta_upload(
+            workspace_path=workspace_path,
+            operations=request.operations,
+            file_hashes=request.file_hashes,
+        )
+        return PlanResponse(
+            success=True,
+            workspace_path=workspace_path,
+            needed_files=plan.get("needed_files", {"created": [], "updated": [], "moved": []}),
+            operation_counts_preview=plan.get(
+                "operation_counts_preview",
+                {
+                    "created": 0,
+                    "updated": 0,
+                    "deleted": 0,
+                    "moved": 0,
+                    "skipped": 0,
+                    "skipped_hash_match": 0,
+                    "failed": 0,
+                },
+            ),
+            needed_size_bytes=int(plan.get("needed_size_bytes", 0) or 0),
+            replica_targets=list(plan.get("replica_targets", []) or []),
+            diagnostics=dict(plan.get("diagnostics", {}) or {}),
+            fallback_used=False,
+            error=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[upload_service] Error planning delta upload: {e}")
+        return PlanResponse(
+            success=False,
+            workspace_path=request.workspace_path,
+            needed_files={"created": [], "updated": [], "moved": []},
+            operation_counts_preview={
+                "created": 0,
+                "updated": 0,
+                "deleted": 0,
+                "moved": 0,
+                "skipped": 0,
+                "skipped_hash_match": 0,
+                "failed": 0,
+            },
+            needed_size_bytes=0,
+            replica_targets=[],
+            diagnostics={},
+            fallback_used=True,
+            error={
+                "code": "PLAN_ERROR",
+                "message": str(e),
+            },
+        )
+
+
+@app.post("/api/v1/delta/apply_ops", response_model=UploadResponse)
+async def apply_delta_ops(request: ApplyOperationsRequest):
+    """Apply metadata-only delta operations without uploading a tar bundle."""
+    key: Optional[str] = None
+    bundle_id: Optional[str] = None
+    sequence_number: Optional[int] = None
+    try:
+        workspace = Path(request.workspace_path)
+        if not workspace.is_absolute():
+            workspace = Path(WORK_DIR) / workspace
+        workspace_path = str(workspace.resolve())
+
+        if AUTH_ENABLED:
+            session_value = str(request.session or "").strip()
+            try:
+                record = validate_session(session_value)
+            except AuthDisabledError:
+                record = None
+            except Exception as e:
+                logger.error(f"[upload_service] Failed to validate auth session for apply_ops: {e}")
+                raise HTTPException(status_code=500, detail="Failed to validate auth session")
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired session",
+                )
+
+        # Resolve collection name for ACL enforcement
+        collection_name, repo_name = _resolve_collection_for_request(
+            workspace_path=workspace_path,
+            client_collection_name=request.collection_name,
+            logical_repo_id=request.logical_repo_id,
+            source_path=request.source_path,
+        )
+
+        # Enforce collection write access for plan/apply when auth is enabled
+        if AUTH_ENABLED and CTXCE_MCP_ACL_ENFORCE:
+            if not collection_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Collection resolution failed for ACL enforcement",
+                )
+            uid = str((record or {}).get("user_id") or "").strip()
+            if not uid:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired session",
+                )
+            try:
+                allowed = has_collection_access(uid, str(collection_name), "write")
+            except AuthDisabledError:
+                allowed = True
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"User does not have write access to collection '{collection_name}'",
+                )
+
+        manifest = request.manifest or {}
+        bundle_id = manifest.get("bundle_id")
+        manifest_sequence = manifest.get("sequence_number")
+        key = get_workspace_key(workspace_path)
+        last_sequence = get_last_sequence(workspace_path)
+        sequence_number = manifest_sequence if manifest_sequence is not None else last_sequence + 1
+
+        if sequence_number is not None and sequence_number != last_sequence + 1:
+            return UploadResponse(
+                success=False,
+                error={
+                    "code": "SEQUENCE_MISMATCH",
+                    "message": f"Expected sequence {last_sequence + 1}, got {sequence_number}",
+                    "expected_sequence": last_sequence + 1,
+                    "received_sequence": sequence_number,
+                    "retry_after": 5000,
+                },
+            )
+
+        start_time = datetime.now()
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": None,
+            "processing_time_ms": None,
+            "status": "processing",
+            "completed_at": None,
+        }
+
+        operations_count = await asyncio.to_thread(
+            apply_delta_operations,
+            workspace_path,
+            request.operations,
+            request.file_hashes,
+        )
+        processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        failed_count = int((operations_count or {}).get("failed") or 0)
+        applied_count = int(
+            (operations_count or {}).get("created", 0)
+            + (operations_count or {}).get("updated", 0)
+            + (operations_count or {}).get("deleted", 0)
+            + (operations_count or {}).get("moved", 0)
+        )
+        status_value = "completed" if failed_count == 0 else "failed"
+        operation_count = int(
+            applied_count + (operations_count or {}).get("skipped_hash_match", 0)
+        )
+        if operation_count > 0 and failed_count == 0:
+            _sequence_tracker[key] = sequence_number
+        _upload_result_tracker[key] = {
+            "workspace_path": workspace_path,
+            "bundle_id": bundle_id,
+            "sequence_number": sequence_number,
+            "processed_operations": operations_count,
+            "processing_time_ms": processing_time,
+            "status": status_value,
+            "failed_count": failed_count,
+            "partial": bool(failed_count > 0 and applied_count > 0),
+            "completed_at": datetime.now().isoformat(),
+        }
+        if failed_count > 0:
+            logger.warning(
+                "[upload_service] apply_ops completed with failures bundle=%s seq=%s failed=%d ops=%s",
+                bundle_id,
+                sequence_number,
+                failed_count,
+                operations_count,
+            )
+            return UploadResponse(
+                success=False,
+                bundle_id=bundle_id,
+                sequence_number=sequence_number,
+                processed_operations=operations_count,
+                processing_time_ms=processing_time,
+                next_sequence=sequence_number + 1 if sequence_number is not None else None,
+                error={
+                    "code": "APPLY_OPS_PARTIAL_FAILURE",
+                    "message": f"One or more operations failed during apply_ops (failed={failed_count})",
+                    "failed_count": failed_count,
+                    "processed_operations": operations_count,
+                },
+            )
+        logger.info(
+            "[upload_service] Applied metadata-only operations bundle=%s seq=%s in %sms ops=%s",
+            bundle_id,
+            sequence_number,
+            processing_time,
+            operations_count,
+        )
+        return UploadResponse(
+            success=True,
+            bundle_id=bundle_id,
+            sequence_number=sequence_number,
+            processed_operations=operations_count,
+            processing_time_ms=processing_time,
+            next_sequence=sequence_number + 1 if sequence_number is not None else None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[upload_service] Error applying metadata-only operations: {e}")
+        if key:
+            _upload_result_tracker[key] = {
+                "workspace_path": request.workspace_path,
+                "bundle_id": bundle_id,
+                "sequence_number": sequence_number,
+                "processed_operations": None,
+                "processing_time_ms": None,
+                "status": "error",
+                "error": str(e),
+                "message": str(e),
+                "completed_at": datetime.now().isoformat(),
+            }
+        return UploadResponse(
+            success=False,
+            error={
+                "code": "APPLY_OPS_ERROR",
+                "message": str(e),
+            },
+        )
 
 @app.post("/api/v1/delta/upload", response_model=UploadResponse)
 async def upload_delta_bundle(
@@ -1422,60 +1937,13 @@ async def upload_delta_bundle(
 
         workspace_path = str(workspace.resolve())
 
-        # Always derive repo_name from workspace_path for origin tracking
-        repo_name = _extract_repo_name_from_path(workspace_path) if _extract_repo_name_from_path else None
-        if not repo_name:
-            repo_name = Path(workspace_path).name
-
-        # Preserve any client-supplied collection name but allow server-side overrides
-        client_collection_name = collection_name
-        resolved_collection: Optional[str] = None
-
-        # Resolve collection name, preferring server-side mapping for logical_repo_id when enabled
-        if logical_repo_reuse_enabled() and logical_repo_id and find_collection_for_logical_repo:
-            try:
-                existing = find_collection_for_logical_repo(logical_repo_id, search_root=WORK_DIR)
-            except Exception:
-                existing = None
-            if existing:
-                resolved_collection = existing
-
-        # Latent migration: when no explicit mapping exists yet for this logical_repo_id, but there is a
-        # single existing collection mapping, prefer reusing it rather than creating a fresh collection.
-        if logical_repo_reuse_enabled() and logical_repo_id and resolved_collection is None and get_collection_mappings:
-            try:
-                mappings = get_collection_mappings(search_root=WORK_DIR) or []
-            except Exception:
-                mappings = []
-
-            if len(mappings) == 1:
-                canonical = mappings[0]
-                canonical_coll = canonical.get("collection_name")
-                if canonical_coll:
-                    resolved_collection = canonical_coll
-                    if update_workspace_state:
-                        try:
-                            update_workspace_state(
-                                workspace_path=canonical.get("container_path") or canonical.get("state_file"),
-                                updates={"logical_repo_id": logical_repo_id},
-                                repo_name=canonical.get("repo_name"),
-                            )
-                        except Exception as migrate_err:
-                            logger.debug(
-                                f"[upload_service] Failed to migrate logical_repo_id for existing mapping: {migrate_err}"
-                            )
-
-        # Finalize collection_name: prefer resolved server-side mapping, then client-supplied name,
-        # then standard get_collection_name/DEFAULT_COLLECTION fallbacks.
-        if resolved_collection is not None:
-            collection_name = resolved_collection
-        elif client_collection_name:
-            collection_name = client_collection_name
-        else:
-            if get_collection_name and repo_name:
-                collection_name = get_collection_name(repo_name)
-            else:
-                collection_name = DEFAULT_COLLECTION
+        # Resolve collection name and repo name
+        collection_name, repo_name = _resolve_collection_for_request(
+            workspace_path=workspace_path,
+            client_collection_name=collection_name,
+            logical_repo_id=logical_repo_id,
+            source_path=source_path,
+        )
 
         # Enforce collection write access for uploads when auth is enabled.
         # Semantics: "write" is sufficient for uploading/indexing content.

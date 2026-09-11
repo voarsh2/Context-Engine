@@ -1,6 +1,6 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.15.4
     container_name: qdrant-db
     # Expose Qdrant database APIs to the host
     # 6333 = HTTP API, 6334 = gRPC
@@ -211,7 +211,7 @@ services:
       - ${HOST_INDEX_PATH:-.}:/work:ro
       - ${HOST_INDEX_PATH:-.}/.codebase:/work/.codebase:rw
 
-    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/ingest_code.py"]
+    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.ingest_code --root /work"]
 
   watcher:
     build:
@@ -235,6 +235,7 @@ services:
       - QWEN3_QUERY_INSTRUCTION=${QWEN3_QUERY_INSTRUCTION:-1}
       - QWEN3_INSTRUCTION_TEXT=${QWEN3_INSTRUCTION_TEXT}
       - WATCH_ROOT=/work
+      - CTXCE_METADATA_ROOT=${CTXCE_METADATA_ROOT:-/work}
       # Watcher-specific backpressure & timeouts (safer defaults)
       - QDRANT_TIMEOUT=60
       - MAX_MICRO_CHUNKS_PER_FILE=${MAX_MICRO_CHUNKS_PER_FILE:-200}
@@ -245,7 +246,7 @@ services:
     volumes:
       - ${HOST_INDEX_PATH:-.}:/work:ro
       - ${HOST_INDEX_PATH:-.}/.codebase:/work/.codebase:rw
-    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && exec python /app/scripts/watch_index.py"]
+    entrypoint: ["sh", "-c", "mkdir -p /tmp/huggingface/hub /tmp/huggingface/transformers /tmp/huggingface/fastembed && cd /app && exec python -m scripts.watch_index"]
 
 
   upload_service:
@@ -262,6 +263,7 @@ services:
       - UPLOAD_SERVICE_PORT=8002
       - QDRANT_URL=${QDRANT_URL}
       - WORK_DIR=/work
+      - CTXCE_METADATA_ROOT=${CTXCE_METADATA_ROOT:-/work}
       - CTXCE_ADMIN_COLLECTION_DELETE_ENABLED=0
       - CTXCE_COLLECTION_REGISTRY_UNDELETE_ON_DISCOVERY=${CTXCE_COLLECTION_REGISTRY_UNDELETE_ON_DISCOVERY:-0}
       - COLLECTION_NAME=${COLLECTION_NAME:-codebase}
@@ -300,7 +302,7 @@ services:
       - ${HOST_INDEX_PATH:-.}:/work:ro
       - ${HOST_INDEX_PATH:-.}/.codebase:/work/.codebase:rw
 
-    entrypoint: ["python", "/app/scripts/create_indexes.py"]
+    entrypoint: ["python", "-m", "scripts.create_indexes"]
 
 volumes:
   qdrant_storage:

@@ -98,7 +98,7 @@ def test_adaptive_span_sizing_failure_is_non_fatal(monkeypatch):
     monkeypatch.setenv("COLLECTION_NAME", "dummy")
 
     # Force extent lookup to throw; the budgeter should swallow it.
-    import scripts.hybrid_ranking as hr
+    from scripts.hybrid import ranking as hr
     monkeypatch.setattr(hr, "_get_symbol_extent", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
 
     items = [

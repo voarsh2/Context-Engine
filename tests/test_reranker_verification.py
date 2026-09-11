@@ -16,6 +16,10 @@ class _FastMCP:
         def _decorator(fn):
             return fn
         return _decorator
+    def resource(self, *args, **kwargs):
+        def _decorator(fn):
+            return fn
+        return _decorator
 
 class _Context:
     def __init__(self, *args, **kwargs):
@@ -50,6 +54,8 @@ async def test_rerank_inproc_changes_order(monkeypatch):
     # Force in-process hybrid + in-process rerank paths
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "1")
+    # Rerank verification suite explicitly exercises non-dense plumbing.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     # Baseline hybrid results (JSON structured items); A before B
     def fake_run_hybrid_search(**kwargs):
@@ -92,7 +98,7 @@ async def test_rerank_inproc_changes_order(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        importlib.import_module("scripts.rerank_local"),
+        importlib.import_module("scripts.rerank_tools.local"),
         "rerank_local",
         fake_rerank_local,
     )
@@ -102,7 +108,9 @@ async def test_rerank_inproc_changes_order(monkeypatch):
     assert [r["path"] for r in base["results"]] == ["/work/a.py", "/work/b.py"]
 
     # With rerank enabled, order should flip to B then A; counters should show inproc_hybrid
-    rr = await server.repo_search(query="q", limit=2, per_path=2, rerank_enabled=True, compact=True)
+    rr = await server.repo_search(
+        query="q", limit=2, per_path=2, rerank_enabled=True, compact=True, debug=True
+    )
     assert rr.get("used_rerank") is True
     assert rr.get("rerank_counters", {}).get("inproc_hybrid", 0) >= 1
     assert [r["path"] for r in rr["results"]] == ["/work/b.py", "/work/a.py"]
@@ -114,6 +122,8 @@ async def test_rerank_inproc_dense_respects_collection_argument(monkeypatch):
     # Drive the in-process dense rerank fallback path by returning no hybrid candidates.
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "1")
+    # Explicit non-dense mode for rerank-path contract checks.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     def fake_run_hybrid_search(**kwargs):
         return []
@@ -130,7 +140,7 @@ async def test_rerank_inproc_dense_respects_collection_argument(monkeypatch):
         return []
 
     monkeypatch.setattr(
-        importlib.import_module("scripts.rerank_local"),
+        importlib.import_module("scripts.rerank_tools.local"),
         "rerank_in_process",
         fake_rerank_in_process,
     )
@@ -149,10 +159,77 @@ async def test_rerank_inproc_dense_respects_collection_argument(monkeypatch):
 
 @pytest.mark.service
 @pytest.mark.anyio
+async def test_rerank_inproc_dense_respects_path_filters(monkeypatch):
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("RERANK_IN_PROCESS", "1")
+    # Explicit non-dense mode for rerank-path contract checks.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
+
+    def fake_run_hybrid_search(**kwargs):
+        return []
+
+    monkeypatch.setitem(sys.modules, "scripts.hybrid_search", _make_hybrid_stub(fake_run_hybrid_search))
+    monkeypatch.delitem(sys.modules, "scripts.mcp_indexer_server", raising=False)
+    server = importlib.import_module("scripts.mcp_indexer_server")
+    monkeypatch.setattr(server, "_get_embedding_model", _fake_embedding_model)
+
+    def fake_rerank_in_process(**kwargs):
+        return [
+            {"score": 0.9, "path": "/work/src/a.py", "symbol": "", "start_line": 1, "end_line": 3},
+            {"score": 0.8, "path": "/work/tests/b.py", "symbol": "", "start_line": 5, "end_line": 9},
+            {
+                "score": 0.7,
+                "path": "/home/coder/project/Context-Engine/scripts/mcp_impl/search.py",
+                "symbol": "",
+                "start_line": 10,
+                "end_line": 20,
+            },
+        ]
+
+    monkeypatch.setattr(
+        importlib.import_module("scripts.rerank_tools.local"),
+        "rerank_in_process",
+        fake_rerank_in_process,
+    )
+
+    only_tests = await server.repo_search(
+        query="q",
+        limit=10,
+        rerank_enabled=True,
+        path_glob=["tests/**"],
+        compact=True,
+    )
+    assert [r["path"] for r in only_tests["results"]] == ["/work/tests/b.py"]
+
+    no_tests = await server.repo_search(
+        query="q",
+        limit=10,
+        rerank_enabled=True,
+        not_glob=["**/tests/**"],
+        compact=True,
+    )
+    assert all("/tests/" not in r["path"] for r in no_tests["results"])
+
+    host_rel_glob = await server.repo_search(
+        query="q",
+        limit=10,
+        rerank_enabled=True,
+        path_glob=["scripts/mcp_impl/**"],
+        compact=True,
+    )
+    assert [r["path"] for r in host_rel_glob["results"]] == [
+        "/home/coder/project/Context-Engine/scripts/mcp_impl/search.py"
+    ]
+
+
+@pytest.mark.service
+@pytest.mark.anyio
 async def test_rerank_subprocess_timeout_fallback(monkeypatch):
     # Force hybrid via subprocess output (doesn't matter which) and disable inproc rerank
     monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
     monkeypatch.setenv("RERANK_IN_PROCESS", "0")
+    # Explicit non-dense mode for rerank-path contract checks.
+    monkeypatch.setenv("REPO_SEARCH_DEFAULT_MODE", "hybrid")
 
     def fake_run_hybrid_search(**kwargs):
         return [
@@ -187,9 +264,9 @@ async def test_rerank_subprocess_timeout_fallback(monkeypatch):
         rerank_enabled=True,
         compact=True,
         collection="test-coll",
+        debug=True,
     )
     # Fallback should keep original order from hybrid; timeout counter incremented
     assert rr.get("used_rerank") is False
     assert rr.get("rerank_counters", {}).get("timeout", 0) >= 1
     assert [r["path"] for r in rr["results"]] == ["/work/a.py", "/work/b.py"]
-

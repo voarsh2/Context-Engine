@@ -10,17 +10,11 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 import time
 import hashlib
 from dataclasses import dataclass, field, asdict
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-# Shared stats helpers (after sys.path setup)
 from scripts.benchmarks.common import percentile, extract_result_paths, resolve_collection_auto
 
 # Ensure correct collection is used (read from workspace state or env)
@@ -228,7 +222,7 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "queries": [
             {"tool": "repo_search", "query": "init_openlit error handling"},
             {"tool": "symbol_graph", "symbol": "init_openlit", "query_type": "callers"},
-            {"tool": "search_tests_for", "query": "openlit initialization"},
+            {"tool": "repo_search", "query": "openlit initialization", "profile": "tests"},
         ],
         "expected_paths": ["openlit_init.py", "test_openlit"],
     },
@@ -237,7 +231,7 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "queries": [
             {"tool": "repo_search", "query": "memory store implementation pattern"},
             {"tool": "context_answer", "query": "How does memory_store work?"},
-            {"tool": "search_config_for", "query": "memory collection settings"},
+            {"tool": "repo_search", "query": "memory collection settings", "profile": "config"},
         ],
         "expected_paths": ["mcp_impl/memory.py", "memory_store"],
     },
@@ -245,10 +239,10 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "description": "Trace dependencies across multiple files",
         "queries": [
             {"tool": "symbol_graph", "symbol": "get_embedding_model", "query_type": "callers"},
-            {"tool": "search_importers_for", "query": "embedder"},
+            {"tool": "repo_search", "query": "embedder", "profile": "code"},
             {"tool": "repo_search", "query": "embedding dimension vector size"},
         ],
-        "expected_paths": ["embedder.py", "rerank_recursive"],
+        "expected_paths": ["embedder.py"],
     },
     "documentation": {
         "description": "Generate explanation of a module",
@@ -460,18 +454,12 @@ async def run_benchmark(
             repo_search,
             context_answer,
             symbol_graph,
-            search_tests_for,
-            search_config_for,
-            search_importers_for,
             memory_find,
         )
         tool_registry = {
             "repo_search": repo_search,
             "context_answer": context_answer,
             "symbol_graph": symbol_graph,
-            "search_tests_for": search_tests_for,
-            "search_config_for": search_config_for,
-            "search_importers_for": search_importers_for,
             "memory_find": memory_find,
         }
     except ImportError as e:

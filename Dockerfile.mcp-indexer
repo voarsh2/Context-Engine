@@ -32,13 +32,14 @@ ENV RERANKER_ONNX_PATH=/app/models/reranker.onnx \
 
 # Bake scripts into the image so entrypoints don't rely on /work
 COPY scripts /app/scripts
+RUN chmod -R a+rX /app/scripts
 
 COPY bench /app/bench
 
 # Expose SSE port for this companion server
 EXPOSE 8001
 
-WORKDIR /work
+WORKDIR /app
 
 # Default command runs the companion MCP server
-CMD ["python", "/app/scripts/mcp_indexer_server.py"]
+CMD ["python", "-m", "scripts.mcp_indexer_server"]

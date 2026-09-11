@@ -4,12 +4,12 @@ hybrid_search.py - Façade module for hybrid code search.
 
 This is the stable public entrypoint for the hybrid search subsystem.
 All internal logic has been refactored into smaller, focused modules:
-- hybrid_config.py: Environment-based configuration and constants
-- hybrid_qdrant.py: Qdrant client management, queries, and vector functions
-- hybrid_embed.py: Embedding model factory and cached embedding
-- hybrid_filters.py: File classification and query DSL parsing
-- hybrid_ranking.py: RRF, scoring, diversification, and micro-span budgeting
-- hybrid_expand.py: Query expansion (synonyms, semantic, LLM-assisted)
+- hybrid/config.py: Environment-based configuration and constants
+- hybrid/qdrant.py: Qdrant client management, queries, and vector functions
+- hybrid/embed.py: Embedding model factory and cached embedding
+- hybrid/filters.py: File classification and query DSL parsing
+- hybrid/ranking.py: RRF, scoring, diversification, and micro-span budgeting
+- hybrid/expand.py: Query expansion (synonyms, semantic, LLM-assisted)
 
 This façade:
 1. Re-exports all public APIs for backwards compatibility
@@ -19,32 +19,36 @@ This façade:
 from __future__ import annotations
 
 import os
-import sys
 import argparse
 import re
 import json
 import math
 import logging
 import threading
-from pathlib import Path
 from typing import List, Dict, Any, Tuple, TYPE_CHECKING
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
-# Ensure /work or repo root is in sys.path for scripts imports
-_ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(_ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(_ROOT_DIR))
+# ---------------------------------------------------------------------------
+# Lazy Qdrant model namespace
+# ---------------------------------------------------------------------------
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any
 
-# ---------------------------------------------------------------------------
-# Core Qdrant imports
-# ---------------------------------------------------------------------------
-from qdrant_client import QdrantClient, models
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_config
 # ---------------------------------------------------------------------------
-from scripts.hybrid_config import (
+from scripts.hybrid.config import (
     # Helper functions
     _safe_int,
     _safe_float,
@@ -109,7 +113,7 @@ from scripts.hybrid_config import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_qdrant
 # ---------------------------------------------------------------------------
-from scripts.hybrid_qdrant import (
+from scripts.hybrid.qdrant import (
     # Pool availability
     _POOL_AVAILABLE,
     # Connection pooling
@@ -142,7 +146,7 @@ from scripts.hybrid_qdrant import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_embed
 # ---------------------------------------------------------------------------
-from scripts.hybrid_embed import (
+from scripts.hybrid.embed import (
     # Embedder factory
     _EMBEDDER_FACTORY,
     EmbeddingModel,
@@ -156,34 +160,21 @@ from scripts.hybrid_embed import (
     UNIFIED_CACHE_AVAILABLE,
 )
 
-# Import unified cache objects from cache_manager when available
-if UNIFIED_CACHE_AVAILABLE:
-    try:
-        from scripts.cache_manager import get_search_cache, get_embedding_cache, get_expansion_cache
-        _EMBED_CACHE = get_embedding_cache()
-        _RESULTS_CACHE = get_search_cache()
-        _EXPANSION_CACHE = get_expansion_cache()
-    except ImportError:
-        _EMBED_CACHE = None
-        _RESULTS_CACHE = {}
-        _EXPANSION_CACHE = None
-else:
-    _EMBED_CACHE = None
-    _RESULTS_CACHE = {}
-    _EXPANSION_CACHE = None
+from scripts.cache_manager import get_search_cache, get_embedding_cache, get_expansion_cache
 
-# Lightweight local fallback cache for deterministic test hits
-try:
-    from collections import OrderedDict as _OD
-except Exception:
-    _OD = dict  # pragma: no cover
+_EMBED_CACHE = get_embedding_cache()
+_RESULTS_CACHE = get_search_cache()
+_EXPANSION_CACHE = get_expansion_cache()
+
+from collections import OrderedDict as _OD
+
 _RESULTS_CACHE_OD = _OD()
 _RESULTS_LOCK = threading.RLock()
 
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_filters
 # ---------------------------------------------------------------------------
-from scripts.hybrid_filters import (
+from scripts.hybrid.filters import (
     # File patterns
     CORE_FILE_PATTERNS,
     NON_CORE_PATTERNS,
@@ -206,7 +197,7 @@ from scripts.hybrid_filters import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_ranking
 # ---------------------------------------------------------------------------
-from scripts.hybrid_ranking import (
+from scripts.hybrid.ranking import (
     # RRF
     rrf,
     _scale_rrf_k,
@@ -238,7 +229,7 @@ from scripts.hybrid_ranking import (
 # ---------------------------------------------------------------------------
 # Re-exports from hybrid_expand
 # ---------------------------------------------------------------------------
-from scripts.hybrid_expand import (
+from scripts.hybrid.expand import (
     # Synonyms
     CODE_SYNONYMS,
     # Expansion functions
@@ -253,7 +244,7 @@ from scripts.hybrid_expand import (
 
 # Conditionally re-export semantic expansion functions
 if SEMANTIC_EXPANSION_AVAILABLE:
-    from scripts.hybrid_expand import (
+    from scripts.hybrid.expand import (
         expand_queries_semantically,
         expand_queries_with_prf,
         get_expansion_stats,
@@ -268,34 +259,27 @@ else:
 # ---------------------------------------------------------------------------
 # Additional imports for backward compatibility
 # ---------------------------------------------------------------------------
-try:
-    from fastembed import TextEmbedding
-except ImportError:
-    TextEmbedding = None  # type: ignore
+TextEmbedding = None  # Tests may monkeypatch this; production imports lazily if needed.
 
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-except ImportError:
-    _get_embedding_model = None
+from scripts.embedder import get_embedding_model as _get_embedding_model
 
 # Import request deduplication system
-try:
-    from scripts.deduplication import get_deduplicator, is_duplicate_request
-    DEDUPLICATION_AVAILABLE = True
-except ImportError:
-    DEDUPLICATION_AVAILABLE = False
+from scripts.deduplication import get_deduplicator, is_duplicate_request
+
+DEDUPLICATION_AVAILABLE = True
 
 # Import query optimizer for dynamic EF tuning
-try:
-    from scripts.query_optimizer import get_query_optimizer, optimize_query
-    QUERY_OPTIMIZER_AVAILABLE = True
-except ImportError:
-    QUERY_OPTIMIZER_AVAILABLE = False
+from scripts.query_optimizer import get_query_optimizer, optimize_query
+
+QUERY_OPTIMIZER_AVAILABLE = True
 
 # Import ingest helpers
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
-from scripts.ingest_code import ensure_collection as _ensure_collection_raw
-from scripts.ingest_code import project_mini as _project_mini
+from scripts.ingest.vectors import project_mini as _project_mini
+from scripts.path_scope import (
+    normalize_under as _normalize_under_scope,
+    metadata_matches_under as _metadata_matches_under,
+)
 
 # ---------------------------------------------------------------------------
 # Module logger
@@ -308,6 +292,31 @@ logger = logging.getLogger("hybrid_search")
 _FILTER_CACHE: Dict[int, Any] = {}
 _FILTER_CACHE_LOCK = threading.Lock()
 _FILTER_CACHE_MAX = 256
+
+def _compute_fname_boost(query: str, md: dict, boost_factor: float) -> float:
+    """Compute filename relevance boost based on query token matches in file path.
+
+    Args:
+        query: The search query text
+        md: Metadata dict containing at least a 'path' key
+        boost_factor: Maximum boost multiplier
+
+    Returns:
+        Boost score (0.0 if no match)
+    """
+    import re as _re
+    path = str(md.get("path") or "").lower()
+    q = query.lower()
+    q_toks = {t for t in _re.findall(r"[a-z0-9_]{3,}", q) if len(t) >= 3}
+    if not q_toks:
+        return 0.0
+    fname = path.rsplit("/", 1)[-1] if "/" in path else path
+    fname_base = _re.sub(r"\.[^.]+$", "", fname)
+    fname_toks = {t for t in _re.split(r"[_\-.]", fname_base) if t and len(t) >= 3}
+    match_count = len(q_toks & fname_toks)
+    if match_count >= 2:
+        return float(boost_factor) * match_count
+    return 0.0
 
 # Cached regex pattern compilation
 @lru_cache(maxsize=128)
@@ -421,13 +430,64 @@ def _generate_code_query_variants(query: str) -> List[str]:
     return result[:5]  # Max 5 variants to balance coverage vs compute
 
 
+def _shape_dense_points(
+    ranked_points: List[Any],
+    *,
+    limit: int,
+    per_path: int | None = 1,
+    under: str | None = None,
+) -> List[Dict[str, Any]]:
+    eff_under = _normalize_under_scope(under)
+    eff_per_path = int(per_path or 0)
+
+    results: List[Dict[str, Any]] = []
+    path_counts: dict[str, int] = {}
+    for p in ranked_points:
+        payload = p.payload or {}
+        md = payload.get("metadata") or {}
+        if eff_under and not _metadata_matches_under(md, eff_under):
+            continue
+
+        # Prefer host_path when available (consistent with hybrid search).
+        path = md.get("host_path") or payload.get("path") or md.get("path") or ""
+        if eff_per_path > 0:
+            current = path_counts.get(path, 0)
+            if current >= eff_per_path:
+                continue
+        else:
+            current = 0
+
+        results.append(
+            {
+                "score": float(getattr(p, "score", 0) or 0),
+                "path": path,
+                "symbol": payload.get("symbol") or md.get("symbol") or "",
+                "start_line": int(md.get("start_line") or 0),
+                "end_line": int(md.get("end_line") or 0),
+                "code_id": payload.get("code_id") or payload.get("_id") or "",
+                "doc_id": payload.get("code_id") or payload.get("_id") or "",
+                "payload": payload,
+            }
+        )
+        if eff_per_path > 0:
+            path_counts[path] = current + 1
+        if len(results) >= int(limit):
+            break
+
+    return results
+
+
 def run_pure_dense_search(
     query: str,
     limit: int = 10,
+    per_path: int | None = 1,
     model: Any = None,
     collection: str | None = None,
     language: str | None = None,
     under: str | None = None,
+    kind: str | None = None,
+    symbol: str | None = None,
+    ext: str | None = None,
     repo: str | list[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """Pure dense search - single query embedding, single vector search.
@@ -437,45 +497,51 @@ def run_pure_dense_search(
     Args:
         query: Natural language query
         limit: Max results to return
+        per_path: Optional max results per file path; <= 0 disables the cap
         model: Embedding model (will load default if None)
         collection: Qdrant collection name
         language: Optional language filter
-        under: Optional path prefix filter
+        under: Optional recursive workspace subtree filter
+        kind: Optional kind filter (exact match)
+        symbol: Optional symbol filter (exact match)
+        ext: Optional file extension filter (without dot)
         repo: Optional repo filter
 
     Returns:
         List of search results with raw cosine similarity scores
     """
-    from scripts.hybrid_qdrant import get_qdrant_client, return_qdrant_client, dense_query
+    from scripts.hybrid.qdrant import get_qdrant_client, return_qdrant_client, dense_query
     from scripts.utils import sanitize_vector_name
     from qdrant_client import models
 
     # Get model
     if model is None:
         model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
-        try:
-            from scripts.embedder import get_embedding_model
-            model = get_embedding_model(model_name)
-        except ImportError:
-            from fastembed import TextEmbedding
-            model = TextEmbedding(model_name=model_name)
+        from scripts.embedder import get_embedding_model
+        model = get_embedding_model(model_name)
     else:
         model_name = getattr(model, "model_name", os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"))
 
     vec_name = sanitize_vector_name(model_name)
     coll = collection or _collection()
 
-    # Build filter
+    # Build server-side filter (exclude `under` here; recursive under is post-filtered)
     must = []
     if language:
         must.append(models.FieldCondition(key="metadata.language", match=models.MatchValue(value=language)))
-    if under:
-        must.append(models.FieldCondition(key="metadata.path_prefix", match=models.MatchValue(value=under)))
     if repo and repo != "*":
         if isinstance(repo, list):
             must.append(models.FieldCondition(key="metadata.repo", match=models.MatchAny(any=repo)))
         else:
             must.append(models.FieldCondition(key="metadata.repo", match=models.MatchValue(value=repo)))
+    if kind:
+        must.append(models.FieldCondition(key="metadata.kind", match=models.MatchValue(value=kind)))
+    if symbol:
+        must.append(models.FieldCondition(key="metadata.symbol", match=models.MatchValue(value=symbol)))
+    if ext:
+        ext_clean = str(ext).lower().lstrip(".")
+        if ext_clean:
+            must.append(models.FieldCondition(key="metadata.ext", match=models.MatchValue(value=ext_clean)))
     flt = models.Filter(must=must) if must else None
 
     # Single query embedding - no variants, no expansion
@@ -500,30 +566,22 @@ def run_pure_dense_search(
     )
 
     try:
-        # Single dense query - no pooling, no re-scoring
-        ranked_points = dense_query(client, vec_name, vec_list, flt, limit, coll, query_text=query)
+        # Single dense query - no pooling, no re-scoring.
+        # When `under` or `per_path` is set, we may need to over-fetch so post-filters
+        # can still fill up to `limit` results.
+        eff_under = _normalize_under_scope(under)
+        fetch_limit = int(limit)
+        eff_per_path = int(per_path or 0)
+        if eff_under or eff_per_path > 0:
+            fetch_limit = min(max(fetch_limit * 4, fetch_limit + 16), 2000)
+        ranked_points = dense_query(client, vec_name, vec_list, flt, fetch_limit, coll, query_text=query)
 
-        # Build output
-        results = []
-        for p in ranked_points:
-            payload = p.payload or {}
-            md = payload.get("metadata") or {}
-
-            # Prefer host_path when available (consistent with hybrid search)
-            _path = md.get("host_path") or payload.get("path") or md.get("path") or ""
-
-            results.append({
-                "score": float(getattr(p, "score", 0) or 0),
-                "path": _path,
-                "symbol": payload.get("symbol") or md.get("symbol") or "",
-                "start_line": int(md.get("start_line") or 0),
-                "end_line": int(md.get("end_line") or 0),
-                "code_id": payload.get("code_id") or payload.get("_id") or "",
-                "doc_id": payload.get("code_id") or payload.get("_id") or "",
-                "payload": payload,
-            })
-
-        return results
+        return _shape_dense_points(
+            ranked_points,
+            limit=limit,
+            per_path=per_path,
+            under=under,
+        )
 
     finally:
         return_qdrant_client(client)
@@ -532,7 +590,7 @@ def run_pure_dense_search(
 # ---------------------------------------------------------------------------
 # Backward compatibility: _embed_queries_cached alias
 # ---------------------------------------------------------------------------
-# The function is now in hybrid_embed.py as embed_queries_cached
+# The function is now in hybrid/embed.py as embed_queries_cached
 # Keep the underscore-prefixed alias for any legacy callers
 
 
@@ -612,7 +670,11 @@ def _run_hybrid_search_impl(
     elif _EMBEDDER_FACTORY:
         _model = _get_embedding_model(model_name)
     else:
-        _model = TextEmbedding(model_name=model_name)
+        text_embedding_cls = TextEmbedding
+        if text_embedding_cls is None:
+            from fastembed import TextEmbedding as text_embedding_cls
+
+        _model = text_embedding_cls(model_name=model_name)
     vec_name = _sanitize_vector_name(model_name)
 
     # Parse Query DSL and merge with explicit args
@@ -690,21 +752,8 @@ def _run_hybrid_search_impl(
     eff_path_globs_norm = _normalize_globs(eff_path_globs)
     eff_not_globs_norm = _normalize_globs(eff_not_globs)
 
-    # Normalize under
-    def _norm_under(u: str | None) -> str | None:
-        if not u:
-            return None
-        u = str(u).strip().replace("\\", "/")
-        u = "/".join([p for p in u.split("/") if p])
-        if not u:
-            return None
-        if not u.startswith("/"):
-            v = "/work/" + u
-        else:
-            v = "/work/" + u.lstrip("/") if not u.startswith("/work/") else u
-        return v
-
-    eff_under = _norm_under(eff_under)
+    # Normalize under as a user-facing recursive subtree scope.
+    eff_under = _normalize_under_scope(eff_under)
 
     # Expansion knobs that affect query construction/results (must be part of cache key)
     try:
@@ -810,12 +859,8 @@ def _run_hybrid_search_impl(
                     key="metadata.repo", match=models.MatchValue(value=eff_repo)
                 )
             )
-    if eff_under:
-        must.append(
-            models.FieldCondition(
-                key="metadata.path_prefix", match=models.MatchValue(value=eff_under)
-            )
-        )
+    # NOTE: `under` is recursive and user-facing; we enforce it in client-side
+    # filtering via normalized metadata paths instead of exact path_prefix equality.
     if eff_kind:
         must.append(
             models.FieldCondition(
@@ -1726,8 +1771,7 @@ def _run_hybrid_search_impl(
         # Filename boost: production-grade matching (handles snake/camel/kebab, acronyms, etc.)
         if FNAME_BOOST > 0.0 and path:
             try:
-                from scripts.rerank_recursive.utils import _compute_fname_boost as _compute_fname_boost  # type: ignore
-                fname_boost = float(_compute_fname_boost(_base_query, md, float(FNAME_BOOST)))
+                fname_boost = _compute_fname_boost(_base_query, md, float(FNAME_BOOST))
                 if fname_boost > 0:
                     rec["fname"] += fname_boost
                     rec["s"] += fname_boost
@@ -2105,7 +2149,7 @@ def _run_hybrid_search_impl(
             return _fnm.fnmatchcase(path, pat)
         return _fnm.fnmatchcase(path.lower(), pat.lower())
 
-    if eff_not or eff_path_regex or eff_ext or eff_path_globs or eff_not_globs:
+    if eff_under or eff_not or eff_path_regex or eff_ext or eff_path_globs or eff_not_globs:
 
         def _pass_filters(m: Dict[str, Any]) -> bool:
             md = (m["pt"].payload or {}).get("metadata") or {}
@@ -2118,6 +2162,8 @@ def _run_hybrid_search_impl(
                 nn = eff_not if case_sensitive else eff_not.lower()
                 if nn in p_for_sub or nn in pp_for_sub:
                     return False
+            if eff_under and not _metadata_matches_under(md, eff_under):
+                return False
             if eff_not_globs_norm and any(_match_glob(g, path) or _match_glob(g, rel) for g in eff_not_globs_norm):
                 return False
             if eff_ext:
@@ -2341,6 +2387,8 @@ def _run_hybrid_search_impl(
         _imports = md.get("imports") or []
         _calls = md.get("calls") or []
         _symp = md.get("symbol_path") or md.get("symbol") or ""
+        _kind = str(md.get("kind") or "")
+        _repo_name = str(md.get("repo") or "")
         _pp = str(md.get("path_prefix") or "")
         _path = str(md.get("path") or "")
         _related_set = set()
@@ -2439,6 +2487,18 @@ def _run_hybrid_search_impl(
         _tags = _payload.get("tags")
         if _tags is None:
             _tags = _metadata.get("tags")
+        _file_hash = str(
+            _payload.get("file_hash")
+            or _metadata.get("file_hash")
+            or _payload.get("content_hash")
+            or _metadata.get("content_hash")
+            or ""
+        )
+        _symbol_content_hash = str(
+            _payload.get("symbol_content_hash")
+            or _metadata.get("symbol_content_hash")
+            or ""
+        )
         # Skip memory-like points without a real file path
         if not _path or not _path.strip():
             if os.environ.get("DEBUG_HYBRID_FILTER"):
@@ -2505,6 +2565,8 @@ def _run_hybrid_search_impl(
             "host_path": _host,
             "container_path": _cont,
             "symbol": _symp,
+            "kind": _kind,
+            "repo": _repo_name,
             "start_line": start_line,
             "end_line": end_line,
             "components": comp,
@@ -2515,6 +2577,8 @@ def _run_hybrid_search_impl(
             "text": _text,
             "pseudo": _pseudo,
             "tags": _tags,
+            "file_hash": _file_hash,
+            "symbol_content_hash": _symbol_content_hash,
         }
         if why is not None:
             item["why"] = why

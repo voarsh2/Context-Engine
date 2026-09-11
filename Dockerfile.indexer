@@ -29,9 +29,10 @@ ENV RERANKER_ONNX_PATH=/app/models/reranker.onnx \
 
 # Bake scripts into the image so we can mount arbitrary code at /work
 COPY scripts /app/scripts
+RUN chmod -R a+rX /app/scripts
 
 
-WORKDIR /work
+WORKDIR /app
 
 # Default command shows help; Makefile/compose will override entrypoint
-CMD ["python", "/app/scripts/ingest_code.py", "--help"]
+CMD ["python", "-m", "scripts.ingest_code", "--help"]

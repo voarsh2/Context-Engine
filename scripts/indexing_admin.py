@@ -10,70 +10,36 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-try:
-    from qdrant_client import QdrantClient
-except Exception:
-    QdrantClient = None  # type: ignore
+from qdrant_client import QdrantClient
 
-try:
-    from scripts.embedder import get_model_dimension
-except Exception:
-    get_model_dimension = None  # type: ignore
-
-try:
-    from scripts.collection_admin import copy_collection_qdrant
-except Exception:
-    copy_collection_qdrant = None  # type: ignore
-
-try:
-    from scripts.ingest_code import (
-        ensure_collection_and_indexes_once,
-        ensure_payload_indexes,
-        _sanitize_vector_name,
-        MINI_VECTOR_NAME as _MINI_VECTOR_NAME,
-        LEX_SPARSE_NAME as _LEX_SPARSE_NAME,
-    )
-except Exception:
-    ensure_collection_and_indexes_once = None  # type: ignore
-    ensure_payload_indexes = None  # type: ignore
-    _sanitize_vector_name = None  # type: ignore
-    _MINI_VECTOR_NAME = os.environ.get("MINI_VECTOR_NAME", "mini")
-    _LEX_SPARSE_NAME = os.environ.get("LEX_SPARSE_NAME", "lex_sparse")
-
-try:
-    from scripts.workspace_state import (
-        get_collection_mappings,
-        get_workspace_state,
-        update_workspace_state,
-        update_indexing_status,
-        get_indexing_config_snapshot,
-        compute_indexing_config_hash,
-        is_staging_enabled,
-        set_staging_state,
-        update_staging_status,
-        clear_staging_collection,
-        activate_staging_collection,
-        promote_pending_indexing_config,
-        persist_indexing_config,
-    )
-except Exception:
-    get_collection_mappings = None  # type: ignore
-    get_workspace_state = None  # type: ignore
-    update_workspace_state = None  # type: ignore
-    update_indexing_status = None  # type: ignore
-    get_indexing_config_snapshot = None  # type: ignore
-    compute_indexing_config_hash = None  # type: ignore
-    is_staging_enabled = None  # type: ignore
-    set_staging_state = None  # type: ignore
-    update_staging_status = None  # type: ignore
-    clear_staging_collection = None  # type: ignore
-    activate_staging_collection = None  # type: ignore
-    promote_pending_indexing_config = None  # type: ignore
-    persist_indexing_config = None  # type: ignore
+from scripts.embedder import get_model_dimension
+from scripts.collection_admin import copy_collection_qdrant
+from scripts.ingest_code import (
+    ensure_collection_and_indexes_once,
+    ensure_payload_indexes,
+    _sanitize_vector_name,
+    MINI_VECTOR_NAME as _MINI_VECTOR_NAME,
+    LEX_SPARSE_NAME as _LEX_SPARSE_NAME,
+)
+from scripts.workspace_state import (
+    get_collection_mappings,
+    get_workspace_state,
+    update_workspace_state,
+    update_indexing_status,
+    get_indexing_config_snapshot,
+    compute_indexing_config_hash,
+    is_staging_enabled,
+    set_staging_state,
+    update_staging_status,
+    clear_staging_collection,
+    activate_staging_collection,
+    promote_pending_indexing_config,
+    persist_indexing_config,
+)
 
 
 def _staging_enabled() -> bool:
-    return bool(is_staging_enabled() if callable(is_staging_enabled) else False)
+    return bool(is_staging_enabled())
 
 
 def _workspace_base_dir() -> Path:
@@ -141,7 +107,7 @@ _MAPPING_INDEX_CACHE: Dict[str, Any] = {"ts": 0.0, "work_dir": "", "value": {}}
 
 
 def _probe_collection_schema(collection: str) -> Optional[Dict[str, Any]]:
-    if not collection or QdrantClient is None:
+    if not collection:
         return None
     cached = _COLLECTION_SCHEMA_CACHE.get(collection)
     if cached:
@@ -916,8 +882,6 @@ def build_admin_collections_view(*, collections: Any, work_dir: str) -> List[Dic
 
 
 def delete_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], collection: str) -> None:
-    if QdrantClient is None:
-        return
     name = (collection or "").strip()
     if not name:
         return
@@ -927,6 +891,17 @@ def delete_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], collect
         return
     try:
         cli.delete_collection(collection_name=name)
+        # Best-effort: also delete companion graph edges collection when present.
+        if not name.endswith("_graph"):
+            try:
+                cli.delete_collection(collection_name=f"{name}_graph")
+            except Exception as exc:
+                try:
+                    print(
+                        f"[indexing_admin] best-effort graph collection delete failed for {name}_graph: {exc}"
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
@@ -937,8 +912,6 @@ def delete_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], collect
 
 
 def recreate_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], collection: str) -> None:
-    if QdrantClient is None:
-        return
     name = (collection or "").strip()
     if not name:
         return
@@ -951,6 +924,17 @@ def recreate_collection_qdrant(*, qdrant_url: str, api_key: Optional[str], colle
             cli.delete_collection(collection_name=name)
         except Exception as delete_error:
             raise RuntimeError(f"Failed to delete existing collection '{name}' in Qdrant: {delete_error}") from delete_error
+        # Best-effort: also delete companion graph edges collection when present.
+        if not name.endswith("_graph"):
+            try:
+                cli.delete_collection(collection_name=f"{name}_graph")
+            except Exception as exc:
+                try:
+                    print(
+                        f"[indexing_admin] best-effort graph collection delete failed for {name}_graph: {exc}"
+                    )
+                except Exception:
+                    pass
     finally:
         try:
             cli.close()
@@ -984,12 +968,9 @@ def spawn_ingest_code(
                 env.pop(k, None)
             else:
                 env[str(k)] = str(v)
-        # When we provide env overrides for a run (e.g. staging rebuild), we also want to
-        # force ingest_code to honor the explicit COLLECTION_NAME instead of routing based
-        # on per-repo state/serving_collection in multi-repo mode.
-        # CTXCE_FORCE_COLLECTION_NAME is only used for these subprocess runs; normal watcher
-        # and indexer flows do not set it.
-        env["CTXCE_FORCE_COLLECTION_NAME"] = "1"  # Force ingest_code to use COLLECTION_NAME for staging/pending env overrides
+    # For admin-triggered subprocess runs (recreate/reindex/staging), force ingest_code to
+    # honor explicit COLLECTION_NAME and avoid multi-repo enumeration.
+    env["CTXCE_FORCE_COLLECTION_NAME"] = "1"
     env["COLLECTION_NAME"] = collection
     env["WATCH_ROOT"] = work_dir
     env["WORKSPACE_PATH"] = work_dir
@@ -1022,11 +1003,10 @@ def spawn_ingest_code(
 
 
 def _determine_embedding_dim(model_name: str) -> int:
-    if get_model_dimension:
-        try:
-            return int(get_model_dimension(model_name))
-        except Exception:
-            pass
+    try:
+        return int(get_model_dimension(model_name))
+    except Exception:
+        pass
     try:
         from fastembed import TextEmbedding  # type: ignore
 
@@ -1037,16 +1017,13 @@ def _determine_embedding_dim(model_name: str) -> int:
 
 
 def _normalize_cloned_collection_schema(*, collection_name: str, qdrant_url: str) -> None:
-    if QdrantClient is None:
-        return
     vector_name = None
     model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
     dim = _determine_embedding_dim(model_name)
-    if _sanitize_vector_name is not None:
-        try:
-            vector_name = _sanitize_vector_name(model_name)
-        except Exception:
-            vector_name = None
+    try:
+        vector_name = _sanitize_vector_name(model_name)
+    except Exception:
+        vector_name = None
     try:
         client = QdrantClient(url=qdrant_url, api_key=os.environ.get("QDRANT_API_KEY") or None)
     except Exception:
@@ -1073,8 +1050,6 @@ def _normalize_cloned_collection_schema(*, collection_name: str, qdrant_url: str
 
 
 def _get_collection_point_count(*, collection_name: str, qdrant_url: str) -> Optional[int]:
-    if QdrantClient is None:
-        return None
     try:
         client = QdrantClient(url=qdrant_url, api_key=os.environ.get("QDRANT_API_KEY") or None)
     except Exception:
@@ -1100,8 +1075,6 @@ def _wait_for_clone_points(
     expected_count: Optional[int],
     timeout_seconds: int = 60,
 ) -> None:
-    if QdrantClient is None:
-        return
     try:
         client = QdrantClient(url=qdrant_url, api_key=os.environ.get("QDRANT_API_KEY") or None)
     except Exception:
@@ -1167,25 +1140,15 @@ def start_staging_rebuild(*, collection: str, work_dir: str) -> str:
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     source_point_count = _get_collection_point_count(collection_name=collection, qdrant_url=qdrant_url)
 
-    # Use local import for thread-safety and determinism
-    _copy_fn: Any = copy_collection_qdrant
-    if _copy_fn is None:
-        # Re-import for container environments where module-level import may have failed
-        from scripts.collection_admin import copy_collection_qdrant as _ccq
-        _copy_fn = _ccq
-
-    if not callable(_copy_fn):
-        raise RuntimeError("copy_collection_qdrant unavailable (import failed)")
-
     try:
         print(f"[staging] Copying collection {collection} -> {old_collection} (overwrite=True)")
         try:
             print(
-                f"[staging] copy_collection_qdrant callable={callable(_copy_fn)} type={type(_copy_fn)} module={getattr(_copy_fn, '__module__', '?')}"
+                f"[staging] copy_collection_qdrant module={getattr(copy_collection_qdrant, '__module__', '?')}"
             )
         except Exception:
             pass
-        _copy_fn(
+        copy_collection_qdrant(
             source=collection,
             target=old_collection,
             qdrant_url=qdrant_url,
@@ -1291,9 +1254,9 @@ def start_staging_rebuild(*, collection: str, work_dir: str) -> str:
     pending_env = state.get("indexing_env_pending") or dict(os.environ)
     env_hash = pending_hash or current_env_indexing_hash()
 
-    if not pending_cfg and get_indexing_config_snapshot:
-        pending_cfg = get_indexing_config_snapshot() if callable(get_indexing_config_snapshot) else get_indexing_config_snapshot
-    if not pending_hash and pending_cfg and compute_indexing_config_hash:
+    if not pending_cfg:
+        pending_cfg = get_indexing_config_snapshot()
+    if not pending_hash and pending_cfg:
         pending_hash = compute_indexing_config_hash(pending_cfg)
 
     if set_staging_state:

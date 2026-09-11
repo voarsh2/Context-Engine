@@ -14,7 +14,18 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
-from qdrant_client import QdrantClient, models
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient, models as models
+else:
+    QdrantClient = Any  # type: ignore
+
+    class _LazyQdrantModels:
+        def __getattr__(self, name: str) -> Any:
+            from qdrant_client import models as _models
+
+            return getattr(_models, name)
+
+    models = _LazyQdrantModels()
 
 from scripts.ingest.config import (
     ROOT_DIR,
@@ -52,6 +63,7 @@ from scripts.ingest.symbols import (
     extract_symbols_with_tree_sitter,
 )
 from scripts.ingest.pseudo import (
+    _pseudo_describe_enabled,
     generate_pseudo_tags,
     should_process_pseudo_for_chunk,
 )
@@ -60,7 +72,7 @@ from scripts.ingest.metadata import (
     _get_imports_calls,
     _compute_host_and_container_paths,
 )
-from scripts.ingest.vectors import project_mini, extract_pattern_vector
+from scripts.ingest.vectors import project_mini
 from scripts.ingest.qdrant import (
     ensure_collection,
     ensure_collection_and_indexes_once,
@@ -72,7 +84,10 @@ from scripts.ingest.qdrant import (
     upsert_points,
     hash_id,
     embed_batch,
-    PATTERN_VECTOR_NAME,
+)
+from scripts.relevance_feedback import (
+    build_symbol_reconciliations,
+    reconcile_collection_weights,
 )
 
 # Import utility functions
@@ -84,13 +99,27 @@ if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
 
+def _pseudo_batch_concurrency() -> int:
+    try:
+        return max(1, int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _use_batch_pseudo(pseudo_mode: str) -> bool:
+    """Enable the GLM batch shortcut only when pseudo generation is explicit."""
+    return _pseudo_describe_enabled() and _pseudo_batch_concurrency() > 1 and pseudo_mode == "full"
+
+
 def _detect_repo_name_from_path(path: Path) -> str:
     """Wrapper function to use workspace_state repository detection."""
-    try:
-        from scripts.workspace_state import _extract_repo_name_from_path as _ws_detect
-        return _ws_detect(str(path))
-    except ImportError:
-        return path.name if path.is_dir() else path.parent.name
+    from scripts.workspace_state import _extract_repo_name_from_path as _ws_detect
+
+    # `_extract_repo_name_from_path` expects a workspace/repo path shape, not a file path.
+    # Always normalize file inputs to their parent directory to avoid falling back to
+    # file basenames (which can poison metadata.repo and graph edge repo tags).
+    candidate = path if path.is_dir() else path.parent
+    return _ws_detect(str(candidate))
 
 
 def detect_language(path: Path) -> str:
@@ -109,7 +138,8 @@ def detect_language(path: Path) -> str:
 _TEXT_LIKE_LANGS = {"unknown", "markdown", "text"}
 
 
-def _is_text_like_language(language: str) -> bool:
+def is_text_like_language(language: str) -> bool:
+    """Classify whether a detected language should skip smart reindexing."""
     return str(language or "").strip().lower() in _TEXT_LIKE_LANGS
 
 
@@ -227,6 +257,87 @@ def _select_dense_text(
     return text
 
 
+def _sync_graph_edges_best_effort(
+    client: QdrantClient,
+    collection: str,
+    file_path: str,
+    repo: str | None,
+    calls: list[str] | None,
+    imports: list[str] | None,
+) -> None:
+    """Best-effort sync of file-level graph edges. Safe to skip on failure."""
+    enabled = str(os.environ.get("GRAPH_EDGES_ENABLE", "1") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return
+    try:
+        from scripts.ingest.graph_edges import (
+            delete_edges_by_path,
+            ensure_graph_collection,
+            upsert_file_edges,
+        )
+
+        ensure_graph_collection(client, collection)
+        # Important: delete stale edges for this file before upserting the new set.
+        delete_edges_by_path(
+            client,
+            collection,
+            caller_path=str(file_path),
+            repo=repo,
+        )
+        upsert_file_edges(
+            client,
+            collection,
+            caller_path=str(file_path),
+            repo=repo,
+            calls=calls,
+            imports=imports,
+        )
+    except Exception as exc:
+        try:
+            print(f"[graph_edges] best-effort sync failed for {file_path}: {exc}")
+        except Exception:
+            pass
+
+
+def _symbols_to_metadata_dict(language: str, text: str) -> dict:
+    """Build symbol metadata dict from in-memory source text."""
+    symbols = {}
+    try:
+        symbols_list = _extract_symbols(language, text)
+        lines = text.split("\n")
+        for sym in symbols_list or []:
+            kind = str(sym.get("kind") or "")
+            name = str(sym.get("name") or "")
+            start = int(sym.get("start") or 0)
+            end = int(sym.get("end") or 0)
+            if not kind or not name or start <= 0 or end < start:
+                continue
+            symbol_id = f"{kind}_{name}_{start}"
+            content = "\n".join(lines[start - 1 : end])
+            content_hash = hashlib.sha1(
+                content.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            symbols[symbol_id] = {
+                "name": name,
+                "type": kind,
+                "start_line": start,
+                "end_line": end,
+                "content_hash": content_hash,
+                "content": content,
+                "pseudo": "",
+                "tags": [],
+                "qdrant_ids": [],
+            }
+    except Exception:
+        return {}
+    return symbols
+
+
 def build_information(
     language: str, path: Path, start: int, end: int, first_line: str
 ) -> str:
@@ -251,16 +362,31 @@ def index_single_file(
     repo_name_for_cache: str | None = None,
     allowed_vectors: set[str] | None = None,
     allowed_sparse: set[str] | None = None,
+    preloaded_text: str | None = None,
+    preloaded_file_hash: str | None = None,
+    preloaded_language: str | None = None,
 ) -> bool:
     """Index a single file path. Returns True if indexed, False if skipped."""
+    repo_for_graph = repo_name_for_cache or _detect_repo_name_from_path(file_path)
     try:
         if _should_skip_explicit_file_by_excluder(file_path):
             try:
                 delete_points_by_path(client, collection, str(file_path))
             except Exception:
                 pass
+            # Clean up graph edges for excluded file
+            _sync_graph_edges_best_effort(
+                client,
+                collection,
+                str(file_path),
+                repo_for_graph,
+                None,  # No calls when file is excluded
+                None,  # No imports when file is excluded
+            )
             print(f"Skipping excluded file: {file_path}")
             return False
+    except NameError:
+        raise
     except Exception:
         return False
 
@@ -283,6 +409,9 @@ def index_single_file(
             repo_name_for_cache=repo_name_for_cache,
             allowed_vectors=allowed_vectors,
             allowed_sparse=allowed_sparse,
+            preloaded_text=preloaded_text,
+            preloaded_file_hash=preloaded_file_hash,
+            preloaded_language=preloaded_language,
         )
     finally:
         if _file_lock_ctx is not None:
@@ -306,6 +435,9 @@ def _index_single_file_inner(
     repo_name_for_cache: str | None = None,
     allowed_vectors: set[str] | None = None,
     allowed_sparse: set[str] | None = None,
+    preloaded_text: str | None = None,
+    preloaded_file_hash: str | None = None,
+    preloaded_language: str | None = None,
 ) -> bool:
     """Inner implementation of index_single_file (after lock is acquired)."""
     if trust_cache is None:
@@ -317,7 +449,12 @@ def _index_single_file_inner(
             trust_cache = False
 
     fast_fs = _env_truthy(os.environ.get("INDEX_FS_FASTPATH"), False)
-    if skip_unchanged and fast_fs and get_cached_file_meta is not None:
+    if (
+        preloaded_text is None
+        and skip_unchanged
+        and fast_fs
+        and get_cached_file_meta is not None
+    ):
         try:
             repo_for_cache = repo_name_for_cache or _detect_repo_name_from_path(file_path)
             meta = get_cached_file_meta(str(file_path), repo_for_cache) or {}
@@ -333,15 +470,17 @@ def _index_single_file_inner(
         except Exception:
             pass
 
-    try:
-        text = file_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        print(f"Skipping {file_path}: {e}")
-        return False
+    if preloaded_text is None:
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"Skipping {file_path}: {e}")
+            return False
+    else:
+        text = preloaded_text
 
-    language = detect_language(file_path)
-    is_text_like = _is_text_like_language(language)
-    file_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+    language = preloaded_language or detect_language(file_path)
+    file_hash = preloaded_file_hash or hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
     repo_tag = repo_name_for_cache or _detect_repo_name_from_path(file_path)
 
@@ -376,7 +515,10 @@ def _index_single_file_inner(
     if get_cached_symbols and set_cached_symbols:
         cached_symbols = get_cached_symbols(str(file_path))
         if cached_symbols:
-            current_symbols = extract_symbols_with_tree_sitter(str(file_path))
+            if preloaded_text is not None:
+                current_symbols = _symbols_to_metadata_dict(language, preloaded_text)
+            else:
+                current_symbols = extract_symbols_with_tree_sitter(str(file_path))
             _, changed = compare_symbol_changes(cached_symbols, current_symbols)
             for symbol_data in current_symbols.values():
                 symbol_id = f"{symbol_data['type']}_{symbol_data['name']}_{symbol_data['start_line']}"
@@ -456,24 +598,19 @@ def _index_single_file_inner(
     batch_ids: List[int] = []
     batch_lex: List[list[float]] = []
     batch_lex_text: List[str] = []
-    batch_code: List[str] = []  # Raw code for pattern vectors
 
     if allowed_vectors is None and allowed_sparse is None:
         allowed_vectors, allowed_sparse = get_collection_vector_names(client, collection)
 
     allow_lex = allowed_vectors is None or LEX_VECTOR_NAME in allowed_vectors
     allow_mini = allowed_vectors is None or MINI_VECTOR_NAME in allowed_vectors
-    allow_pattern = allowed_vectors is None or PATTERN_VECTOR_NAME in allowed_vectors
     allow_sparse = allowed_sparse is None or LEX_SPARSE_NAME in allowed_sparse
 
-    # Check if pattern vectors are enabled
-    pattern_vectors_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-    pattern_vectors_on = pattern_vectors_on and allow_pattern
     refrag_on = os.environ.get("REFRAG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     use_mini = refrag_on and allow_mini
     use_sparse = LEX_SPARSE_MODE and allow_sparse
 
-    def make_point(pid, dense_vec, lex_vec, payload, lex_text: str = "", code_text: str = ""):
+    def make_point(pid, dense_vec, lex_vec, payload, lex_text: str = ""):
         if vector_name:
             vecs = {vector_name: dense_vec}
             if allow_lex:
@@ -483,14 +620,6 @@ def _index_single_file_inner(
                     vecs[MINI_VECTOR_NAME] = project_mini(list(dense_vec), MINI_VEC_DIM)
             except Exception:
                 pass
-            # Add pattern vector for structural similarity search
-            if pattern_vectors_on and code_text:
-                try:
-                    pv = extract_pattern_vector(code_text, language)
-                    if pv:
-                        vecs[PATTERN_VECTOR_NAME] = pv
-                except Exception:
-                    pass
             if use_sparse and lex_text:
                 sparse_vec = _lex_sparse_vector_text(lex_text)
                 if sparse_vec.get("indices"):
@@ -499,8 +628,24 @@ def _index_single_file_inner(
         else:
             return models.PointStruct(id=pid, vector=dense_vec, payload=payload)
 
-    pseudo_batch_concurrency = int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1)
-    use_batch_pseudo = pseudo_batch_concurrency > 1 and pseudo_mode == "full"
+    pseudo_batch_concurrency = _pseudo_batch_concurrency()
+    use_batch_pseudo = _use_batch_pseudo(pseudo_mode)
+
+    def _full_index_symbol_content_hash(kind: str, symbol_name: str) -> str:
+        matches = [
+            sym_info
+            for sym_info in symbols
+            if str(sym_info.get("kind") or "") == str(kind)
+            and str(sym_info.get("name") or "") == str(symbol_name)
+        ]
+        if len(matches) != 1:
+            return ""
+        sym_info = matches[0]
+        lines = text.splitlines()
+        start = max(1, int(sym_info.get("start") or 1))
+        end = max(start, int(sym_info.get("end") or start))
+        content = "\n".join(lines[start - 1 : end])
+        return hashlib.sha1(content.encode("utf-8", errors="ignore")).hexdigest()
 
     chunk_data: list[dict] = []
     for ch in chunks:
@@ -541,6 +686,7 @@ def _index_single_file_inner(
                 "end_line": ch["end"],
                 "code": ch["text"],
                 "file_hash": file_hash,
+                "symbol_content_hash": _full_index_symbol_content_hash(kind, sym),
                 "imports": imports,
                 "calls": calls,
                 "ingested_at": int(time.time()),
@@ -639,7 +785,6 @@ def _index_single_file_inner(
         aug_lex_text = (ch.get("text") or "") + (" " + pseudo if pseudo else "") + (" " + " ".join(tags) if tags else "")
         batch_lex.append(_lex_hash_vector_text(aug_lex_text))
         batch_lex_text.append(aug_lex_text)
-        batch_code.append(ch.get("text") or "")
 
     if batch_texts:
         vectors = embed_batch(model, batch_texts)
@@ -649,10 +794,26 @@ def _index_single_file_inner(
             except Exception:
                 pass
         points = [
-            make_point(i, v, lx, m, lt, ct)
-            for i, v, lx, m, lt, ct in zip(batch_ids, vectors, batch_lex, batch_meta, batch_lex_text, batch_code)
+            make_point(i, v, lx, m, lt)
+            for i, v, lx, m, lt in zip(batch_ids, vectors, batch_lex, batch_meta, batch_lex_text)
         ]
         upsert_points(client, collection, points)
+
+    # Optional: materialize file-level graph edges in a companion `<collection>_graph` store.
+    # This is an accelerator for symbol_graph callers/importers and is safe to skip on failure.
+    # IMPORTANT: Sync must run after upserts (or after delete-only reindex) to ensure graph
+    # edges stay consistent. When a file reindexes to zero chunks, batch_texts is empty but
+    # we still need to sync graph edges to remove stale entries.
+    _sync_graph_edges_best_effort(
+        client,
+        collection,
+        str(file_path),
+        repo_tag,
+        calls,
+        imports,
+    )
+
+    if batch_texts:
         try:
             ws = os.environ.get("WATCH_ROOT") or os.environ.get("WORKSPACE_PATH") or "/work"
             if set_cached_file_hash:
@@ -717,14 +878,10 @@ def index_repo(
         except Exception:
             pass
 
-    try:
-        from scripts.embedder import get_embedding_model, get_model_dimension
-        model = get_embedding_model(model_name)
-        dim = get_model_dimension(model_name)
-    except ImportError:
-        from fastembed import TextEmbedding
-        model = TextEmbedding(model_name=model_name)
-        dim = len(next(model.embed(["dimension probe"])))
+    from scripts.embedder import get_embedding_model, get_model_dimension
+
+    model = get_embedding_model(model_name)
+    dim = get_model_dimension(model_name)
 
     client = QdrantClient(
         url=qdrant_url,
@@ -797,12 +954,6 @@ def index_repo(
             print(
                 f"[COLLECTION_WARNING] Collection {collection} lacks mini vector '{MINI_VECTOR_NAME}'. "
                 "ReFRAG vectors will be skipped for this run."
-            )
-        pattern_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-        if pattern_on and PATTERN_VECTOR_NAME not in allowed_vectors:
-            print(
-                f"[COLLECTION_WARNING] Collection {collection} lacks pattern vector '{PATTERN_VECTOR_NAME}'. "
-                "Pattern vectors will be skipped for this run."
             )
         if LEX_VECTOR_NAME not in allowed_vectors:
             print(
@@ -881,6 +1032,7 @@ def process_file_with_smart_reindexing(
     model,
     vector_name: str | None,
     *,
+    model_dim: int | None = None,
     allowed_vectors: set[str] | None = None,
     allowed_sparse: set[str] | None = None,
 ) -> str:
@@ -890,18 +1042,10 @@ def process_file_with_smart_reindexing(
     - Reusing existing embeddings/lexical vectors for unchanged chunks (by code content), and
     - Re-embedding only for changed chunks.
     """
-    # Allow test monkeypatching on ingest_code.* to be honored here.
-    # Must be done FIRST before any helper calls.
-    _ingest_mod = None
-    try:
-        import importlib
-        _ingest_mod = importlib.import_module("scripts.ingest_code")
-    except Exception:
-        _ingest_mod = None
-    _embed_batch = getattr(_ingest_mod, "embed_batch", embed_batch) if _ingest_mod else embed_batch
-    _upsert_points_fn = getattr(_ingest_mod, "upsert_points", upsert_points) if _ingest_mod else upsert_points
-    _delete_points_fn = getattr(_ingest_mod, "delete_points_by_path", delete_points_by_path) if _ingest_mod else delete_points_by_path
-    _should_process_pseudo = getattr(_ingest_mod, "should_process_pseudo_for_chunk", should_process_pseudo_for_chunk) if _ingest_mod else should_process_pseudo_for_chunk
+    _embed_batch = embed_batch
+    _upsert_points_fn = upsert_points
+    _delete_points_fn = delete_points_by_path
+    _should_process_pseudo = should_process_pseudo_for_chunk
 
     try:
         p = Path(str(file_path))
@@ -910,8 +1054,19 @@ def process_file_with_smart_reindexing(
                 _delete_points_fn(client, current_collection, str(p))
             except Exception:
                 pass
+            # Clean up graph edges for excluded file
+            _sync_graph_edges_best_effort(
+                client,
+                current_collection,
+                str(p),
+                per_file_repo or _detect_repo_name_from_path(file_path),
+                None,  # No calls when file is excluded
+                None,  # No imports when file is excluded
+            )
             print(f"[SMART_REINDEX] Skipping excluded file: {file_path}")
             return "skipped"
+    except NameError:
+        raise
     except Exception:
         return "skipped"
 
@@ -927,6 +1082,13 @@ def process_file_with_smart_reindexing(
     except Exception:
         file_path = Path(fp)
 
+    is_text_like = is_text_like_language(language)
+    if is_text_like:
+        print(
+            f"[SMART_REINDEX] {file_path}: text-like language '{language}', "
+            "skipping smart reindex and using full reindex path"
+        )
+        return "failed"
     file_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
     if allowed_vectors is None and allowed_sparse is None:
@@ -934,11 +1096,8 @@ def process_file_with_smart_reindexing(
 
     allow_lex = allowed_vectors is None or LEX_VECTOR_NAME in allowed_vectors
     allow_mini = allowed_vectors is None or MINI_VECTOR_NAME in allowed_vectors
-    allow_pattern = allowed_vectors is None or PATTERN_VECTOR_NAME in allowed_vectors
     allow_sparse = allowed_sparse is None or LEX_SPARSE_NAME in allowed_sparse
 
-    pattern_vectors_on = os.environ.get("PATTERN_VECTORS", "").strip().lower() in {"1", "true", "yes", "on"}
-    pattern_vectors_on = pattern_vectors_on and allow_pattern
     refrag_on = os.environ.get("REFRAG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     use_mini = refrag_on and allow_mini
     use_sparse = LEX_SPARSE_MODE and allow_sparse
@@ -988,8 +1147,31 @@ def process_file_with_smart_reindexing(
     changed_set = set(changed_symbols)
 
     if len(changed_symbols) == 0 and cached_symbols:
-        print(f"[SMART_REINDEX] {file_path}: 0 changes detected, skipping")
-        return "skipped"
+        prev_hash = None
+        try:
+            if get_cached_file_hash:
+                prev_hash = get_cached_file_hash(fp, per_file_repo)
+        except Exception:
+            prev_hash = None
+        if prev_hash and file_hash and prev_hash == file_hash:
+            print(f"[SMART_REINDEX] {file_path}: 0 changes detected, skipping")
+            return "skipped"
+        print(
+            f"[SMART_REINDEX] {file_path}: non-symbol change detected; "
+            "falling back to full reindex"
+        )
+        return "failed"
+
+    if model_dim and vector_name:
+        try:
+            ensure_collection_and_indexes_once(
+                client,
+                current_collection,
+                int(model_dim),
+                vector_name,
+            )
+        except Exception:
+            pass
 
     existing_points = []
     try:
@@ -1085,7 +1267,6 @@ def process_file_with_smart_reindexing(
     else:
         chunks = chunk_lines(text, CHUNK_LINES, CHUNK_OVERLAP)
 
-    is_text_like = _is_text_like_language(language)
     symbol_spans = _extract_symbols(language, text)
 
     reused_points: list[models.PointStruct] = []
@@ -1094,13 +1275,52 @@ def process_file_with_smart_reindexing(
     embed_ids: list[int] = []
     embed_lex: list[list[float]] = []
     embed_lex_text: list[str] = []
-    embed_code: list[str] = []  # Raw code for pattern vectors
 
     imports, calls = _get_imports_calls(language, text)
     last_mod, churn_count, author_count = _git_metadata(file_path)
 
-    pseudo_batch_concurrency = int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1)
-    use_batch_pseudo = pseudo_batch_concurrency > 1
+    pseudo_batch_concurrency = _pseudo_batch_concurrency()
+    # Smart reindexing must use the same explicit generation switch as the
+    # sequential path; otherwise the batch fast path can call GLM while pseudo
+    # descriptions are disabled.
+    use_batch_pseudo = _use_batch_pseudo("full")
+
+    def _apply_symbol_pseudo(
+        symbol_name: str,
+        kind: str,
+        start_line: int,
+        pseudo_text: str,
+        pseudo_tags: list[str],
+    ) -> None:
+        if not symbol_name or not kind:
+            return
+        sid = f"{kind}_{symbol_name}_{start_line}"
+        target = symbol_meta.get(sid)
+        if target is None:
+            for candidate in symbol_meta.values():
+                if str(candidate.get("type") or "") != str(kind):
+                    continue
+                if str(candidate.get("name") or "") != str(symbol_name):
+                    continue
+                target = candidate
+                break
+        if target is None:
+            return
+        target["pseudo"] = pseudo_text
+        target["tags"] = list(pseudo_tags or [])
+
+    def _symbol_content_hash(kind: str, symbol_name: str) -> str:
+        if not kind or not symbol_name:
+            return ""
+        matches = [
+            info
+            for info in symbol_meta.values()
+            if str(info.get("type") or "") == str(kind)
+            and str(info.get("name") or "") == str(symbol_name)
+        ]
+        if len(matches) == 1:
+            return str(matches[0].get("content_hash") or "")
+        return ""
 
     chunk_data_sr: list[dict] = []
     for ch in chunks:
@@ -1141,6 +1361,7 @@ def process_file_with_smart_reindexing(
                 "end_line": ch["end"],
                 "code": ch["text"],
                 "file_hash": file_hash,
+                "symbol_content_hash": _symbol_content_hash(kind, sym),
                 "imports": imports,
                 "calls": calls,
                 "ingested_at": int(time.time()),
@@ -1190,6 +1411,14 @@ def process_file_with_smart_reindexing(
                             start_line = ch.get("start", 0)
                             sid = f"{k}_{symbol_name}_{start_line}"
                             set_cached_pseudo(fp, sid, pseudo, tags, file_hash)
+                        _apply_symbol_pseudo(
+                            symbol_name,
+                            ch.get("kind", "unknown"),
+                            ch.get("start", 0),
+                            pseudo,
+                            tags,
+                        )
+                        ch["_pseudo_applied"] = True
             except Exception as e:
                 print(f"[PSEUDO_BATCH] Smart reindex batch failed, falling back: {e}")
                 use_batch_pseudo = False
@@ -1211,8 +1440,25 @@ def process_file_with_smart_reindexing(
                         sid = f"{k}_{symbol_name}_{start_line}"
                         if set_cached_pseudo:
                             set_cached_pseudo(fp, sid, pseudo, tags, file_hash)
+                        _apply_symbol_pseudo(
+                            symbol_name,
+                            k,
+                            start_line,
+                            pseudo,
+                            tags,
+                        )
+                        ch["_pseudo_applied"] = True
             except Exception:
                 pass
+
+        if (pseudo or tags) and not ch.get("_pseudo_applied"):
+            _apply_symbol_pseudo(
+                ch.get("symbol", ""),
+                ch.get("kind", "unknown"),
+                ch.get("start", 0),
+                pseudo,
+                tags,
+            )
 
         if pseudo:
             payload["pseudo"] = pseudo
@@ -1327,12 +1573,11 @@ def process_file_with_smart_reindexing(
         aug_lex_text = (code_text or "") + (" " + pseudo if pseudo else "") + (" " + " ".join(tags) if tags else "")
         embed_lex.append(_lex_hash_vector_text(aug_lex_text))
         embed_lex_text.append(aug_lex_text)
-        embed_code.append(code_text or "")
 
     new_points: list[models.PointStruct] = []
     if embed_texts:
         vectors = _embed_batch(model, embed_texts)
-        for pid, v, lx, pl, lt, ct in zip(embed_ids, vectors, embed_lex, embed_payloads, embed_lex_text, embed_code):
+        for pid, v, lx, pl, lt in zip(embed_ids, vectors, embed_lex, embed_payloads, embed_lex_text):
             if vector_name:
                 vecs = {vector_name: v}
                 if allow_lex:
@@ -1342,14 +1587,6 @@ def process_file_with_smart_reindexing(
                         vecs[MINI_VECTOR_NAME] = project_mini(list(v), MINI_VEC_DIM)
                 except Exception:
                     pass
-                # Add pattern vector for structural similarity search
-                if pattern_vectors_on and ct:
-                    try:
-                        pv = extract_pattern_vector(ct, language)
-                        if pv:
-                            vecs[PATTERN_VECTOR_NAME] = pv
-                    except Exception:
-                        pass
                 if use_sparse and lt:
                     sparse_vec = _lex_sparse_vector_text(lt)
                     if sparse_vec.get("indices"):
@@ -1367,6 +1604,40 @@ def process_file_with_smart_reindexing(
 
     if all_points:
         _upsert_points_fn(client, current_collection, all_points)
+
+    # Optional: materialize file-level graph edges (best-effort).
+    # IMPORTANT: Sync must run after upserts OR after delete-only reindex to ensure graph
+    # edges stay consistent. When a file reindexes to zero chunks, all_points is empty but
+    # we still need to sync graph edges to remove stale entries.
+    _sync_graph_edges_best_effort(
+        client,
+        current_collection,
+        str(file_path),
+        per_file_repo,
+        calls,
+        imports,
+    )
+
+    try:
+        reconciliations = build_symbol_reconciliations(
+            cached_symbols,
+            symbol_meta,
+            repo=str(per_file_repo or ""),
+            path=fp,
+            split_min_overlap=float(
+                os.environ.get("RELEVANCE_SPLIT_MIN_OVERLAP", "0.45") or 0.45
+            ),
+            split_min_coverage=float(
+                os.environ.get("RELEVANCE_SPLIT_MIN_COVERAGE", "0.75") or 0.75
+            ),
+        )
+        migrated = reconcile_collection_weights(current_collection, reconciliations)
+        if migrated:
+            print(
+                f"[SMART_REINDEX] Reconciled {migrated} feedback target(s) for {file_path}"
+            )
+    except Exception as e:
+        print(f"[SMART_REINDEX] Feedback reconciliation skipped for {file_path}: {e}")
 
     try:
         if set_cached_symbols:

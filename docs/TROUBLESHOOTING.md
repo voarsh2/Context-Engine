@@ -62,6 +62,31 @@ Prefer native path (`scripts/gpu_toggle.sh gpu`). For Docker, add `platform: lin
 ### Indexing stuck on large files
 Use `MAX_MICRO_CHUNKS_PER_FILE=200` during dev runs.
 
+### Journal replay is hard to inspect in Kubernetes
+
+The watcher logs use `watch_index::journal_drain` for a bounded replay pass and
+`watch_index::journal_drain_busy` when the current pass is still processing. A
+large `backlog` is not by itself a failure; check whether it falls between log
+entries and whether `journal_bulk_status_failed` or indexing errors appear.
+
+The upload service also exposes the shared journal state:
+
+```bash
+curl -sG "$UPLOAD_SERVICE/api/v1/delta/status" \
+  --data-urlencode 'workspace_path=/work/<repo-slug>' | jq '.pending_operations, .server_info.journal'
+```
+
+The response includes pending/failed counts, the oldest retryable record, the
+highest retry count, and a small sample of recorded errors.
+
+### Remote upload reports thousands of created files
+
+The client first reports local scan candidates. The remote plan then compares
+their content hashes with the server replica cache and reports `content_needed`,
+`skipped_hash_match`, and `needed_bytes`. A cold client may still hash and send
+metadata for every candidate so the server can compare it; that does not mean
+all candidates are uploaded.
+
 ### Watcher timeouts (-9) or Qdrant "ResponseHandlingException: timed out"
 Set watcher-safe defaults to reduce payload size:
 
@@ -151,5 +176,4 @@ docker-compose restart
 1. Check this troubleshooting guide
 2. Review logs: `docker compose logs mcp_indexer`
 3. Verify health: `make health`
-4. Check Qdrant status: `make qdrant-status`
-
+4. Check indexer health: `curl http://localhost:${FASTMCP_INDEXER_HTTP_HEALTH_PORT:-18003}/readyz`; use the `qdrant_status` MCP tool for collection details

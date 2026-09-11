@@ -3,20 +3,8 @@
 # to properly instrument vector DB calls.
 # ---------------------------------------------------------------------------
 import os
-import sys as _sys
 
-# Ensure repo roots are importable so 'scripts' resolves inside container
-_roots_env = os.environ.get("WORK_ROOTS", "")
-_roots = [p.strip() for p in _roots_env.split(",") if p.strip()] or ["/work", "/app"]
-for _root in _roots:
-    if _root and _root not in _sys.path:
-        _sys.path.insert(0, _root)
-
-# Now import OpenLit init (before any other scripts imports that may use qdrant)
-try:
-    from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
-except ImportError:
-    pass  # OpenLit not available
+from scripts import openlit_init  # noqa: F401 - triggers early instrumentation
 
 import json
 import threading
@@ -41,24 +29,28 @@ from scripts.mcp_auth import (
 
 from qdrant_client import QdrantClient, models
 
-# Import connection pooling for proper resource management
-try:
-    from scripts.qdrant_client_manager import (
-        get_qdrant_client,
-        return_qdrant_client,
-        pooled_qdrant_client,
-    )
-    _POOL_AVAILABLE = True
-except ImportError:
-    _POOL_AVAILABLE = False
+from scripts.qdrant_client_manager import (
+    get_qdrant_client,
+    return_qdrant_client,
+)
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_default_collection() -> str:
+    raw = (os.environ.get("DEFAULT_COLLECTION") or os.environ.get("COLLECTION_NAME") or "").strip()
+    if _env_flag("MULTI_REPO_MODE") and raw in {"", "codebase"}:
+        return ""
+    return raw or "codebase"
+
 
 # Env
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-DEFAULT_COLLECTION = (
-    os.environ.get("DEFAULT_COLLECTION")
-    or os.environ.get("COLLECTION_NAME")
-    or "codebase"
-)
+DEFAULT_COLLECTION = _resolve_default_collection()
 LEX_VECTOR_NAME = os.environ.get("LEX_VECTOR_NAME", "lex")
 LEX_VECTOR_DIM = int(os.environ.get("LEX_VECTOR_DIM", "4096") or 4096)
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
@@ -76,9 +68,9 @@ VECTOR_NAME = _sanitize_vector_name(EMBEDDING_MODEL)
 # I/O-safety knobs for memory server behavior
 # These env vars allow tuning startup latency vs. first-call latency, especially important
 # on slow storage backends (e.g., Ceph + HDD). See comments below for rationale.
-MEMORY_ENSURE_ON_START = str(os.environ.get("MEMORY_ENSURE_ON_START", "1")).strip().lower() in {"1", "true", "yes", "on"}
-MEMORY_COLD_SKIP_DENSE = str(os.environ.get("MEMORY_COLD_SKIP_DENSE", "0")).strip().lower() in {"1", "true", "yes", "on"}
-MEMORY_PROBE_EMBED_DIM = str(os.environ.get("MEMORY_PROBE_EMBED_DIM", "1")).strip().lower() in {"1", "true", "yes", "on"}
+MEMORY_ENSURE_ON_START = _env_flag("MEMORY_ENSURE_ON_START", False)
+MEMORY_COLD_SKIP_DENSE = _env_flag("MEMORY_COLD_SKIP_DENSE", False)
+MEMORY_PROBE_EMBED_DIM = _env_flag("MEMORY_PROBE_EMBED_DIM", True)
 try:
     MEMORY_VECTOR_DIM = int(os.environ.get("MEMORY_VECTOR_DIM") or os.environ.get("EMBED_DIM") or "768")
 except Exception:
@@ -90,15 +82,8 @@ except Exception:
 # Use the centralized embedder from scripts.embedder for consistent caching.
 # This eliminates duplicate model loading and ensures consistent behavior.
 
-# Reference to the centralized embedder for cold-skip detection
-try:
-    from scripts.embedder import get_embedding_model as _centralized_get_embedding_model
-    from scripts.embedder import is_model_cached as _is_model_cached
-    _EMBEDDER_AVAILABLE = True
-except ImportError:
-    _EMBEDDER_AVAILABLE = False
-    def _is_model_cached(model_name: str = "") -> bool:  # type: ignore[misc]
-        return False  # Fallback: assume not cached
+from scripts.embedder import get_embedding_model as _centralized_get_embedding_model
+from scripts.embedder import is_model_cached as _is_model_cached
 
 def _get_embedding_model():
     """Get the embedding model using the centralized embedder.
@@ -108,12 +93,7 @@ def _get_embedding_model():
     - Qwen3 model support with feature flags
     - Automatic cache invalidation on corrupted downloads
     """
-    if _EMBEDDER_AVAILABLE:
-        return _centralized_get_embedding_model(EMBEDDING_MODEL)
-
-    # Fallback for environments without centralized embedder (rare)
-    from fastembed import TextEmbedding
-    return TextEmbedding(model_name=EMBEDDING_MODEL)
+    return _centralized_get_embedding_model(EMBEDDING_MODEL)
 
 # Track ensured collections to reduce redundant ensure calls.
 # RATIONALE: Avoid repeated Qdrant network calls for the same collection.
@@ -270,31 +250,19 @@ def _start_readyz_server():
 # ---------------------------------------------------------------------------
 # Qdrant Client Management
 # ---------------------------------------------------------------------------
-# Use connection pooling when available, fallback to creating clients on-demand.
-# This prevents socket exhaustion under load and improves connection reuse.
-
 def _get_qdrant_client() -> QdrantClient:
-    """Get a Qdrant client from pool or create one."""
-    if _POOL_AVAILABLE:
-        return get_qdrant_client(
-            url=QDRANT_URL,
-            api_key=os.environ.get("QDRANT_API_KEY")
-        )
-    return QdrantClient(url=QDRANT_URL, api_key=os.environ.get("QDRANT_API_KEY"))
+    """Get a Qdrant client from the shared pool."""
+    return get_qdrant_client(
+        url=QDRANT_URL,
+        api_key=os.environ.get("QDRANT_API_KEY")
+    )
 
 
 def _return_qdrant_client(client: QdrantClient):
     """Return a client to the pool, or close it if pooling unavailable."""
     if client is None:
         return
-    if _POOL_AVAILABLE:
-        return_qdrant_client(client)
-    else:
-        # Fallback path: close client to avoid socket leak
-        try:
-            client.close()
-        except Exception:
-            pass  # Best effort cleanup
+    return_qdrant_client(client)
 
 
 # Ensure collection exists with dual vectors
@@ -303,13 +271,9 @@ def _return_qdrant_client(client: QdrantClient):
 def _ensure_collection(name: str):
     """Create collection if missing.
 
-    Default behavior mirrors the original implementation for PR compatibility:
-    - Probe the embedding model to detect the dense vector dimension (MEMORY_PROBE_EMBED_DIM=1)
-    - Eager ensure on startup (MEMORY_ENSURE_ON_START=1)
-
     For slow storage backends (e.g., Ceph + HDD), set the following in your env:
     - MEMORY_PROBE_EMBED_DIM=0  -> skip model probing; use MEMORY_VECTOR_DIM/EMBED_DIM
-    - MEMORY_ENSURE_ON_START=0  -> ensure lazily on first tool call
+    - MEMORY_ENSURE_ON_START=1  -> eagerly create DEFAULT_COLLECTION at startup
     """
     client = _get_qdrant_client()
     try:
@@ -379,9 +343,8 @@ def _ensure_collection(name: str):
         _return_qdrant_client(client)
 
 
-# Optional eager collection ensure on startup (enabled by default for backward compatibility).
-# Set MEMORY_ENSURE_ON_START=0 to defer ensure to first tool call (recommended on slow storage).
-if MEMORY_ENSURE_ON_START:
+# Optional eager collection ensure for single-collection deployments.
+if MEMORY_ENSURE_ON_START and DEFAULT_COLLECTION:
     try:
         _ensure_collection(DEFAULT_COLLECTION)
     except Exception:
@@ -767,7 +730,10 @@ def _resolve_collection(
         except Exception:
             pass
 
-    return coll or DEFAULT_COLLECTION
+    resolved = coll or DEFAULT_COLLECTION
+    if not resolved:
+        raise ValueError("collection is required in multi-repo memory server mode")
+    return resolved
 
 
 if __name__ == "__main__":

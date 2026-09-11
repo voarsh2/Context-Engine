@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+#####
 import pytest
 from fastapi.testclient import TestClient
 
@@ -497,6 +497,7 @@ def test_start_handles_spawn_failure_but_leaves_staging_state(staging_workspace:
 
 
 def test_admin_staging_endpoints_exercise_http_layer(monkeypatch: pytest.MonkeyPatch):
+    from scripts import indexing_admin
     from scripts import upload_service
 
     calls = {"start": 0, "activate": 0, "abort": 0}
@@ -518,11 +519,11 @@ def test_admin_staging_endpoints_exercise_http_layer(monkeypatch: pytest.MonkeyP
     def fake_abort(**kwargs):
         calls["abort"] += 1
 
-    monkeypatch.setattr(upload_service, "start_staging_rebuild", fake_start)
-    monkeypatch.setattr(upload_service, "activate_staging_rebuild", fake_activate)
-    monkeypatch.setattr(upload_service, "abort_staging_rebuild", fake_abort)
+    monkeypatch.setattr(indexing_admin, "start_staging_rebuild", fake_start)
+    monkeypatch.setattr(indexing_admin, "activate_staging_rebuild", fake_activate)
+    monkeypatch.setattr(indexing_admin, "abort_staging_rebuild", fake_abort)
     monkeypatch.setattr(
-        upload_service,
+        indexing_admin,
         "resolve_collection_root",
         lambda **kwargs: ("/fake/root", "repo1"),
     )
@@ -540,6 +541,61 @@ def test_admin_staging_endpoints_exercise_http_layer(monkeypatch: pytest.MonkeyP
     resp = client.post("/admin/staging/abort", data={"collection": "coll1"}, follow_redirects=False)
     assert resp.status_code == 302
     assert calls["abort"] == 1
+
+
+def test_admin_copy_endpoint_reports_graph_clone_in_redirect(monkeypatch: pytest.MonkeyPatch):
+    import sys
+    import types
+    from urllib.parse import parse_qs, urlparse
+
+    from scripts import upload_service
+
+    monkeypatch.setattr(upload_service, "AUTH_ENABLED", True)
+    monkeypatch.setattr(upload_service, "_require_admin_session", lambda request: {"user_id": "admin"})
+    monkeypatch.setattr(upload_service, "WORK_DIR", "/fake/work")
+    monkeypatch.setenv("WORK_DIR", "/fake/work")
+
+    def fake_copy_collection_qdrant(**kwargs):
+        assert kwargs.get("source") == "src"
+        assert kwargs.get("target") == "dst"
+        return "dst"
+
+    class _FakeQdrantClient:
+        def get_collection(self, collection_name: str):
+            if collection_name == "dst_graph":
+                return {"name": collection_name}
+            raise RuntimeError("not found")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.collection_admin",
+        types.SimpleNamespace(copy_collection_qdrant=fake_copy_collection_qdrant),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.qdrant_client_manager",
+        types.SimpleNamespace(pooled_qdrant_client=lambda **kwargs: _FakeQdrantClient()),
+    )
+
+    client = TestClient(upload_service.app)
+    resp = client.post(
+        "/admin/staging/copy",
+        data={"collection": "src", "target": "dst", "overwrite": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    loc = resp.headers.get("location") or ""
+    parsed = urlparse(loc)
+    qs = parse_qs(parsed.query)
+    assert qs.get("copied") == ["src"]
+    assert qs.get("new") == ["dst"]
+    assert qs.get("graph_copied") == ["1"]
 
 
 def test_watcher_collection_resolution_prefers_serving_state_when_staging_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -650,7 +706,9 @@ def test_spawn_ingest_code_without_overrides_uses_system_env(monkeypatch: pytest
     env = captured["env"]
     assert env["BASE_ONLY"] == "system"
     assert env["COLLECTION_NAME"] == "primary-coll"
-    assert "CTXCE_FORCE_COLLECTION_NAME" not in env
+    # Admin-spawned ingests should never enumerate `/work/*` in multi-repo mode;
+    # force exact collection/root handling even when no explicit overrides are provided.
+    assert env.get("CTXCE_FORCE_COLLECTION_NAME") == "1"
 
 
 def test_promote_pending_env_without_pending_config(staging_workspace: dict):
@@ -736,31 +794,6 @@ def test_resolve_codebase_root_fallbacks_to_parent(monkeypatch: pytest.MonkeyPat
 
     resolved_parent = indexing_admin._resolve_codebase_root(repo)
     assert resolved_parent == codebase_root
-
-
-def test_admin_abort_endpoint_falls_back_to_clear_when_abort_helper_missing(monkeypatch: pytest.MonkeyPatch):
-    from scripts import upload_service
-
-    calls = {"clear": []}
-
-    monkeypatch.setattr(upload_service, "_require_admin_session", lambda request: {"user_id": "admin"})
-    monkeypatch.setattr(upload_service, "abort_staging_rebuild", None)
-    monkeypatch.setattr(
-        upload_service,
-        "clear_staging_collection",
-        lambda workspace_path, repo_name: calls["clear"].append((workspace_path, repo_name)),
-    )
-    monkeypatch.setattr(
-        upload_service,
-        "resolve_collection_root",
-        lambda **kwargs: ("/fake/root", "repo1"),
-    )
-
-    client = TestClient(upload_service.app)
-
-    resp = client.post("/admin/staging/abort", data={"collection": "coll1"}, follow_redirects=False)
-    assert resp.status_code == 302
-    assert calls["clear"] == [("/fake/root", "repo1")]
 
 
 def test_watcher_collection_reuse_logical_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

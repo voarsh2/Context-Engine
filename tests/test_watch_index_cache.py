@@ -150,3 +150,653 @@ def test_processor_delete_clears_cache_even_without_client(monkeypatch, tmp_path
     )
 
     remove_mock.assert_called_once_with(str(missing), "repo")
+
+
+def test_run_indexing_strategy_reuses_preloaded_file_state(monkeypatch, tmp_path):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (False, "changed"))
+
+    captured = {}
+
+    def fake_index_single_file(*args, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", fake_index_single_file)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+    )
+
+    assert ok is True
+    assert captured["preloaded_text"] == "print('x')\n"
+    assert captured["preloaded_file_hash"] == "abc123"
+    assert captured["preloaded_language"] == "python"
+
+
+def test_run_indexing_strategy_skips_ensure_for_cached_hash_match(monkeypatch, tmp_path):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    ensure_mock = MagicMock()
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", ensure_mock)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: "abc123")
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+
+    with pytest.raises(proc_mod._SkipUnchanged):
+        proc_mod._run_indexing_strategy(
+            path,
+            client=MagicMock(),
+            model=MagicMock(),
+            collection="coll",
+            vector_name="vec",
+            model_dim=1,
+            repo_name="repo",
+        )
+
+    ensure_mock.assert_not_called()
+
+
+def test_run_indexing_strategy_force_upsert_bypasses_cached_hash_match(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    ensure_mock = MagicMock()
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", ensure_mock)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: "abc123")
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (False, "changed"))
+
+    index_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", index_mock)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+        force_upsert=True,
+    )
+
+    assert ok is True
+    ensure_mock.assert_called_once()
+    index_mock.assert_called_once()
+
+
+def test_run_indexing_strategy_skips_smart_path_for_markdown(monkeypatch, tmp_path):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "notes.md"
+    path.write_text("# notes\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("# notes\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "markdown")
+
+    smart_check = MagicMock(side_effect=AssertionError("smart path must be skipped"))
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", smart_check)
+
+    captured = {}
+
+    def fake_index_single_file(*args, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", fake_index_single_file)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+    )
+
+    assert ok is True
+    smart_check.assert_not_called()
+    assert captured["preloaded_language"] == "markdown"
+
+
+def test_run_indexing_strategy_force_upsert_missing_points_bypasses_smart(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (True, "smart_reindex"))
+    monkeypatch.setattr(proc_mod.idx, "get_indexed_file_hash", lambda *a, **k: "")
+    monkeypatch.setattr(proc_mod, "_path_has_indexed_points", lambda *a, **k: False)
+
+    smart_mock = MagicMock(return_value="skipped")
+    monkeypatch.setattr(proc_mod.idx, "process_file_with_smart_reindexing", smart_mock)
+
+    index_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", index_mock)
+
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+        force_upsert=True,
+    )
+
+    assert ok is True
+    smart_mock.assert_not_called()
+    index_mock.assert_called_once()
+
+
+def test_run_indexing_strategy_sets_skip_verify_reason_for_file_lock(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod.idx, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod.idx, "detect_language", lambda _p: "python")
+    monkeypatch.setattr(proc_mod.idx, "should_use_smart_reindexing", lambda *a, **k: (False, "changed"))
+    monkeypatch.setattr(proc_mod.idx, "index_single_file", lambda *a, **k: False)
+    monkeypatch.setattr(proc_mod.idx, "is_file_locked", lambda *_: True)
+
+    verify_context = {}
+    ok = proc_mod._run_indexing_strategy(
+        path,
+        client=MagicMock(),
+        model=MagicMock(),
+        collection="coll",
+        vector_name="vec",
+        model_dim=1,
+        repo_name="repo",
+        force_upsert=True,
+        verify_context=verify_context,
+    )
+
+    assert ok is False
+    assert verify_context.get("skip_verify_reason") == "file_locked"
+
+
+def test_finalize_journal_skips_force_upsert_verify_when_file_locked(monkeypatch):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    verify_mock = MagicMock()
+    done_mock = MagicMock()
+    failed_mock = MagicMock()
+    monkeypatch.setattr(proc_mod, "_verify_and_update_journal_for_upsert", verify_mock)
+    monkeypatch.setattr(proc_mod, "_mark_journal_done", done_mock)
+    monkeypatch.setattr(proc_mod, "_mark_journal_failed", failed_mock)
+
+    proc_mod._finalize_journal_after_index_attempt(
+        Path("/tmp/file.py"),
+        client=MagicMock(),
+        collection="coll",
+        repo_key="/tmp",
+        repo_name="repo",
+        force_upsert=True,
+        journal_content_hash="abc",
+        skip_verify_reason="file_locked",
+    )
+
+    verify_mock.assert_not_called()
+    done_mock.assert_not_called()
+    failed_mock.assert_not_called()
+
+
+def test_staging_requires_subprocess_only_for_active_dual_root_state(monkeypatch):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+    monkeypatch.setattr(proc_mod, "is_staging_enabled", lambda: True)
+
+    assert proc_mod._staging_requires_subprocess(None) is False
+    assert (
+        proc_mod._staging_requires_subprocess(
+            {
+                "indexing_env": {"FOO": "bar"},
+                "active_repo_slug": "repo",
+                "serving_repo_slug": "repo",
+            }
+        )
+        is False
+    )
+    assert (
+        proc_mod._staging_requires_subprocess(
+            {
+                "indexing_env": {"FOO": "bar"},
+                "active_repo_slug": "repo",
+                "serving_repo_slug": "repo_old",
+            }
+        )
+        is True
+    )
+    assert (
+        proc_mod._staging_requires_subprocess(
+            {
+                "indexing_env": {"FOO": "bar"},
+                "active_repo_slug": "repo",
+                "serving_repo_slug": "repo",
+                "staging": {"collection": "repo_old_collection"},
+            }
+        )
+        is True
+    )
+
+
+def test_process_paths_does_not_force_subprocess_for_non_active_staging(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod, "_detect_repo_for_file", lambda p: tmp_path)
+    monkeypatch.setattr(proc_mod, "_get_collection_for_file", lambda p: "coll")
+    monkeypatch.setattr(proc_mod, "_set_status_indexing", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "persist_indexing_config", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "update_indexing_status", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_extract_repo_name_from_path", lambda *_: "repo")
+    monkeypatch.setattr(proc_mod, "is_staging_enabled", lambda: True)
+    monkeypatch.setattr(
+        proc_mod,
+        "get_workspace_state",
+        lambda *a, **k: {
+            "indexing_env": {"FOO": "bar"},
+            "active_repo_slug": "repo",
+            "serving_repo_slug": "repo",
+        },
+    )
+
+    staging_mock = MagicMock(return_value=False)
+    monkeypatch.setattr(proc_mod, "_maybe_handle_staging_file", staging_mock)
+    monkeypatch.setattr(proc_mod, "_run_indexing_strategy", lambda *a, **k: True)
+
+    proc_mod._process_paths(
+        [path],
+        client=MagicMock(),
+        model=MagicMock(),
+        vector_name="vec",
+        model_dim=1,
+        workspace_path=str(tmp_path),
+    )
+
+    assert staging_mock.call_args is not None
+    assert staging_mock.call_args.kwargs == {
+        "force_upsert": False,
+        "journal_content_hash": "",
+    }
+    assert staging_mock.call_args.args[0] == path
+    assert staging_mock.call_args.args[6] is None
+
+
+def test_process_paths_uses_subprocess_when_staging_is_actually_active(
+    monkeypatch, tmp_path
+):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod, "_detect_repo_for_file", lambda p: tmp_path)
+    monkeypatch.setattr(proc_mod, "_get_collection_for_file", lambda p: "coll")
+    monkeypatch.setattr(proc_mod, "_set_status_indexing", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "persist_indexing_config", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "update_indexing_status", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(proc_mod, "_extract_repo_name_from_path", lambda *_: "repo")
+    monkeypatch.setattr(proc_mod, "is_staging_enabled", lambda: True)
+    monkeypatch.setattr(
+        proc_mod,
+        "get_workspace_state",
+        lambda *a, **k: {
+            "indexing_env": {"FOO": "bar"},
+            "active_repo_slug": "repo",
+            "serving_repo_slug": "repo_old",
+        },
+    )
+
+    staging_mock = MagicMock(return_value=False)
+    monkeypatch.setattr(proc_mod, "_maybe_handle_staging_file", staging_mock)
+    monkeypatch.setattr(proc_mod, "_run_indexing_strategy", lambda *a, **k: True)
+
+    proc_mod._process_paths(
+        [path],
+        client=MagicMock(),
+        model=MagicMock(),
+        vector_name="vec",
+        model_dim=1,
+        workspace_path=str(tmp_path),
+    )
+
+    assert staging_mock.call_args is not None
+    assert staging_mock.call_args.kwargs == {
+        "force_upsert": False,
+        "journal_content_hash": "",
+    }
+    assert staging_mock.call_args.args[0] == path
+    assert staging_mock.call_args.args[6] == {"FOO": "bar"}
+
+
+def test_staging_force_upsert_hash_match_verifies_before_skip(monkeypatch, tmp_path):
+    proc_mod = importlib.import_module("scripts.watch_index_core.processor")
+
+    path = tmp_path / "file.py"
+    path.write_text("print('x')\n", encoding="utf-8")
+
+    monkeypatch.setattr(proc_mod, "_read_text_and_sha1", lambda _p: ("print('x')\n", "abc123"))
+    monkeypatch.setattr(proc_mod, "get_cached_file_hash", lambda *a, **k: "abc123")
+    monkeypatch.setattr(proc_mod, "_verify_upsert_committed", lambda *a, **k: True)
+    monkeypatch.setattr(proc_mod, "_log_activity", lambda *a, **k: None)
+
+    mark_done = MagicMock()
+    monkeypatch.setattr(proc_mod, "_mark_journal_done", mark_done)
+    advance = MagicMock()
+    monkeypatch.setattr(proc_mod, "_advance_progress", advance)
+
+    handled = proc_mod._maybe_handle_staging_file(
+        path,
+        MagicMock(),
+        "coll",
+        "repo",
+        str(tmp_path),
+        [path],
+        {"FOO": "bar"},
+        {str(tmp_path): 0},
+        "started",
+        force_upsert=True,
+        journal_content_hash="abc123",
+    )
+
+    assert handled is True
+    mark_done.assert_called_once_with(path, str(tmp_path), "repo")
+    advance.assert_called_once()
+
+
+def test_runtime_root_override_updates_internal_path_checks(monkeypatch, tmp_path):
+    import scripts.watch_index as watch_index
+    from scripts.watch_index_core import config as watch_config
+    import scripts.watch_index_core.processor as proc_mod
+    import scripts.embedder as embedder_mod
+
+    runtime_root = tmp_path / "runtime-root"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    internal = runtime_root / ".git" / "HEAD"
+    internal.parent.mkdir(parents=True, exist_ok=True)
+    internal.write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    original_root = watch_config.ROOT
+    original_watch_root = watch_index.ROOT
+    monkeypatch.setenv("WATCH_ROOT", str(runtime_root))
+    monkeypatch.setattr(watch_index, "initialize_watcher_state", lambda root: {"repo_name": None})
+    monkeypatch.setattr(watch_index, "get_indexing_config_snapshot", lambda repo_name=None: {})
+    monkeypatch.setattr(watch_index, "compute_indexing_config_hash", lambda snapshot: "hash")
+    monkeypatch.setattr(watch_index, "persist_indexing_config", lambda *a, **k: None)
+    monkeypatch.setattr(watch_index, "update_indexing_status", lambda *a, **k: None)
+    monkeypatch.setattr(embedder_mod, "get_embedding_model", lambda *_: MagicMock())
+    monkeypatch.setattr(embedder_mod, "get_model_dimension", lambda *_: 1)
+    monkeypatch.setattr(watch_index, "resolve_vector_name_config", lambda *a, **k: "vec")
+    monkeypatch.setattr(watch_index, "_start_pseudo_backfill_worker", lambda *a, **k: None)
+    monkeypatch.setattr(watch_index, "create_observer", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(watch_index, "IndexHandler", MagicMock())
+    monkeypatch.setattr(watch_index, "ChangeQueue", MagicMock())
+    monkeypatch.setattr(
+        watch_index,
+        "QdrantClient",
+        MagicMock(return_value=MagicMock(get_collection=MagicMock())),
+    )
+    monkeypatch.setattr(watch_index, "run_consistency_audit", lambda *a, **k: None)
+    monkeypatch.setattr(watch_index, "run_empty_dir_sweep_maintenance", lambda *a, **k: None)
+    monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", lambda *a, **k: [])
+    def _bool_env(name, default=False):
+        if name == "WATCH_JOURNAL_DRAIN_ENABLED":
+            return True
+        return False
+
+    monkeypatch.setattr(watch_index, "get_boolean_env", _bool_env)
+    monkeypatch.setattr(watch_index, "_sleep", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    try:
+        watch_index.main()
+    except KeyboardInterrupt:
+        pass
+
+    try:
+        assert watch_config.ROOT == runtime_root.resolve()
+        assert proc_mod._is_internal_ignored_path(internal) is True
+    finally:
+        watch_config.ROOT = original_root
+        watch_index.ROOT = original_watch_root
+
+
+def test_journal_drain_does_not_requeue_while_queue_is_busy(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    queue = MagicMock()
+    queue.stats.return_value = {
+        "queued": 10,
+        "pending": 20,
+        "forced": 10,
+        "pending_forced": 20,
+        "processing": True,
+    }
+    pending_mock = MagicMock()
+    monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", pending_mock)
+
+    watch_index._drain_pending_journal(queue)
+
+    pending_mock.assert_not_called()
+    queue.add.assert_not_called()
+
+
+def test_journal_drain_limits_one_pass(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    monkeypatch.setenv("WATCH_JOURNAL_DRAIN_BATCH_SIZE", "2")
+    monkeypatch.setattr(watch_index, "_maybe_log_journal_drain", lambda **_: None)
+    entries = [
+        {"path": f"/work/repo-{idx}/file.py", "op_type": "upsert"}
+        for idx in range(3)
+    ]
+    monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", lambda *_: entries)
+
+    queue = MagicMock()
+    queue.stats.return_value = {
+        "queued": 0,
+        "pending": 0,
+        "forced": 0,
+        "pending_forced": 0,
+        "processing": False,
+    }
+
+    watch_index._drain_pending_journal(queue)
+
+    assert queue.add.call_count == 2
+
+
+def test_journal_status_batch_flushes_once_per_pass(monkeypatch, tmp_path):
+    import scripts.watch_index_core.processor as processor
+
+    bulk_update = MagicMock()
+    single_update = MagicMock()
+    monkeypatch.setattr(processor, "update_index_journal_entries_status", bulk_update)
+    monkeypatch.setattr(processor, "update_index_journal_entry_status", single_update)
+
+    batch = [
+        {"repo_key": "/work/repo", "repo_name": "repo", "path": str(tmp_path / "one.py"), "status": "done"},
+        {"repo_key": "/work/repo", "repo_name": "repo", "path": str(tmp_path / "two.py"), "status": "done"},
+    ]
+    processor._flush_journal_status_batch(batch)
+    assert bulk_update.call_count == 1
+    assert single_update.call_count == 0
+
+
+def test_journal_status_batch_falls_back_to_single_updates(monkeypatch, tmp_path):
+    import scripts.watch_index_core.processor as processor
+
+    bulk_update = MagicMock(side_effect=RuntimeError("bulk write failed"))
+    single_update = MagicMock()
+    monkeypatch.setattr(processor, "update_index_journal_entries_status", bulk_update)
+    monkeypatch.setattr(processor, "update_index_journal_entry_status", single_update)
+
+    batch = [
+        {"repo_key": "/work/repo", "repo_name": "repo", "path": str(tmp_path / "one.py"), "status": "done"},
+        {
+            "repo_key": "/work/repo",
+            "repo_name": "repo",
+            "path": str(tmp_path / "two.py"),
+            "status": "failed",
+            "error": "boom",
+            "remove_on_done": False,
+        },
+    ]
+    processor._flush_journal_status_batch(batch)
+
+    assert bulk_update.call_count == 1
+    assert single_update.call_count == 2
+    assert single_update.call_args_list[0].kwargs["status"] == "done"
+    assert single_update.call_args_list[1].kwargs == {
+        "status": "failed",
+        "error": "boom",
+        "workspace_path": "/work/repo",
+        "repo_name": "repo",
+        "remove_on_done": False,
+    }
+
+
+def test_main_throttles_periodic_maintenance(monkeypatch, tmp_path):
+    import scripts.watch_index as watch_index
+    from scripts.watch_index_core import config as watch_config
+    import scripts.embedder as embedder_mod
+
+    runtime_root = tmp_path / "runtime-root"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    original_root = watch_config.ROOT
+    original_watch_root = watch_index.ROOT
+    monkeypatch.setenv("WATCH_ROOT", str(runtime_root))
+    monkeypatch.setenv("WATCH_MAINTENANCE_INTERVAL_SECS", "300")
+    monkeypatch.setenv("WATCH_INIT_MAINTENANCE_ENABLED", "0")
+    monkeypatch.setattr(watch_index, "initialize_watcher_state", lambda *a, **k: {"repo_name": None})
+    monkeypatch.setattr(watch_index, "get_indexing_config_snapshot", lambda repo_name=None: {})
+    monkeypatch.setattr(watch_index, "compute_indexing_config_hash", lambda snapshot: "hash")
+    monkeypatch.setattr(watch_index, "persist_indexing_config", lambda *a, **k: None)
+    monkeypatch.setattr(watch_index, "update_indexing_status", lambda *a, **k: None)
+    monkeypatch.setattr(embedder_mod, "get_embedding_model", lambda *_: MagicMock())
+    monkeypatch.setattr(embedder_mod, "get_model_dimension", lambda *_: 1)
+    monkeypatch.setattr(watch_index, "resolve_vector_name_config", lambda *a, **k: "vec")
+    monkeypatch.setattr(watch_index, "_start_pseudo_backfill_worker", lambda *a, **k: None)
+
+    class FakeObserver:
+        def schedule(self, *a, **k):
+            return None
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def join(self):
+            return None
+
+    monkeypatch.setattr(watch_index, "create_observer", lambda *a, **k: FakeObserver())
+    monkeypatch.setattr(watch_index, "IndexHandler", MagicMock())
+    monkeypatch.setattr(watch_index, "ChangeQueue", MagicMock())
+    monkeypatch.setattr(
+        watch_index,
+        "QdrantClient",
+        MagicMock(return_value=MagicMock(get_collection=MagicMock())),
+    )
+    def _bool_env(name, default=False):
+        if name == "WATCH_JOURNAL_DRAIN_ENABLED":
+            return True
+        return False
+
+    monkeypatch.setattr(watch_index, "get_boolean_env", _bool_env)
+
+    drain_mock = MagicMock()
+    maintenance_mock = MagicMock()
+    monkeypatch.setattr(watch_index, "_drain_pending_journal", drain_mock)
+    monkeypatch.setattr(watch_index, "_run_periodic_maintenance", maintenance_mock)
+
+    time_values = iter([0.0, 1.0, 2.0, 301.0])
+    monkeypatch.setattr(watch_index.time, "time", lambda: next(time_values))
+
+    sleep_calls = {"count": 0}
+
+    def _sleep(_secs):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 4:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(watch_index, "_sleep", _sleep)
+
+    try:
+        watch_index.main()
+    finally:
+        watch_config.ROOT = original_root
+        watch_index.ROOT = original_watch_root
+
+    assert drain_mock.call_count == 4
+    assert maintenance_mock.call_count == 2
+
+
+def test_watch_source_defaults_follow_repo_mode(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    monkeypatch.delenv("WATCH_JOURNAL_DRAIN_ENABLED", raising=False)
+    monkeypatch.delenv("WATCH_FS_EVENTS_ENABLED", raising=False)
+
+    assert watch_index._journal_drain_enabled(True) is True
+    assert watch_index._fs_events_enabled(True) is False
+    assert watch_index._journal_drain_enabled(False) is False
+    assert watch_index._fs_events_enabled(False) is True
+
+
+def test_watch_source_env_overrides_defaults(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    monkeypatch.setenv("WATCH_JOURNAL_DRAIN_ENABLED", "0")
+    monkeypatch.setenv("WATCH_FS_EVENTS_ENABLED", "1")
+
+    assert watch_index._journal_drain_enabled(True) is False
+    assert watch_index._fs_events_enabled(True) is True

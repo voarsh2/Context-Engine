@@ -1,30 +1,22 @@
+import logging
 import os
 import json
 import re
 import shutil
 import time
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional, List
+
+logger = logging.getLogger(__name__)
 
 from scripts.auth_backend import mark_collection_deleted
 
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client import models as qmodels
-except Exception:
-    QdrantClient = None  # type: ignore
-    qmodels = None  # type: ignore
+from qdrant_client import QdrantClient
+from qdrant_client import models as qmodels
 
-try:
-    from scripts.qdrant_client_manager import pooled_qdrant_client
-except Exception:
-    pooled_qdrant_client = None
-
-try:
-    from scripts.workspace_state import get_collection_mappings
-except Exception:
-    get_collection_mappings = None
+from scripts.qdrant_client_manager import pooled_qdrant_client
+from scripts.workspace_state import get_collection_mappings
 
 
 _SLUGGED_REPO_RE = re.compile(r"^.+-[0-9a-f]{16}(?:_old)?$")
@@ -97,7 +89,6 @@ def _managed_upload_marker_path(
     slug_name: str,
     marker_root: Optional[Path] = None,
 ) -> Path:
-    # Marker is stored with per-repo metadata, not inside the repo workspace tree.
     base = marker_root or work_root
     return base / ".codebase" / "repos" / slug_name / _MARKER_NAME
 
@@ -115,11 +106,12 @@ def _is_managed_upload_workspace_dir(
             return False
         if not _SLUGGED_REPO_RE.match(p.name or ""):
             return False
-        return _managed_upload_marker_path(
+        marker = _managed_upload_marker_path(
             work_root=work_root,
             marker_root=marker_root,
             slug_name=p.name,
-        ).exists()
+        )
+        return marker.exists()
     except Exception:
         return False
 
@@ -193,6 +185,7 @@ def delete_collection_everywhere(
     out: Dict[str, Any] = {
         "collection": name,
         "qdrant_deleted": False,
+        "qdrant_graph_deleted": False,
         "registry_marked_deleted": False,
         "deleted_state_files": 0,
         "deleted_managed_workspaces": 0,
@@ -209,6 +202,14 @@ def delete_collection_everywhere(
                     out["qdrant_deleted"] = True
                 except Exception:
                     out["qdrant_deleted"] = False
+                # Best-effort: also delete companion graph edges collection when present.
+                # This branch stores file-level edges in `<collection>_graph`.
+                if not name.endswith("_graph"):
+                    try:
+                        cli.delete_collection(collection_name=f"{name}_graph")
+                        out["qdrant_graph_deleted"] = True
+                    except Exception:
+                        out["qdrant_graph_deleted"] = False
     except Exception:
         out["qdrant_deleted"] = False
 
@@ -226,7 +227,7 @@ def delete_collection_everywhere(
     mappings = []
     try:
         if get_collection_mappings is not None:
-            mappings = get_collection_mappings(search_root=str(codebase_root)) or []
+            mappings = get_collection_mappings(search_root=str(work_root)) or []
     except Exception:
         mappings = []
 
@@ -333,8 +334,6 @@ def copy_collection_qdrant(
     copied = False
 
     def _manual_copy_points() -> None:
-        if QdrantClient is None or qmodels is None:
-            raise RuntimeError("QdrantClient unavailable for manual collection copy")
         cli = QdrantClient(url=base_url, api_key=api_key or None, timeout=_copy_client_timeout_seconds())
         try:
             if overwrite:
@@ -359,8 +358,10 @@ def copy_collection_qdrant(
                 vectors_config = None
                 sparse_vectors_config = None
 
+            # Support vector-less collections (e.g. payload-only graph edge collections).
             if vectors_config is None:
-                raise RuntimeError(f"Cannot determine vectors config for source collection {src}")
+                vectors_config = {}
+            vectorless = isinstance(vectors_config, dict) and not vectors_config
 
             try:
                 cli.create_collection(
@@ -401,7 +402,7 @@ def copy_collection_qdrant(
                         limit=batch_limit,
                         offset=offset,
                         with_payload=True,
-                        with_vectors=True,
+                        with_vectors=(not vectorless),
                     )
                 except Exception as exc:
                     raise RuntimeError(f"Failed to scroll points from {src}: {exc}") from exc
@@ -414,7 +415,9 @@ def copy_collection_qdrant(
                         point_id = getattr(record, "id", None)
                         payload = getattr(record, "payload", None)
                         vector = None
-                        if hasattr(record, "vector") and getattr(record, "vector") is not None:
+                        if vectorless:
+                            vector = {}
+                        elif hasattr(record, "vector") and getattr(record, "vector") is not None:
                             vector = getattr(record, "vector")
                         elif hasattr(record, "vectors") and getattr(record, "vectors") is not None:
                             vector = getattr(record, "vectors")
@@ -437,8 +440,6 @@ def copy_collection_qdrant(
                 pass
 
     def _count_points(name: str) -> Optional[int]:
-        if QdrantClient is None:
-            return None
         cli = QdrantClient(url=base_url, api_key=api_key or None, timeout=_copy_client_timeout_seconds())
         try:
             res = cli.count(collection_name=name, exact=True)
@@ -476,5 +477,24 @@ def copy_collection_qdrant(
         # either lack /clone entirely or return success while creating an empty collection.
         # The manual path guarantees the destination gets the exact same points/payloads/vectors.
         _manual_copy_points()
+
+    # Best-effort: copy the companion graph collection when copying a base collection.
+    # Graph edges are derived data and can be rebuilt, but copying avoids a cold-start window
+    # during staging cutovers where the clone has no graph.
+    if not src.endswith("_graph") and not dest.endswith("_graph"):
+        try:
+            copy_collection_qdrant(
+                source=f"{src}_graph",
+                target=f"{dest}_graph",
+                qdrant_url=base_url,
+                overwrite=overwrite,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Best-effort graph collection copy %s_graph -> %s_graph failed: %s",
+                src,
+                dest,
+                exc,
+            )
 
     return dest

@@ -4,17 +4,31 @@ function createBridgeManager(deps) {
   const path = deps.path;
   const fs = deps.fs;
   const log = deps.log;
+  const extensionRoot = deps.extensionRoot;
 
   const getEffectiveConfig = deps.getEffectiveConfig;
   const resolveBridgeWorkspacePath = deps.resolveBridgeWorkspacePath;
   const attachOutput = deps.attachOutput;
   const terminateProcess = deps.terminateProcess;
   const scheduleMcpConfigRefreshAfterBridge = deps.scheduleMcpConfigRefreshAfterBridge;
+  const cancelPendingBridgeConfigRefresh = deps.cancelPendingBridgeConfigRefresh;
 
   let httpBridgeProcess;
   let httpBridgePort;
   let httpBridgeWorkspace;
   let stopInFlight;
+
+  function clearBridgeState(child) {
+    if (httpBridgeProcess !== child) {
+      return;
+    }
+    httpBridgeProcess = undefined;
+    httpBridgePort = undefined;
+    httpBridgeWorkspace = undefined;
+    if (typeof cancelPendingBridgeConfigRefresh === 'function') {
+      cancelPendingBridgeConfigRefresh();
+    }
+  }
 
   function normalizeBridgeUrl(url) {
     if (!url || typeof url !== 'string') {
@@ -42,7 +56,32 @@ function createBridgeManager(deps) {
     }
   }
 
+  function getBridgeMode() {
+    try {
+      const settings = getEffectiveConfig();
+      return (settings.get('mcpBridgeMode') || 'bundled').trim();
+    } catch (_) {
+      return 'bundled';
+    }
+  }
+
+  function findBundledBridgeBin() {
+    if (!extensionRoot) return undefined;
+    const bundledPath = path.join(extensionRoot, 'ctx-mcp-bridge', 'bin', 'ctxce.js');
+    if (fs.existsSync(bundledPath)) {
+      return path.resolve(bundledPath);
+    }
+    return undefined;
+  }
+
   function findLocalBridgeBin() {
+    // First check for bundled bridge if mode is 'bundled'
+    const mode = getBridgeMode();
+    if (mode === 'bundled') {
+      return findBundledBridgeBin();
+    }
+
+    // External mode logic (existing behavior)
     let localOnly = true;
     let configured = '';
     try {
@@ -69,11 +108,19 @@ function createBridgeManager(deps) {
   function resolveBridgeCliInvocation() {
     const binPath = findLocalBridgeBin();
     if (binPath) {
+      // Use absolute Node runtime to avoid PATH dependency in extension hosts
+      const bundledBin = findBundledBridgeBin();
+      const resolvedKind = bundledBin && path.resolve(binPath) === path.resolve(bundledBin)
+        ? 'bundled'
+        : 'local';
       return {
-        command: 'node',
+        command: process.execPath,
         args: [binPath],
-        kind: 'local'
+        kind: resolvedKind
       };
+    }
+    if (getBridgeMode() === 'bundled') {
+      return undefined;
     }
     const isWindows = process.platform === 'win32';
     if (isWindows) {
@@ -105,6 +152,10 @@ function createBridgeManager(deps) {
 
   function requiresHttpBridge(serverMode, transportMode) {
     return serverMode === 'bridge' && transportMode === 'http';
+  }
+
+  function requiresLocalBridgeProcess(serverMode, transportMode) {
+    return serverMode === 'bridge' && (transportMode === 'http' || transportMode === 'sse-remote');
   }
 
   function resolveBridgeHttpUrl() {
@@ -199,21 +250,12 @@ function createBridgeManager(deps) {
     attachOutput(child, 'mcp-http');
     child.on('exit', (code, signal) => {
       log(`HTTP MCP bridge exited with code ${code} signal ${signal || ''}`.trim());
-      if (httpBridgeProcess === child) {
-        httpBridgeProcess = undefined;
-        httpBridgePort = undefined;
-        httpBridgeWorkspace = undefined;
-      }
+      clearBridgeState(child);
     });
     child.on('error', error => {
       log(`HTTP MCP bridge process error: ${error instanceof Error ? error.message : String(error)}`);
-      if (httpBridgeProcess === child) {
-        httpBridgeProcess = undefined;
-        httpBridgePort = undefined;
-        httpBridgeWorkspace = undefined;
-      }
+      clearBridgeState(child);
     });
-    vscode.window.showInformationMessage(`Context Engine HTTP MCP bridge listening on http://127.0.0.1:${options.port}/mcp`);
     if (typeof scheduleMcpConfigRefreshAfterBridge === 'function') {
       scheduleMcpConfigRefreshAfterBridge();
     }
@@ -269,10 +311,10 @@ function createBridgeManager(deps) {
       const serverModeRaw = config.get('mcpServerMode') || 'bridge';
       const transportMode = (typeof transportModeRaw === 'string' ? transportModeRaw.trim() : 'sse-remote') || 'sse-remote';
       const serverMode = (typeof serverModeRaw === 'string' ? serverModeRaw.trim() : 'bridge') || 'bridge';
-      if (requiresHttpBridge(serverMode, transportMode)) {
+      if (requiresLocalBridgeProcess(serverMode, transportMode)) {
         await start();
       } else {
-        log('Context Engine Uploader: HTTP bridge settings changed, but current MCP wiring does not use the HTTP bridge; not restarting HTTP bridge.');
+        log('Context Engine Uploader: bridge settings changed, but current MCP wiring does not use the local bridge process; not restarting bridge.');
       }
     }
   }
@@ -290,6 +332,7 @@ function createBridgeManager(deps) {
     getState,
     isRunning,
     requiresHttpBridge,
+    requiresLocalBridgeProcess,
     resolveBridgeHttpUrl,
     ensureReadyForConfigs,
     start,

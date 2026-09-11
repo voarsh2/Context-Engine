@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 from scripts.logger import get_logger
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 
 def build_logger():
@@ -32,6 +29,12 @@ ROOT = Path(os.environ.get("WATCH_ROOT", "/work")).resolve()
 
 # Debounce interval for file system events
 DELAY_SECS = float(os.environ.get("WATCH_DEBOUNCE_SECS", "1.0"))
+
+# Suppress repeated processing of the exact same observed file state for a short
+# window. This is especially useful on shared/polled filesystems like CephFS.
+RECENT_FINGERPRINT_TTL_SECS = float(
+    os.environ.get("WATCH_RECENT_FINGERPRINT_TTL_SECS", "0")
+)
 
 
 def default_collection_name() -> str:

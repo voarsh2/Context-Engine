@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
       - name: qdrant
-        image: qdrant/qdrant:latest
+        image: qdrant/qdrant:v1.15.4
         imagePullPolicy: Always
         ports:
         - name: http

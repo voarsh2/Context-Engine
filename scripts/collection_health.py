@@ -6,15 +6,8 @@ Detects when the local cache is out of sync with the actual Qdrant collection
 and triggers corrective actions (cache clear + reindex).
 """
 import os
-import sys
-from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
-
-# Ensure project root is on sys.path
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from scripts.workspace_state import (
     _read_cache,
@@ -432,4 +425,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

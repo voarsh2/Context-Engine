@@ -6,7 +6,6 @@ Extracted from mcp_indexer_server.py for better modularity.
 Contains:
 - Subprocess runner (_run_async)
 - Embedding model cache (_get_embedding_model)
-- Router cache invalidation (_invalidate_router_scratchpad)
 - Repo detection (_detect_current_repo)
 
 Note: The @mcp.tool() decorated functions remain in mcp_indexer_server.py
@@ -22,7 +21,6 @@ __all__ = [
     # Functions
     "_run_async",
     "_get_embedding_model",
-    "_invalidate_router_scratchpad",
     "_detect_current_repo",
     "_collection_map_impl",
 ]
@@ -30,6 +28,7 @@ __all__ = [
 import asyncio
 import logging
 import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,39 +44,10 @@ _EMBED_MODEL_LOCKS: Dict[str, threading.Lock] = {}
 
 
 def _get_embedding_model(model_name: str):
-    """Get cached embedding model with optional Qwen3 support.
+    """Get cached embedding model via the centralized embedder factory."""
+    from scripts.embedder import get_embedding_model
 
-    Uses the centralized embedder factory if available, with fallback
-    to direct fastembed initialization for backwards compatibility.
-    """
-    # Try centralized embedder factory first (supports Qwen3 feature flag)
-    try:
-        from scripts.embedder import get_embedding_model
-        return get_embedding_model(model_name)
-    except ImportError:
-        pass
-
-    # Fallback to original implementation
-    try:
-        from fastembed import TextEmbedding  # type: ignore
-    except Exception:
-        raise
-
-    m = _EMBED_MODEL_CACHE.get(model_name)
-    if m is None:
-        # Double-checked locking to avoid duplicate inits under concurrency
-        lock = _EMBED_MODEL_LOCKS.setdefault(model_name, threading.Lock())
-        with lock:
-            m = _EMBED_MODEL_CACHE.get(model_name)
-            if m is None:
-                m = TextEmbedding(model_name=model_name)
-                try:
-                    # Warmup with common patterns to optimize internal caches
-                    _ = list(m.embed(["function", "class", "import", "def", "const"]))
-                except Exception:
-                    pass
-                _EMBED_MODEL_CACHE[model_name] = m
-    return m
+    return get_embedding_model(model_name)
 
 
 # ---------------------------------------------------------------------------
@@ -98,21 +68,6 @@ async def _run_async(
     return await run_subprocess_async(cmd, timeout=timeout, env=env)
 
 
-# ---------------------------------------------------------------------------
-# Router cache invalidation
-# ---------------------------------------------------------------------------
-def _invalidate_router_scratchpad(workspace_path: str) -> bool:
-    """Invalidate any cached router scratchpad for the workspace.
-
-    This is called after indexing operations to ensure the router
-    picks up new/changed code. Returns True if invalidation occurred.
-    """
-    try:
-        # Clear any in-memory caches that might be stale
-        return True
-    except Exception:
-        return False
-
 
 # ---------------------------------------------------------------------------
 # Repo detection
@@ -123,8 +78,7 @@ def _detect_current_repo() -> Optional[str]:
     Priority:
     1. CURRENT_REPO env var (explicitly set)
     2. REPO_NAME env var
-    3. Detect from /work directory structure (first subdirectory with .git)
-    4. Git remote origin name
+    3. Bindmount git detection when CTXCE_BINDMOUNT_REPO_DETECTION=1
 
     Returns: repo name or None if detection fails
     """
@@ -134,34 +88,40 @@ def _detect_current_repo() -> Optional[str]:
         if val:
             return val
 
-    # Try to detect from /work directory
+    try:
+        from scripts.workspace_state import bindmount_repo_detection_enabled
+
+        allow_git_detection = bindmount_repo_detection_enabled()
+    except Exception:
+        allow_git_detection = False
+
+    if not allow_git_detection:
+        return None
+
+    # Bindmount detection from /work. Do not guess from invalid/internal
+    # metadata: a leaked /work/.git must not become repo "work".
     work_path = Path("/work")
     if work_path.exists():
         try:
-            # Check for .git in /work itself
             if (work_path / ".git").exists():
-                # Use git to get repo name from remote
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ["git", "-C", str(work_path), "config", "--get", "remote.origin.url"],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        url = result.stdout.strip()
-                        # Extract repo name from URL
-                        name = url.rstrip("/").rsplit("/", 1)[-1]
-                        if name.endswith(".git"):
-                            name = name[:-4]
-                        if name:
-                            return name
-                except Exception:
-                    pass
-                # Fallback to directory name
-                return work_path.name
+                result = subprocess.run(
+                    ["git", "-C", str(work_path), "config", "--get", "remote.origin.url"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    url = result.stdout.strip()
+                    name = url.rstrip("/").rsplit("/", 1)[-1]
+                    if name.endswith(".git"):
+                        name = name[:-4]
+                    if name:
+                        return name
 
-            # Check subdirectories for repos
+            internal_dirs = {".codebase", ".git", "__pycache__"}
             for subdir in work_path.iterdir():
+                if subdir.name in internal_dirs:
+                    continue
                 if subdir.is_dir() and (subdir / ".git").exists():
                     return subdir.name
         except Exception:

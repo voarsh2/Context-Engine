@@ -4,12 +4,11 @@ import argparse
 import subprocess
 import shlex
 import hashlib
+import logging
 from typing import List, Dict, Any
 import re
 import time
 import json
-import sys
-from pathlib import Path
 
 from qdrant_client import QdrantClient, models
 
@@ -19,21 +18,12 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 API_KEY = os.environ.get("QDRANT_API_KEY")
 REPO_NAME = os.environ.get("REPO_NAME", "workspace")
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-# Import TextEmbedding for type hints and fallback
-from fastembed import TextEmbedding
-
-# Use embedder factory for Qwen3 support; fallback to direct fastembed
-try:
-    from scripts.embedder import get_embedding_model as _get_embedding_model
-    _EMBEDDER_FACTORY = True
-except ImportError:
-    _EMBEDDER_FACTORY = False
+from scripts.embedder import get_embedding_model as _get_embedding_model
 
 from scripts.utils import sanitize_vector_name as _sanitize_vector_name
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def _manifest_run_id(manifest_path: str) -> str:
@@ -365,30 +355,60 @@ def _ingest_from_manifest(
     vec_name: str,
     include_body: bool,
     per_batch: int,
-) -> int:
+) -> tuple[int, bool]:
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         print(f"Failed to read manifest {manifest_path}: {e}")
-        return 0
+        return 0, False
 
     commits = data.get("commits") or []
     if not commits:
         print("No commits in manifest.")
-        return 0
+        return 0, False
 
     run_id = _manifest_run_id(manifest_path)
     mode = str(data.get("mode") or "delta").strip().lower() or "delta"
 
     points: List[models.PointStruct] = []
-    count = 0
-    for c in commits:
+    total_commits = len(commits)
+    prepared_count = 0
+    persisted_count = 0
+    invalid_commit_records = 0
+    embed_failures = 0
+    point_build_failures = 0
+    upsert_failures = 0
+    processed_count = 0
+    progress_step = max(1, total_commits // 10) if total_commits > 0 else 1
+
+    def _log_progress(force: bool = False) -> None:
+        if not force and processed_count % progress_step != 0:
+            return
+        logger.info(
+            "[ingest_history] progress run_id=%s processed=%d/%d prepared=%d persisted=%d invalid=%d embed_failures=%d point_failures=%d upsert_failures=%d",
+            run_id,
+            processed_count,
+            total_commits,
+            prepared_count,
+            persisted_count,
+            invalid_commit_records,
+            embed_failures,
+            point_build_failures,
+            upsert_failures,
+        )
+
+    for idx, c in enumerate(commits, start=1):
+        processed_count += 1
         try:
             if not isinstance(c, dict):
+                invalid_commit_records += 1
+                _log_progress()
                 continue
             commit_id = str(c.get("commit_id") or "").strip()
             if not commit_id:
+                invalid_commit_records += 1
+                _log_progress()
                 continue
             author_name = str(c.get("author_name") or "")
             authored_date = str(c.get("authored_date") or "")
@@ -406,7 +426,15 @@ def _ingest_from_manifest(
             text = build_text(md, include_body=include_body)
             try:
                 vec = next(model.embed([text])).tolist()
-            except Exception:
+            except Exception as e:
+                embed_failures += 1
+                logger.warning(
+                    "[ingest_history] embed failed for commit=%s idx=%d: %s",
+                    commit_id,
+                    idx,
+                    e,
+                )
+                _log_progress()
                 continue
 
             goal: str = ""
@@ -451,28 +479,96 @@ def _ingest_from_manifest(
             pid = stable_id(commit_id)
             pt = models.PointStruct(id=pid, vector={vec_name: vec}, payload=payload)
             points.append(pt)
-            count += 1
+            prepared_count += 1
             if len(points) >= per_batch:
-                client.upsert(collection_name=COLLECTION, points=points)
-                points.clear()
+                batch_size = len(points)
+                try:
+                    client.upsert(collection_name=COLLECTION, points=points)
+                    persisted_count += batch_size
+                except Exception as e:
+                    upsert_failures += batch_size
+                    logger.exception(
+                        "[ingest_history] upsert batch failed (size=%d): %s",
+                        batch_size,
+                        e,
+                    )
+                finally:
+                    points.clear()
+            _log_progress()
         except Exception:
+            point_build_failures += 1
+            logger.warning(
+                "[ingest_history] commit processing failed idx=%d",
+                idx,
+                exc_info=True,
+            )
+            _log_progress()
             continue
 
     if points:
-        client.upsert(collection_name=COLLECTION, points=points)
-    try:
-        _prune_old_commit_points(client, run_id, mode=mode)
-    except Exception:
-        pass
-    try:
-        _cleanup_manifest_files(manifest_path)
-    except Exception:
-        pass
-    print(f"Ingested {count} commits into {COLLECTION} from manifest {manifest_path}.")
-    return count
+        batch_size = len(points)
+        try:
+            client.upsert(collection_name=COLLECTION, points=points)
+            persisted_count += batch_size
+        except Exception as e:
+            upsert_failures += batch_size
+            logger.exception(
+                "[ingest_history] final upsert failed (size=%d): %s",
+                batch_size,
+                e,
+            )
+    _log_progress(force=True)
+    ingest_successful = (
+        prepared_count > 0
+        and invalid_commit_records == 0
+        and embed_failures == 0
+        and point_build_failures == 0
+        and upsert_failures == 0
+        and persisted_count == prepared_count
+    )
+    # Only prune snapshot runs that completed cleanly
+    prune_safe = mode == "snapshot" and ingest_successful
+    if prune_safe:
+        try:
+            _prune_old_commit_points(client, run_id, mode=mode)
+        except Exception as e:
+            logger.warning("[ingest_history] prune failed for run_id=%s: %s", run_id, e)
+    elif mode == "snapshot":
+        logger.warning(
+            "[ingest_history] skipping prune for run_id=%s because the snapshot ingest was incomplete",
+            run_id,
+        )
+
+    # Only cleanup manifest if ingest completed successfully
+    ingest_complete = ingest_successful
+    if ingest_complete:
+        try:
+            _cleanup_manifest_files(manifest_path)
+        except Exception as e:
+            logger.warning("[ingest_history] manifest cleanup failed for %s: %s", manifest_path, e)
+    else:
+        logger.warning(
+            "[ingest_history] keeping manifest %s because ingest was incomplete",
+            manifest_path,
+        )
+
+    logger.info(
+        "Ingested commits from manifest %s into %s: persisted=%d prepared=%d invalid=%d "
+        "embed_failures=%d point_failures=%d upsert_failures=%d",
+        manifest_path,
+        COLLECTION,
+        persisted_count,
+        prepared_count,
+        invalid_commit_records,
+        embed_failures,
+        point_build_failures,
+        upsert_failures,
+    )
+    return persisted_count, ingest_complete
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(
         description="Ingest Git history into Qdrant deterministically"
     )
@@ -512,16 +608,12 @@ def main():
     )
     args = ap.parse_args()
 
-    # Use embedder factory for Qwen3 support
-    if _EMBEDDER_FACTORY:
-        model = _get_embedding_model(MODEL_NAME)
-    else:
-        model = TextEmbedding(model_name=MODEL_NAME)
+    model = _get_embedding_model(MODEL_NAME)
     vec_name = _sanitize_vector_name(MODEL_NAME)
     client = QdrantClient(url=QDRANT_URL, api_key=API_KEY or None)
 
     if args.manifest_json:
-        _ingest_from_manifest(
+        persisted_count, ingest_complete = _ingest_from_manifest(
             args.manifest_json,
             model,
             client,
@@ -529,6 +621,8 @@ def main():
             args.include_body,
             args.per_batch,
         )
+        if not ingest_complete:
+            raise SystemExit(1)
         return
 
     commits = list_commits(args)
@@ -537,6 +631,8 @@ def main():
         return
 
     points: List[models.PointStruct] = []
+    persisted_count = 0
+    upsert_failures = 0
     for sha in commits:
         md = commit_metadata(sha)
         text = build_text(md, include_body=args.include_body)
@@ -583,11 +679,40 @@ def main():
         point = models.PointStruct(id=pid, vector={vec_name: vec}, payload=payload)
         points.append(point)
         if len(points) >= args.per_batch:
-            client.upsert(collection_name=COLLECTION, points=points)
-            points.clear()
+            batch_size = len(points)
+            try:
+                client.upsert(collection_name=COLLECTION, points=points)
+                persisted_count += batch_size
+            except Exception as e:
+                upsert_failures += batch_size
+                logger.exception(
+                    "[ingest_history] batch upsert failed collection=%s repo=%s size=%d path=%s: %s",
+                    COLLECTION,
+                    REPO_NAME,
+                    batch_size,
+                    args.path or "",
+                    e,
+                )
+            finally:
+                points.clear()
     if points:
-        client.upsert(collection_name=COLLECTION, points=points)
-    print(f"Ingested {len(commits)} commits into {COLLECTION}.")
+        final_size = len(points)
+        try:
+            client.upsert(collection_name=COLLECTION, points=points)
+            persisted_count += final_size
+        except Exception as e:
+            upsert_failures += final_size
+            logger.exception(
+                "[ingest_history] final upsert failed collection=%s repo=%s size=%d path=%s: %s",
+                COLLECTION,
+                REPO_NAME,
+                final_size,
+                args.path or "",
+                e,
+            )
+    if upsert_failures:
+        raise SystemExit(1)
+    print(f"Ingested {persisted_count} commits into {COLLECTION}.")
 
 
 if __name__ == "__main__":

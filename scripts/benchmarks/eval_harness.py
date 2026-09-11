@@ -10,14 +10,12 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import statistics
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Shared stats helpers
 from scripts.benchmarks.common import (
@@ -186,7 +184,7 @@ EVAL_QUERIES = [
     {"query": "hybrid search RRF ranking", "expected": ["hybrid/ranking.py"]},
     {"query": "memory store implementation", "expected": ["mcp_impl/memory.py"]},
     {"query": "openlit initialization tracing", "expected": ["openlit_init.py"]},
-    {"query": "recursive reranker learning", "expected": ["rerank_recursive"]},
+    {"query": "relevance feedback ratings", "expected": ["relevance_feedback.py", "mcp_impl/search.py"]},
     {"query": "embedder model loading", "expected": ["embedder.py"]},
     {"query": "workspace state persistence", "expected": ["workspace_state.py"]},
     {"query": "symbol graph callers", "expected": ["symbol_graph.py", "mcp_impl"]},

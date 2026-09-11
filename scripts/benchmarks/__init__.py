@@ -27,10 +27,7 @@ __all__ = [
     "SCENARIOS",
     # Component benchmarks (import on demand)
     # - eval_harness
-    # - trm_bench
-    # - router_bench
     # - refrag_bench
     # - expand_bench
     # - run_all
 ]
-

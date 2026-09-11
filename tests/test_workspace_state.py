@@ -129,10 +129,10 @@ class TestCollectionNameResolution:
     def test_single_repo_env_override_preserved(self, ws_module, monkeypatch):
         """In single-repo mode, COLLECTION_NAME remains a master override."""
         monkeypatch.delenv("MULTI_REPO_MODE", raising=False)
-        monkeypatch.setenv("COLLECTION_NAME", "codebase")
+        monkeypatch.setenv("COLLECTION_NAME", "custom")
         ws = importlib.reload(ws_module)
 
-        assert ws.get_collection_name("my-repo_old") == "codebase_old"
+        assert ws.get_collection_name("my-repo_old") == "custom_old"
 
     def test_multi_repo_workspace_level_env_override_still_applies(self, ws_module, monkeypatch):
         """When repo_name is None, env override should still apply even in multi-repo mode."""
@@ -141,6 +141,38 @@ class TestCollectionNameResolution:
         ws = importlib.reload(ws_module)
 
         assert ws.get_collection_name(None) == "codebase"
+
+    def test_multi_repo_workspace_root_path_uses_configured_collection(self, ws_module, monkeypatch, tmp_path):
+        """The multi-repo workspace root is not a repository identity."""
+        ws_root = tmp_path / "work"
+        ws_root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.setenv("COLLECTION_NAME", "context-engine")
+        ws = importlib.reload(ws_module)
+
+        assert ws.get_collection_name(str(ws_root)) == "context-engine"
+
+    def test_multi_repo_upload_managed_detection_does_not_probe_git(self, ws_module, monkeypatch, tmp_path):
+        """Upload-managed multi-repo identity comes from workspace path, not git metadata."""
+        ws_root = tmp_path / "work"
+        repo_root = ws_root / "repo-a"
+        (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.delenv("CTXCE_BINDMOUNT_REPO_DETECTION", raising=False)
+        ws = importlib.reload(ws_module)
+
+        monkeypatch.setattr(
+            ws,
+            "_git_remote_repo_name",
+            lambda *_: pytest.fail("git inference should be disabled for upload-managed mode"),
+        )
+
+        assert ws._extract_repo_name_from_path(str(repo_root)) == "repo-a"
+        assert ws._extract_repo_name_from_path(str(ws_root)) == ""
 
 
 # ============================================================================
@@ -430,6 +462,166 @@ class TestConstants:
 
     def test_placeholder_collection_names(self, ws_module):
         """PLACEHOLDER_COLLECTION_NAMES contains expected values."""
-        assert "" in ws_module.PLACEHOLDER_COLLECTION_NAMES
-        assert "default-collection" in ws_module.PLACEHOLDER_COLLECTION_NAMES
-        assert "my-collection" in ws_module.PLACEHOLDER_COLLECTION_NAMES
+        assert ws_module.PLACEHOLDER_COLLECTION_NAMES == {"", "codebase"}
+
+
+class TestCompareSymbolChanges:
+    def test_compare_symbol_changes_tolerates_line_shift_for_unchanged_content(self, ws_module):
+        old_symbols = {
+            "function_foo_10": {
+                "name": "foo",
+                "type": "function",
+                "start_line": 10,
+                "end_line": 20,
+                "content_hash": "samehash",
+            }
+        }
+        new_symbols = {
+            "function_foo_12": {
+                "name": "foo",
+                "type": "function",
+                "start_line": 12,
+                "end_line": 22,
+                "content_hash": "samehash",
+            }
+        }
+
+        unchanged, changed = ws_module.compare_symbol_changes(old_symbols, new_symbols)
+
+        assert unchanged == ["function_foo_12"]
+        assert changed == []
+
+
+class TestSymbolCachePaths:
+    def test_symbol_cache_uses_shared_repo_state_dir_in_multi_repo_mode(self, monkeypatch, tmp_path):
+        ws_root = tmp_path / "work"
+        repo_name = "repo-1234567890abcdef"
+        repo_root = ws_root / repo_name
+        repo_root.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+
+        import importlib
+
+        ws_module = importlib.import_module("scripts.workspace_state")
+        ws_module = importlib.reload(ws_module)
+
+        file_path = repo_root / "src" / "app.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("print('x')\n", encoding="utf-8")
+
+        expected_hash = ws_module.hashlib.md5(
+            str(file_path.resolve()).encode("utf-8")
+        ).hexdigest()[:8]
+        cache_path = ws_module._get_symbol_cache_path(str(file_path))
+
+        assert cache_path == (
+            ws_root
+            / ".codebase"
+            / "repos"
+            / repo_name
+            / "symbols"
+            / f"{expected_hash}.json"
+        )
+
+    def test_symbol_cache_write_uses_cross_user_writable_mode(self, monkeypatch, tmp_path):
+        ws_root = tmp_path / "work"
+        repo_name = "repo-1234567890abcdef"
+        repo_root = ws_root / repo_name
+        repo_root.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+
+        import importlib
+
+        ws_module = importlib.import_module("scripts.workspace_state")
+        ws_module = importlib.reload(ws_module)
+
+        file_path = repo_root / "src" / "cacheme.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("print('x')\n", encoding="utf-8")
+
+        ws_module.set_cached_symbols(str(file_path), {"sym": {"name": "sym"}}, "abc123")
+        cache_path = ws_module._get_symbol_cache_path(str(file_path))
+
+        assert cache_path.exists()
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits are not stable on Windows")
+        dir_mode = cache_path.parent.stat().st_mode & 0o777
+        file_mode = cache_path.stat().st_mode & 0o777
+        assert dir_mode & 0o700 == 0o700
+        assert file_mode & 0o600 == 0o600
+
+
+class TestCollectionMappings:
+    def test_get_collection_mappings_accepts_codebase_root_search_path(self, monkeypatch, tmp_path):
+        ws_root = tmp_path / "work"
+        ws_root.mkdir(parents=True, exist_ok=True)
+        slug = "repo-1234567890abcdef"
+        global_state_dir = ws_root / ".codebase" / "repos" / slug
+        global_state_dir.mkdir(parents=True, exist_ok=True)
+        global_state_path = global_state_dir / "state.json"
+        global_state_path.write_text(
+            json.dumps(
+                {
+                    "qdrant_collection": "repo-123456-abcdef",
+                    "updated_at": "2026-03-08T00:00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+
+        import importlib
+
+        ws_module = importlib.import_module("scripts.workspace_state")
+        ws_module = importlib.reload(ws_module)
+
+        mappings = ws_module.get_collection_mappings(search_root=str(ws_root / ".codebase"))
+        slug_entries = [m for m in mappings if str(m.get("repo_name")) == slug]
+
+        assert slug_entries, "expected global repo mapping to be discovered from codebase root"
+        entry = slug_entries[0]
+        assert entry["collection_name"] == "repo-123456-abcdef"
+        assert Path(entry["state_file"]).resolve() == global_state_path.resolve()
+
+    def test_get_collection_mappings_keeps_global_repo_state_behavior(self, monkeypatch, tmp_path):
+        ws_root = tmp_path / "work"
+        ws_root.mkdir(parents=True, exist_ok=True)
+        repo_name = "frontend"
+        global_state_dir = ws_root / ".codebase" / "repos" / repo_name
+        global_state_dir.mkdir(parents=True, exist_ok=True)
+        global_state_path = global_state_dir / "state.json"
+        global_state_path.write_text(
+            json.dumps(
+                {
+                    "qdrant_collection": "frontend-abcdef",
+                    "updated_at": "2026-03-08T00:00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+        monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+        monkeypatch.setenv("MULTI_REPO_MODE", "1")
+
+        import importlib
+
+        ws_module = importlib.import_module("scripts.workspace_state")
+        ws_module = importlib.reload(ws_module)
+
+        mappings = ws_module.get_collection_mappings(search_root=str(ws_root))
+        repo_entries = [m for m in mappings if str(m.get("repo_name")) == repo_name]
+
+        assert repo_entries, "expected global repo mapping to be discovered"
+        entry = repo_entries[0]
+        assert entry["collection_name"] == "frontend-abcdef"
+        assert Path(entry["state_file"]).resolve() == global_state_path.resolve()

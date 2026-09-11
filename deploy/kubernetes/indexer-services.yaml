@@ -53,8 +53,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/watch_index.py
-        workingDir: /work
+        - -m
+        - scripts.watch_index
+        workingDir: /app
         env:
         - name: QDRANT_URL
           valueFrom:
@@ -102,6 +103,11 @@ spec:
             configMapKeyRef:
               name: context-engine-config
               key: WATCH_DEBOUNCE_SECS
+        - name: WATCH_USE_POLLING
+          valueFrom:
+            configMapKeyRef:
+              name: context-engine-config
+              key: WATCH_USE_POLLING
         - name: HF_HOME
           value: /work/models/hf-cache
         - name: XDG_CACHE_HOME
@@ -191,8 +197,11 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - python
-        - /app/scripts/ingest_code.py
-        workingDir: /work
+        - -m
+        - scripts.ingest_code
+        - --root
+        - /work
+        workingDir: /app
         env:
         - name: QDRANT_URL
           valueFrom:
@@ -299,8 +308,8 @@ spec:
         command:
         - /bin/sh
         - -c
-        - PYTHONPATH=/app python /app/scripts/create_indexes.py && PYTHONPATH=/app python /app/scripts/warm_all_collections.py && PYTHONPATH=/app python /app/scripts/health_check.py
-        workingDir: /work
+        - python -m scripts.run_init_maintenance
+        workingDir: /app
         env:
         - name: QDRANT_URL
           valueFrom:

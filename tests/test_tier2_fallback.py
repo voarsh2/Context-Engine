@@ -39,12 +39,18 @@ class FakeEmbedder:
 @pytest.mark.asyncio
 async def test_tier2_fallback_unconditional_with_language_filter(tmp_path, monkeypatch, qdrant_container):
     # Env for services
-    os.environ["QDRANT_URL"] = qdrant_container
-    os.environ["COLLECTION_NAME"] = f"test-{uuid.uuid4().hex[:8]}"
-    os.environ["USE_TREE_SITTER"] = "0"
-    os.environ["HYBRID_IN_PROCESS"] = "1"
-    os.environ["EMBEDDING_MODEL"] = "fake"
-    os.environ["REFRAG_GATE_FIRST"] = "1"  # ensure Tier-1 gate-first path is active
+    monkeypatch.setenv("QDRANT_URL", qdrant_container)
+    monkeypatch.setenv("COLLECTION_NAME", f"test-{uuid.uuid4().hex[:8]}")
+    monkeypatch.setenv("USE_TREE_SITTER", "0")
+    monkeypatch.setenv("HYBRID_IN_PROCESS", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "fake")
+    monkeypatch.setenv("REFRAG_GATE_FIRST", "1")  # ensure Tier-1 gate-first path is active
+    monkeypatch.setenv("REFRAG_RUNTIME", "llamacpp")
+    monkeypatch.setenv("CTX_MULTI_COLLECTION", "0")
+    monkeypatch.setenv("CTX_DOC_PASS", "0")
+    monkeypatch.setenv("CTX_DOC_TOP_FALLBACK", "0")
+    monkeypatch.setenv("HYBRID_EXPAND", "0")
+    monkeypatch.setenv("SEMANTIC_EXPANSION_ENABLED", "0")
 
     # Stub embeddings everywhere (FakeEmbedder produces 32-dim vectors)
     monkeypatch.setattr(ing, "TextEmbedding", lambda *a, **k: FakeEmbedder("fake"))
