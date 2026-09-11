@@ -63,6 +63,7 @@ from scripts.ingest.symbols import (
     extract_symbols_with_tree_sitter,
 )
 from scripts.ingest.pseudo import (
+    _pseudo_describe_enabled,
     generate_pseudo_tags,
     should_process_pseudo_for_chunk,
 )
@@ -96,6 +97,18 @@ from scripts.utils import lex_sparse_vector_text as _lex_sparse_vector_text
 
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
+
+
+def _pseudo_batch_concurrency() -> int:
+    try:
+        return max(1, int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _use_batch_pseudo(pseudo_mode: str) -> bool:
+    """Enable the GLM batch shortcut only when pseudo generation is explicit."""
+    return _pseudo_describe_enabled() and _pseudo_batch_concurrency() > 1 and pseudo_mode == "full"
 
 
 def _detect_repo_name_from_path(path: Path) -> str:
@@ -615,8 +628,8 @@ def _index_single_file_inner(
         else:
             return models.PointStruct(id=pid, vector=dense_vec, payload=payload)
 
-    pseudo_batch_concurrency = int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1)
-    use_batch_pseudo = pseudo_batch_concurrency > 1 and pseudo_mode == "full"
+    pseudo_batch_concurrency = _pseudo_batch_concurrency()
+    use_batch_pseudo = _use_batch_pseudo(pseudo_mode)
 
     def _full_index_symbol_content_hash(kind: str, symbol_name: str) -> str:
         matches = [
@@ -1262,13 +1275,15 @@ def process_file_with_smart_reindexing(
     embed_ids: list[int] = []
     embed_lex: list[list[float]] = []
     embed_lex_text: list[str] = []
-    embed_code: list[str] = []  # Raw code for pattern vectors
 
     imports, calls = _get_imports_calls(language, text)
     last_mod, churn_count, author_count = _git_metadata(file_path)
 
-    pseudo_batch_concurrency = int(os.environ.get("PSEUDO_BATCH_CONCURRENCY", "1") or 1)
-    use_batch_pseudo = pseudo_batch_concurrency > 1
+    pseudo_batch_concurrency = _pseudo_batch_concurrency()
+    # Smart reindexing must use the same explicit generation switch as the
+    # sequential path; otherwise the batch fast path can call GLM while pseudo
+    # descriptions are disabled.
+    use_batch_pseudo = _use_batch_pseudo("full")
 
     def _apply_symbol_pseudo(
         symbol_name: str,
@@ -1558,12 +1573,11 @@ def process_file_with_smart_reindexing(
         aug_lex_text = (code_text or "") + (" " + pseudo if pseudo else "") + (" " + " ".join(tags) if tags else "")
         embed_lex.append(_lex_hash_vector_text(aug_lex_text))
         embed_lex_text.append(aug_lex_text)
-        embed_code.append(code_text or "")
 
     new_points: list[models.PointStruct] = []
     if embed_texts:
         vectors = _embed_batch(model, embed_texts)
-        for pid, v, lx, pl, lt, ct in zip(embed_ids, vectors, embed_lex, embed_payloads, embed_lex_text, embed_code):
+        for pid, v, lx, pl, lt in zip(embed_ids, vectors, embed_lex, embed_payloads, embed_lex_text):
             if vector_name:
                 vecs = {vector_name: v}
                 if allow_lex:

@@ -198,6 +198,61 @@ def test_smart_reindex_refreshes_lex_vector_for_reused_chunks(tmp_path, monkeypa
     assert out_vec[ingest_pipeline.LEX_VECTOR_NAME] != old_lex
 
 
+def test_smart_reindex_does_not_call_batch_pseudo_when_disabled(tmp_path, monkeypatch):
+    """The smart batch shortcut must honor the explicit pseudo switch."""
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=object))
+    monkeypatch.setenv("PSEUDO_BATCH_CONCURRENCY", "4")
+    monkeypatch.setenv("REFRAG_PSEUDO_DESCRIBE", "0")
+    monkeypatch.setenv("INDEX_MICRO_CHUNKS", "0")
+    monkeypatch.setenv("INDEX_SEMANTIC_CHUNKS", "0")
+    monkeypatch.setenv("REFRAG_MODE", "0")
+
+    from scripts.ingest import pipeline as ingest_pipeline
+    import scripts.refrag_glm as refrag_glm
+
+    _patch_qdrant_models(monkeypatch, ingest_pipeline)
+    _patch_symbol(monkeypatch, ingest_pipeline, name="add")
+    _patch_smart_side_effects(monkeypatch, ingest_pipeline)
+    monkeypatch.setattr(ingest_pipeline, "get_cached_symbols", lambda _fp: {})
+    monkeypatch.setattr(ingest_pipeline, "set_cached_symbols", None)
+    monkeypatch.setattr(ingest_pipeline, "set_cached_file_hash", None)
+    monkeypatch.setattr(ingest_pipeline, "set_cached_pseudo", None)
+    monkeypatch.setattr(ingest_pipeline, "upsert_points", lambda *a, **k: None)
+    monkeypatch.setattr(ingest_pipeline, "embed_batch", lambda _model, texts: [[0.1, 0.2, 0.3] for _ in texts])
+    monkeypatch.setattr(ingest_pipeline, "ensure_collection_and_indexes_once", lambda *a, **k: None)
+
+    batch_calls = []
+    monkeypatch.setattr(
+        refrag_glm,
+        "generate_pseudo_tags_batch",
+        lambda *a, **k: batch_calls.append((a, k)),
+    )
+
+    fp = tmp_path / "x.py"
+    fp.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    class FakeClient:
+        def scroll(self, **kwargs):
+            return ([], None)
+
+    status = ingest_pipeline.process_file_with_smart_reindexing(
+        file_path=fp,
+        text=fp.read_text(encoding="utf-8"),
+        language="python",
+        client=FakeClient(),
+        current_collection="c",
+        per_file_repo="r",
+        model=object(),
+        vector_name="dense",
+        model_dim=3,
+        allowed_vectors=set(),
+        allowed_sparse=set(),
+    )
+
+    assert status == "success"
+    assert batch_calls == []
+
+
 def test_should_process_pseudo_for_chunk_reuses_cache_after_line_shift(monkeypatch):
     from scripts.ingest import pseudo as pseudo_mod
 
