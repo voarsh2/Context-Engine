@@ -133,6 +133,8 @@ Dynamic HNSW_EF tuning and intelligent query routing for 2x faster simple querie
 | Name | Description | Default |
 |------|-------------|---------|
 | WATCH_DEBOUNCE_SECS | Debounce between FS events | 1.5 |
+| WATCH_JOURNAL_DRAIN_BATCH_SIZE | Maximum journal paths queued per drain pass | 256 |
+| WATCH_JOURNAL_LOG_INTERVAL_SECS | Minimum interval between journal drain log entries | 120 |
 | WATCH_INIT_MAINTENANCE_ENABLED | Run periodic init maintenance from watcher | 1 (enabled) |
 | WATCH_INIT_MAINTENANCE_INTERVAL_MINUTES | Minutes between init maintenance passes | 120 |
 | WATCH_INIT_MAINTENANCE_RUN_ON_START | Run immediately on watcher startup instead of waiting one interval | 0 (disabled) |

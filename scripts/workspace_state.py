@@ -205,6 +205,32 @@ class IndexJournalRecord(TypedDict, total=False):
     last_error: Optional[str]
 
 
+_INDEX_JOURNAL_STATUSES = frozenset({"pending", "in_progress", "failed", "done"})
+
+
+def _normalize_index_journal_status(value: Any, *, invalid: str = "pending") -> str:
+    status = str(value or "pending").strip().lower()
+    return status if status in _INDEX_JOURNAL_STATUSES else invalid
+
+
+def _coerce_index_journal_attempts(
+    value: Any,
+    *,
+    path: Optional[str] = None,
+    warn: bool = False,
+) -> int:
+    try:
+        attempts = int(value or 0)
+    except (ValueError, TypeError):
+        attempts = 0
+        if warn:
+            logger.warning(
+                "workspace_state::invalid_journal_attempts",
+                extra={"attempts": value, "path": path or ""},
+            )
+    return max(0, attempts)
+
+
 def _index_journal_retry_delay_seconds() -> float:
     try:
         return max(0.0, float(os.environ.get("INDEX_JOURNAL_RETRY_DELAY_SECS", "5") or 5))
@@ -1761,6 +1787,57 @@ def _get_index_journal_path(
     return state_dir / INDEX_JOURNAL_FILENAME
 
 
+def _discover_journal_repositories(
+    workspace_path: Optional[str] = None,
+) -> List[tuple[str, Optional[str]]]:
+    """Find repository journals visible from a workspace or metadata root."""
+    root_path = Path(workspace_path or _resolve_workspace_root()).resolve()
+    multi_repo_mode = is_multi_repo_mode()
+    repo_candidates: set[str] = set()
+
+    # A status query should only inspect repositories with an actual journal.
+    # The workspace can contain arbitrary sibling directories and scanning all
+    # of them made the operator-facing status path noisy and unnecessarily slow.
+    try:
+        for repo_root in root_path.iterdir():
+            if not repo_root.is_dir():
+                continue
+            if (repo_root / STATE_DIRNAME / INDEX_JOURNAL_FILENAME).is_file():
+                repo_candidates.add(repo_root.name)
+    except OSError:
+        pass
+
+    state_roots = [root_path / STATE_DIRNAME / "repos"]
+    try:
+        metadata_state_root = (
+            Path(_resolve_workspace_root()).resolve() / STATE_DIRNAME / "repos"
+        )
+        if metadata_state_root != state_roots[0]:
+            state_roots.append(metadata_state_root)
+    except OSError:
+        pass
+
+    for state_root in state_roots:
+        try:
+            if not state_root.exists():
+                continue
+            for state_dir in state_root.iterdir():
+                if state_dir.is_dir() and (
+                    state_dir / INDEX_JOURNAL_FILENAME
+                ).is_file():
+                    repo_candidates.add(state_dir.name)
+        except OSError:
+            continue
+
+    return [
+        (
+            candidate,
+            None if multi_repo_mode else str(root_path / candidate),
+        )
+        for candidate in sorted(repo_candidates)
+    ]
+
+
 def _read_index_journal_file_uncached(journal_path: Path) -> Dict[str, Any]:
     try:
         with journal_path.open("r", encoding="utf-8-sig") as f:
@@ -1840,22 +1917,14 @@ def upsert_index_journal_entries(
     """Persist or replace repo-scoped index journal entries keyed by normalized path."""
     normalized_entries: List[IndexJournalRecord] = []
     now = datetime.now().isoformat()
-    valid_statuses = {"pending", "in_progress", "failed", "done"}
     for entry in entries or []:
         path = _normalize_cache_key_path(str(entry.get("path") or ""))
         op_type = str(entry.get("op_type") or "").strip().lower()
         if not path or op_type not in {"upsert", "delete"}:
             continue
         content_hash = str(entry.get("content_hash") or "").strip() or None
-        status = str(entry.get("status") or "pending").strip().lower()
-        if status not in valid_statuses:
-            status = "pending"
-        try:
-            attempts = int(entry.get("attempts", 0) or 0)
-        except Exception:
-            attempts = 0
-        if attempts < 0:
-            attempts = 0
+        status = _normalize_index_journal_status(entry.get("status"))
+        attempts = _coerce_index_journal_attempts(entry.get("attempts", 0))
         last_error = entry.get("last_error")
         if last_error is not None:
             last_error = str(last_error)
@@ -1902,6 +1971,164 @@ def clear_index_journal_entries(
     return removed
 
 
+def update_index_journal_entries_status(
+    entries: List[Dict[str, Any]],
+    *,
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+    remove_on_done: bool = True,
+) -> Dict[str, Any]:
+    """Update many journal records with one read/modify/write transaction."""
+    updates: Dict[str, Dict[str, Any]] = {}
+    for entry in entries or []:
+        normalized_path = _normalize_cache_key_path(str(entry.get("path") or ""))
+        if not normalized_path:
+            continue
+        status = _normalize_index_journal_status(entry.get("status"), invalid="failed")
+        updates[normalized_path] = {
+            "status": status,
+            "error": str(entry.get("error") or "").strip() or None,
+            "remove_on_done": bool(entry.get("remove_on_done", remove_on_done)),
+        }
+
+    def _mutate(journal: Dict[str, Any]) -> None:
+        ops = journal.setdefault("operations", {})
+        if not isinstance(ops, dict):
+            ops = {}
+            journal["operations"] = ops
+        now = datetime.now().isoformat()
+        for normalized_path, update in updates.items():
+            rec = ops.get(normalized_path)
+            if not isinstance(rec, dict):
+                continue
+            status = update["status"]
+            if status == "done" and update["remove_on_done"]:
+                ops.pop(normalized_path, None)
+                continue
+            rec["status"] = status
+            rec["updated_at"] = now
+            rec["attempts"] = _coerce_index_journal_attempts(rec.get("attempts")) + 1
+            rec["last_error"] = update["error"]
+            ops[normalized_path] = rec
+
+    return _update_index_journal(workspace_path, repo_name, _mutate)
+
+
+def get_index_journal_summary(
+    workspace_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return compact, operator-friendly journal counts and retry details."""
+    workspace_path, repo_name = _resolve_repo_context(workspace_path, repo_name)
+
+    # In multi-repo mode the watcher owns the workspace root and each repo has
+    # its own journal. Aggregate the root view so an operator can inspect one
+    # status endpoint without knowing every repo slug first.
+    if is_multi_repo_mode() and not repo_name:
+        root_path = Path(workspace_path).resolve()
+        repositories: Dict[str, Dict[str, Any]] = {}
+        for candidate, candidate_workspace_path in _discover_journal_repositories(workspace_path):
+            repositories[candidate] = get_index_journal_summary(
+                workspace_path=candidate_workspace_path or str(root_path),
+                repo_name=candidate,
+            )
+        if repositories:
+            aggregate_counts = {
+                "pending": 0,
+                "in_progress": 0,
+                "failed": 0,
+                "done": 0,
+                "unknown": 0,
+            }
+            sample_errors: List[Dict[str, Any]] = []
+            oldest_retryable_at: Optional[str] = None
+            max_attempts = 0
+            total = 0
+            retryable = 0
+            outstanding = 0
+            exhausted = 0
+            updated_at = ""
+            for candidate, summary in repositories.items():
+                total += int(summary.get("total") or 0)
+                retryable += int(summary.get("retryable") or 0)
+                outstanding += int(summary.get("outstanding") or 0)
+                exhausted += int(summary.get("exhausted") or 0)
+                for status, count in aggregate_counts.items():
+                    aggregate_counts[status] += int((summary.get("counts") or {}).get(status) or 0)
+                candidate_oldest = str(summary.get("oldest_retryable_at") or "")
+                if candidate_oldest and (not oldest_retryable_at or candidate_oldest < oldest_retryable_at):
+                    oldest_retryable_at = candidate_oldest
+                max_attempts = max(max_attempts, int(summary.get("max_attempts") or 0))
+                updated_at = max(updated_at, str(summary.get("updated_at") or ""))
+                for error in summary.get("sample_errors") or []:
+                    if len(sample_errors) >= 5:
+                        break
+                    sample_errors.append({"repo": candidate, **error})
+            return {
+                "journal_path": str(root_path / STATE_DIRNAME / "repos"),
+                "total": total,
+                "counts": aggregate_counts,
+                "retryable": retryable,
+                "outstanding": outstanding,
+                "exhausted": exhausted,
+                "oldest_retryable_at": oldest_retryable_at,
+                "max_attempts": max_attempts,
+                "sample_errors": sample_errors,
+                "updated_at": updated_at,
+                "repositories": repositories,
+            }
+
+    journal_path = _get_index_journal_path(workspace_path, repo_name)
+    journal = _read_index_journal_file_uncached(journal_path)
+    operations = journal.get("operations", {})
+    if not isinstance(operations, dict):
+        operations = {}
+
+    counts = {"pending": 0, "in_progress": 0, "failed": 0, "done": 0, "unknown": 0}
+    retryable = 0
+    exhausted = 0
+    oldest_updated_at: Optional[str] = None
+    max_attempts = 0
+    journal_max_attempts = _index_journal_max_attempts()
+    sample_errors: List[Dict[str, Any]] = []
+    for raw_path, raw_record in operations.items():
+        if not isinstance(raw_record, dict):
+            counts["unknown"] += 1
+            continue
+        status = _normalize_index_journal_status(
+            raw_record.get("status"), invalid="unknown"
+        )
+        counts[status] += 1
+        attempts = _coerce_index_journal_attempts(raw_record.get("attempts"))
+        max_attempts = max(max_attempts, attempts)
+        if status in {"pending", "failed"}:
+            if journal_max_attempts > 0 and attempts >= journal_max_attempts:
+                exhausted += 1
+            else:
+                retryable += 1
+                updated_at = str(raw_record.get("updated_at") or raw_record.get("created_at") or "")
+                if updated_at and (oldest_updated_at is None or updated_at < oldest_updated_at):
+                    oldest_updated_at = updated_at
+            error = str(raw_record.get("last_error") or "").strip()
+            if error and len(sample_errors) < 5:
+                sample_errors.append({"path": str(raw_record.get("path") or raw_path), "error": error})
+
+    return {
+        "journal_path": str(journal_path),
+        "total": len(operations),
+        "counts": counts,
+        "retryable": retryable,
+        "outstanding": sum(
+            count for status, count in counts.items() if status != "done"
+        ),
+        "exhausted": exhausted,
+        "oldest_retryable_at": oldest_updated_at,
+        "max_attempts": max_attempts,
+        "sample_errors": sample_errors,
+        "updated_at": str(journal.get("updated_at") or ""),
+    }
+
+
 def list_pending_index_journal_entries(
     workspace_path: Optional[str] = None,
     repo_name: Optional[str] = None,
@@ -1927,18 +2154,14 @@ def list_pending_index_journal_entries(
         for rec in merged_ops.values():
             if not isinstance(rec, dict):
                 continue
-            status = str(rec.get("status") or "pending").strip().lower()
+            status = _normalize_index_journal_status(
+                rec.get("status"), invalid="unknown"
+            )
             if status not in {"pending", "failed"}:
                 continue
-            attempts_raw = rec.get("attempts")
-            try:
-                attempts = int(attempts_raw or 0)
-            except (ValueError, TypeError):
-                attempts = 0
-                logger.warning(
-                    "workspace_state::invalid_journal_attempts",
-                    extra={"attempts": attempts_raw, "path": str(rec.get("path") or "")},
-                )
+            attempts = _coerce_index_journal_attempts(
+                rec.get("attempts"), path=str(rec.get("path") or ""), warn=True
+            )
             if max_attempts > 0 and attempts >= max_attempts:
                 continue
             if status == "failed" and retry_delay > 0:
@@ -1972,45 +2195,7 @@ def list_pending_index_journal_entries(
         return _read_repo_journal_entries(repo_name)
 
     result: List[IndexJournalRecord] = []
-    root_path = Path(workspace_path or _resolve_workspace_root()).resolve()
-    repo_candidates: set[str] = set()
-    multi_repo_mode = is_multi_repo_mode()
-    try:
-        for repo_root in root_path.iterdir():
-            if not repo_root.is_dir():
-                continue
-            if repo_root.name in INTERNAL_STATE_TOP_LEVEL_DIRS:
-                continue
-            if (not multi_repo_mode) and (not _SLUGGED_REPO_RE.match(repo_root.name)):
-                continue
-            repo_candidates.add(repo_root.name)
-    except Exception:
-        pass
-
-    try:
-        repos_state_root = root_path / STATE_DIRNAME / "repos"
-        if repos_state_root.exists():
-            for state_dir in repos_state_root.iterdir():
-                if not state_dir.is_dir():
-                    continue
-                repo_candidates.add(state_dir.name)
-    except Exception:
-        pass
-
-    try:
-        metadata_repos_root = Path(_resolve_workspace_root()).resolve() / STATE_DIRNAME / "repos"
-        if metadata_repos_root != root_path / STATE_DIRNAME / "repos" and metadata_repos_root.exists():
-            for state_dir in metadata_repos_root.iterdir():
-                if not state_dir.is_dir():
-                    continue
-                repo_candidates.add(state_dir.name)
-    except Exception:
-        pass
-
-    for candidate in sorted(repo_candidates):
-        candidate_workspace_path: Optional[str] = None
-        if not multi_repo_mode:
-            candidate_workspace_path = str(root_path / candidate)
+    for candidate, candidate_workspace_path in _discover_journal_repositories(workspace_path):
         result.extend(
             _read_repo_journal_entries(
                 candidate,
@@ -2034,6 +2219,7 @@ def update_index_journal_entry_status(
 ) -> Dict[str, Any]:
     """Update or clear a repo-scoped journal entry after processing."""
     normalized_path = _normalize_cache_key_path(path)
+    status = _normalize_index_journal_status(status, invalid="failed")
     now = datetime.now().isoformat()
 
     def _mutate(journal: Dict[str, Any]) -> None:
@@ -2049,16 +2235,9 @@ def update_index_journal_entry_status(
             return
         rec["status"] = status
         rec["updated_at"] = now
-        attempts_raw = rec.get("attempts")
-        try:
-            attempts = int(attempts_raw or 0)
-        except (ValueError, TypeError):
-            attempts = 0
-            logger.warning(
-                "workspace_state::invalid_journal_attempts",
-                extra={"attempts": attempts_raw, "path": normalized_path},
-            )
-        rec["attempts"] = attempts + 1
+        rec["attempts"] = _coerce_index_journal_attempts(
+            rec.get("attempts"), path=normalized_path, warn=True
+        ) + 1
         rec["last_error"] = str(error or "").strip() or None
         ops[normalized_path] = rec
 

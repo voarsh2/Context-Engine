@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -113,6 +114,139 @@ def test_index_journal_clear_entries(ws_module, tmp_path):
     )
 
 
+def test_index_journal_bulk_status_updates_once(ws_module, monkeypatch, tmp_path):
+    repo_name = "repo-1234567890abcdef"
+    repo_root = tmp_path / "work" / repo_name
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = [repo_root / f"src/{idx}.py" for idx in range(3)]
+
+    ws_module.upsert_index_journal_entries(
+        [{"path": str(path), "op_type": "upsert"} for path in paths],
+        workspace_path=str(repo_root),
+        repo_name=repo_name,
+    )
+
+    original_update = ws_module._update_index_journal
+    calls = []
+
+    def counted_update(*args, **kwargs):
+        calls.append(1)
+        return original_update(*args, **kwargs)
+
+    monkeypatch.setattr(ws_module, "_update_index_journal", counted_update)
+    ws_module.update_index_journal_entries_status(
+        [{"path": str(path), "status": "done"} for path in paths],
+        workspace_path=str(repo_root),
+        repo_name=repo_name,
+    )
+
+    assert len(calls) == 1
+    assert ws_module.list_pending_index_journal_entries(
+        workspace_path=str(repo_root), repo_name=repo_name
+    ) == []
+
+
+def test_index_journal_summary_reports_retryable_entries(ws_module, tmp_path):
+    repo_name = "repo-1234567890abcdef"
+    repo_root = tmp_path / "work" / repo_name
+    repo_root.mkdir(parents=True, exist_ok=True)
+    pending = repo_root / "src/pending.py"
+    failed = repo_root / "src/failed.py"
+
+    ws_module.upsert_index_journal_entries(
+        [
+            {"path": str(pending), "op_type": "upsert"},
+            {"path": str(failed), "op_type": "delete"},
+        ],
+        workspace_path=str(repo_root),
+        repo_name=repo_name,
+    )
+    ws_module.update_index_journal_entry_status(
+        str(failed),
+        status="failed",
+        error="qdrant unavailable",
+        workspace_path=str(repo_root),
+        repo_name=repo_name,
+        remove_on_done=False,
+    )
+
+    summary = ws_module.get_index_journal_summary(
+        workspace_path=str(repo_root), repo_name=repo_name
+    )
+
+    assert summary["total"] == 2
+    assert summary["retryable"] == 2
+    assert summary["outstanding"] == 2
+    assert summary["counts"]["pending"] == 1
+    assert summary["counts"]["failed"] == 1
+    assert summary["sample_errors"] == [
+        {"path": str(failed.resolve()), "error": "qdrant unavailable"}
+    ]
+
+
+def test_index_journal_summary_counts_in_progress_as_outstanding(ws_module, tmp_path):
+    repo_name = "repo-1234567890abcdef"
+    repo_root = tmp_path / "work" / repo_name
+    repo_root.mkdir(parents=True, exist_ok=True)
+    path = repo_root / "src/in_progress.py"
+
+    ws_module.upsert_index_journal_entries(
+        [{"path": str(path), "op_type": "upsert"}],
+        workspace_path=str(repo_root),
+        repo_name=repo_name,
+    )
+    ws_module.update_index_journal_entry_status(
+        str(path),
+        status="in_progress",
+        workspace_path=str(repo_root),
+        repo_name=repo_name,
+        remove_on_done=False,
+    )
+
+    summary = ws_module.get_index_journal_summary(
+        workspace_path=str(repo_root), repo_name=repo_name
+    )
+
+    assert summary["counts"]["in_progress"] == 1
+    assert summary["retryable"] == 0
+    assert summary["outstanding"] == 1
+
+
+def test_index_journal_unknown_status_is_reported_but_not_retried(ws_module, tmp_path):
+    repo_name = "repo-1234567890abcdef"
+    repo_root = tmp_path / "work" / repo_name
+    path = repo_root / "src" / "unknown.py"
+    journal_path = ws_module._get_index_journal_path(str(repo_root), repo_name)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "operations": {
+                    str(path.resolve()): {
+                        "path": str(path.resolve()),
+                        "op_type": "upsert",
+                        "status": "mystery",
+                        "attempts": 0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = ws_module.get_index_journal_summary(
+        workspace_path=str(repo_root), repo_name=repo_name
+    )
+
+    assert summary["counts"]["unknown"] == 1
+    assert summary["retryable"] == 0
+    assert summary["outstanding"] == 1
+    assert ws_module.list_pending_index_journal_entries(
+        workspace_path=str(repo_root), repo_name=repo_name
+    ) == []
+
+
 def test_index_journal_aggregates_repo_scoped_entries(ws_module, tmp_path):
     repo_name = "repo-1234567890abcdef"
     file_path = tmp_path / "work" / repo_name / "src" / "x.py"
@@ -160,6 +294,31 @@ def test_index_journal_aggregates_repo_scoped_entries_in_multi_repo_mode(
         for e in ws_module.list_pending_index_journal_entries(workspace_path=str(ws_root))
     ]
     assert str(file_path.resolve()) in pending
+
+
+def test_index_journal_discovery_ignores_arbitrary_workspace_directories(
+    monkeypatch, tmp_path
+):
+    ws_root = tmp_path / "work"
+    ws_root.mkdir(parents=True, exist_ok=True)
+    (ws_root / "logs").mkdir()
+    (ws_root / "logs" / "large.log").write_text("noise\n", encoding="utf-8")
+    repo_name = "frontend"
+    repo_state = ws_root / ".codebase" / "repos" / repo_name
+    repo_state.mkdir(parents=True, exist_ok=True)
+    (repo_state / "index_journal.json").write_text(
+        json.dumps({"operations": {}}), encoding="utf-8"
+    )
+
+    monkeypatch.setenv("WORKSPACE_PATH", str(ws_root))
+    monkeypatch.setenv("WATCH_ROOT", str(ws_root))
+    monkeypatch.setenv("MULTI_REPO_MODE", "1")
+    ws_module = importlib.import_module("scripts.workspace_state")
+    ws_module = importlib.reload(ws_module)
+
+    discovered = ws_module._discover_journal_repositories(str(ws_root))
+
+    assert discovered == [(repo_name, None)]
 
 
 def test_index_journal_aggregates_split_watch_and_metadata_roots(monkeypatch, tmp_path):
@@ -304,7 +463,7 @@ def test_processor_delete_marks_journal_done(monkeypatch, tmp_path):
     monkeypatch.setattr(proc_mod.idx, "delete_graph_edges_by_path", graph_delete_mock)
     monkeypatch.setattr(proc_mod, "_verify_delete_committed", lambda *a, **k: True)
     monkeypatch.setattr(proc_mod, "_verify_graph_delete_committed", lambda *a, **k: True)
-    monkeypatch.setattr(proc_mod, "update_index_journal_entry_status", journal_mock)
+    monkeypatch.setattr(proc_mod, "update_index_journal_entries_status", journal_mock)
 
     proc_mod._process_paths(
         [missing],
@@ -320,7 +479,7 @@ def test_processor_delete_marks_journal_done(monkeypatch, tmp_path):
     assert graph_delete_mock.call_args_list[0].kwargs["repo"] == "repo"
     assert graph_delete_mock.call_args_list[1].kwargs["repo"] is None
     journal_mock.assert_called_once()
-    assert journal_mock.call_args.kwargs["status"] == "done"
+    assert journal_mock.call_args.args[0][0]["status"] == "done"
 
 
 def test_processor_honors_delete_journal_for_existing_file(monkeypatch, tmp_path):
@@ -352,7 +511,7 @@ def test_processor_honors_delete_journal_for_existing_file(monkeypatch, tmp_path
     monkeypatch.setattr(proc_mod.idx, "delete_graph_edges_by_path", graph_delete_mock)
     monkeypatch.setattr(proc_mod, "_verify_delete_committed", lambda *a, **k: True)
     monkeypatch.setattr(proc_mod, "_verify_graph_delete_committed", lambda *a, **k: True)
-    monkeypatch.setattr(proc_mod, "update_index_journal_entry_status", journal_mock)
+    monkeypatch.setattr(proc_mod, "update_index_journal_entries_status", journal_mock)
 
     proc_mod._process_paths(
         [existing],
@@ -368,7 +527,7 @@ def test_processor_honors_delete_journal_for_existing_file(monkeypatch, tmp_path
     assert graph_delete_mock.call_args_list[0].kwargs["repo"] == "repo"
     assert graph_delete_mock.call_args_list[1].kwargs["repo"] is None
     journal_mock.assert_called_once()
-    assert journal_mock.call_args.kwargs["status"] == "done"
+    assert journal_mock.call_args.args[0][0]["status"] == "done"
 
 
 def test_processor_relinks_move_journal_before_delete(monkeypatch, tmp_path):
@@ -403,7 +562,7 @@ def test_processor_relinks_move_journal_before_delete(monkeypatch, tmp_path):
     journal_mock = MagicMock()
     monkeypatch.setattr(proc_mod, "_rename_in_store", rename_mock)
     monkeypatch.setattr(proc_mod.idx, "delete_points_by_path", delete_mock)
-    monkeypatch.setattr(proc_mod, "update_index_journal_entry_status", journal_mock)
+    monkeypatch.setattr(proc_mod, "update_index_journal_entries_status", journal_mock)
 
     proc_mod._process_paths(
         [src, dest],
@@ -416,7 +575,8 @@ def test_processor_relinks_move_journal_before_delete(monkeypatch, tmp_path):
 
     rename_mock.assert_called_once()
     delete_mock.assert_not_called()
-    done_paths = [call.args[0] for call in journal_mock.call_args_list if call.kwargs.get("status") == "done"]
+    updates = journal_mock.call_args.args[0]
+    done_paths = [entry["path"] for entry in updates if entry.get("status") == "done"]
     assert str(dest.resolve()) in done_paths
     assert str(src.resolve()) in done_paths
 
@@ -479,7 +639,7 @@ def test_processor_force_upsert_empty_file_marks_done(monkeypatch, tmp_path):
     monkeypatch.setattr(proc_mod, "_path_has_indexed_points", lambda *a, **k: False)
 
     journal_mock = MagicMock()
-    monkeypatch.setattr(proc_mod, "update_index_journal_entry_status", journal_mock)
+    monkeypatch.setattr(proc_mod, "update_index_journal_entries_status", journal_mock)
     monkeypatch.setattr(
         proc_mod,
         "list_pending_index_journal_entries",
@@ -502,4 +662,4 @@ def test_processor_force_upsert_empty_file_marks_done(monkeypatch, tmp_path):
     )
 
     journal_mock.assert_called_once()
-    assert journal_mock.call_args.kwargs["status"] == "done"
+    assert journal_mock.call_args.args[0][0]["status"] == "done"

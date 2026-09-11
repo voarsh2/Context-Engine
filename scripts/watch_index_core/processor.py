@@ -36,6 +36,7 @@ from scripts.workspace_state import (
     set_cached_file_hash,
     set_indexing_progress as _update_progress,
     set_indexing_started as _set_status_indexing,
+    update_index_journal_entries_status,
     update_index_journal_entry_status,
     update_indexing_status,
 )
@@ -52,6 +53,82 @@ from .utils import (
 )
 
 logger = watch_config.LOGGER
+
+_JOURNAL_STATUS_BATCH_LOCAL = threading.local()
+
+
+def _active_journal_status_batch() -> Optional[List[Dict[str, object]]]:
+    return getattr(_JOURNAL_STATUS_BATCH_LOCAL, "current", None)
+
+
+def _queue_journal_status(
+    path: Path,
+    repo_key: str,
+    repo_name: Optional[str],
+    *,
+    status: str,
+    error: Optional[str] = None,
+    remove_on_done: bool = True,
+) -> bool:
+    batch = _active_journal_status_batch()
+    if batch is None:
+        return False
+    batch.append(
+        {
+            "repo_key": repo_key,
+            "repo_name": repo_name,
+            "path": _normalize_cache_key_path(str(path)),
+            "status": status,
+            "error": error,
+            "remove_on_done": remove_on_done,
+        }
+    )
+    return True
+
+
+def _flush_journal_status_batch(updates: List[Dict[str, object]]) -> None:
+    if not updates:
+        return
+    grouped: Dict[tuple[str, Optional[str]], List[Dict[str, object]]] = {}
+    for update in updates:
+        key = (str(update["repo_key"]), update.get("repo_name"))
+        grouped.setdefault(key, []).append(update)
+
+    for (repo_key, repo_name), grouped_updates in grouped.items():
+        payload = [
+            {
+                "path": update["path"],
+                "status": update["status"],
+                "error": update.get("error"),
+                "remove_on_done": update.get("remove_on_done", True),
+            }
+            for update in grouped_updates
+        ]
+        try:
+            update_index_journal_entries_status(
+                payload,
+                workspace_path=repo_key,
+                repo_name=repo_name,
+            )
+            continue
+        except Exception:
+            logger.exception(
+                "watch_index::journal_bulk_status_failed",
+                extra={"repo_key": repo_key, "repo_name": repo_name, "count": len(payload)},
+            )
+
+        for update in payload:
+            try:
+                update_index_journal_entry_status(
+                    str(update["path"]),
+                    status=str(update["status"]),
+                    error=update.get("error"),
+                    workspace_path=repo_key,
+                    repo_name=repo_name,
+                    remove_on_done=bool(update.get("remove_on_done", True)),
+                )
+            except Exception:
+                pass
 
 
 class _SkipUnchanged(Exception):
@@ -362,6 +439,8 @@ def _advance_progress(
 
 
 def _mark_journal_done(path: Path, repo_key: str, repo_name: Optional[str]) -> None:
+    if _queue_journal_status(path, repo_key, repo_name, status="done"):
+        return
     try:
         update_index_journal_entry_status(
             str(path),
@@ -379,6 +458,15 @@ def _mark_journal_failed(
     repo_name: Optional[str],
     error: str,
 ) -> None:
+    if _queue_journal_status(
+        path,
+        repo_key,
+        repo_name,
+        status="failed",
+        error=error,
+        remove_on_done=False,
+    ):
+        return
     try:
         update_index_journal_entry_status(
             str(path),
@@ -694,7 +782,7 @@ def _maybe_handle_staging_file(
     return True
 
 
-def _process_paths(
+def _process_paths_impl(
     paths,
     client,
     model,
@@ -1047,6 +1135,38 @@ def _process_paths(
             )
         except Exception:
             pass
+
+
+def _process_paths(
+    paths,
+    client,
+    model,
+    vector_name: str,
+    model_dim: int,
+    workspace_path: str,
+) -> None:
+    """Process a watcher batch and persist journal status updates efficiently."""
+    previous_batch = getattr(_JOURNAL_STATUS_BATCH_LOCAL, "current", None)
+    batch: List[Dict[str, object]] = []
+    _JOURNAL_STATUS_BATCH_LOCAL.current = batch
+    try:
+        _process_paths_impl(
+            paths,
+            client,
+            model,
+            vector_name,
+            model_dim,
+            workspace_path,
+        )
+    finally:
+        if previous_batch is None:
+            try:
+                delattr(_JOURNAL_STATUS_BATCH_LOCAL, "current")
+            except AttributeError:
+                pass
+        else:
+            _JOURNAL_STATUS_BATCH_LOCAL.current = previous_batch
+        _flush_journal_status_batch(batch)
 
 
 def _read_text_and_sha1(path: Path) -> tuple[Optional[str], str]:

@@ -47,6 +47,7 @@ ROOT = watch_config.ROOT
 _COLLECTION: Optional[str] = None
 _JOURNAL_DRAIN_LAST_LOG = 0.0
 _JOURNAL_DRAIN_LAST_TOTAL = 0
+_JOURNAL_DRAIN_LAST_BUSY_LOG = 0.0
 
 
 def get_collection() -> str:
@@ -79,12 +80,44 @@ def _journal_log_interval_secs() -> float:
         return 120.0
 
 
+def _journal_drain_batch_size() -> int:
+    try:
+        return max(1, int(os.environ.get("WATCH_JOURNAL_DRAIN_BATCH_SIZE", "256") or 256))
+    except Exception:
+        return 256
+
+
+def _maybe_log_journal_drain_busy(queue: ChangeQueue) -> None:
+    global _JOURNAL_DRAIN_LAST_BUSY_LOG
+    now = time.time()
+    if _JOURNAL_DRAIN_LAST_BUSY_LOG > 0 and (
+        now - _JOURNAL_DRAIN_LAST_BUSY_LOG
+    ) < _journal_log_interval_secs():
+        return
+    try:
+        queue_stats = queue.stats()
+    except Exception:
+        queue_stats = {}
+    logger.info(
+        "watch_index::journal_drain_busy last_backlog=%d queue=%s",
+        _JOURNAL_DRAIN_LAST_TOTAL,
+        queue_stats,
+        extra={
+            "root": str(ROOT),
+            "last_backlog": _JOURNAL_DRAIN_LAST_TOTAL,
+            "queue_stats": queue_stats,
+        },
+    )
+    _JOURNAL_DRAIN_LAST_BUSY_LOG = now
+
+
 def _maybe_log_journal_drain(
     *,
     total: int,
     queued: int,
     op_counts: Counter[str],
     queue: ChangeQueue,
+    batch_size: int,
 ) -> None:
     global _JOURNAL_DRAIN_LAST_LOG, _JOURNAL_DRAIN_LAST_TOTAL
     now = time.time()
@@ -104,14 +137,17 @@ def _maybe_log_journal_drain(
     except Exception:
         queue_stats = {}
     logger.info(
-        "watch_index::journal_drain backlog=%d queued=%d ops=%s queue=%s",
+        "watch_index::journal_drain backlog=%d batch_limit=%d queued_batch=%d "
+        "ops=%s queue=%s",
         total,
+        batch_size,
         queued,
         dict(op_counts),
         queue_stats,
         extra={
             "root": str(ROOT),
             "backlog": total,
+            "batch_limit": batch_size,
             "queued": queued,
             "op_counts": dict(op_counts),
             "queue_stats": queue_stats,
@@ -124,10 +160,21 @@ def _maybe_log_journal_drain(
 def _drain_pending_journal(queue: ChangeQueue) -> None:
     pending_path: Optional[str] = None
     try:
+        queue_stats = queue.stats()
+        if (
+            queue_stats.get("processing")
+            or int(queue_stats.get("queued", 0) or 0) > 0
+            or int(queue_stats.get("pending", 0) or 0) > 0
+        ):
+            _maybe_log_journal_drain_busy(queue)
+            return
+
         pending_entries = list_pending_index_journal_entries(str(ROOT))
+        batch_size = _journal_drain_batch_size()
+        batch_entries = pending_entries[:batch_size]
         queued = 0
         op_counts: Counter[str] = Counter()
-        for pending_entry in pending_entries:
+        for pending_entry in batch_entries:
             op_type = str(pending_entry.get("op_type") or "unknown").strip() or "unknown"
             op_counts[op_type] += 1
             pending_path = str(pending_entry.get("path") or "").strip()
@@ -139,6 +186,7 @@ def _drain_pending_journal(queue: ChangeQueue) -> None:
             queued=queued,
             op_counts=op_counts,
             queue=queue,
+            batch_size=batch_size,
         )
     except Exception as exc:
         logger.exception(
@@ -319,7 +367,8 @@ def main() -> None:
     print(
         "[watch_mode] sources "
         f"journal_drain={'on' if journal_drain_enabled else 'off'} "
-        f"fs_events={'on' if fs_events_enabled else 'off'}"
+        f"fs_events={'on' if fs_events_enabled else 'off'} "
+        f"journal_batch={_journal_drain_batch_size()}"
     )
 
     obs = None

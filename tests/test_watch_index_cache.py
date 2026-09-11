@@ -607,6 +607,101 @@ def test_runtime_root_override_updates_internal_path_checks(monkeypatch, tmp_pat
         watch_index.ROOT = original_watch_root
 
 
+def test_journal_drain_does_not_requeue_while_queue_is_busy(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    queue = MagicMock()
+    queue.stats.return_value = {
+        "queued": 10,
+        "pending": 20,
+        "forced": 10,
+        "pending_forced": 20,
+        "processing": True,
+    }
+    pending_mock = MagicMock()
+    monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", pending_mock)
+
+    watch_index._drain_pending_journal(queue)
+
+    pending_mock.assert_not_called()
+    queue.add.assert_not_called()
+
+
+def test_journal_drain_limits_one_pass(monkeypatch):
+    import scripts.watch_index as watch_index
+
+    monkeypatch.setenv("WATCH_JOURNAL_DRAIN_BATCH_SIZE", "2")
+    monkeypatch.setattr(watch_index, "_maybe_log_journal_drain", lambda **_: None)
+    entries = [
+        {"path": f"/work/repo-{idx}/file.py", "op_type": "upsert"}
+        for idx in range(3)
+    ]
+    monkeypatch.setattr(watch_index, "list_pending_index_journal_entries", lambda *_: entries)
+
+    queue = MagicMock()
+    queue.stats.return_value = {
+        "queued": 0,
+        "pending": 0,
+        "forced": 0,
+        "pending_forced": 0,
+        "processing": False,
+    }
+
+    watch_index._drain_pending_journal(queue)
+
+    assert queue.add.call_count == 2
+
+
+def test_journal_status_batch_flushes_once_per_pass(monkeypatch, tmp_path):
+    import scripts.watch_index_core.processor as processor
+
+    bulk_update = MagicMock()
+    single_update = MagicMock()
+    monkeypatch.setattr(processor, "update_index_journal_entries_status", bulk_update)
+    monkeypatch.setattr(processor, "update_index_journal_entry_status", single_update)
+
+    batch = [
+        {"repo_key": "/work/repo", "repo_name": "repo", "path": str(tmp_path / "one.py"), "status": "done"},
+        {"repo_key": "/work/repo", "repo_name": "repo", "path": str(tmp_path / "two.py"), "status": "done"},
+    ]
+    processor._flush_journal_status_batch(batch)
+    assert bulk_update.call_count == 1
+    assert single_update.call_count == 0
+
+
+def test_journal_status_batch_falls_back_to_single_updates(monkeypatch, tmp_path):
+    import scripts.watch_index_core.processor as processor
+
+    bulk_update = MagicMock(side_effect=RuntimeError("bulk write failed"))
+    single_update = MagicMock()
+    monkeypatch.setattr(processor, "update_index_journal_entries_status", bulk_update)
+    monkeypatch.setattr(processor, "update_index_journal_entry_status", single_update)
+
+    batch = [
+        {"repo_key": "/work/repo", "repo_name": "repo", "path": str(tmp_path / "one.py"), "status": "done"},
+        {
+            "repo_key": "/work/repo",
+            "repo_name": "repo",
+            "path": str(tmp_path / "two.py"),
+            "status": "failed",
+            "error": "boom",
+            "remove_on_done": False,
+        },
+    ]
+    processor._flush_journal_status_batch(batch)
+
+    assert bulk_update.call_count == 1
+    assert single_update.call_count == 2
+    assert single_update.call_args_list[0].kwargs["status"] == "done"
+    assert single_update.call_args_list[1].kwargs == {
+        "status": "failed",
+        "error": "boom",
+        "workspace_path": "/work/repo",
+        "repo_name": "repo",
+        "remove_on_done": False,
+    }
+
+
 def test_main_throttles_periodic_maintenance(monkeypatch, tmp_path):
     import scripts.watch_index as watch_index
     from scripts.watch_index_core import config as watch_config
