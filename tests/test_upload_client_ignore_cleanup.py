@@ -1,4 +1,6 @@
+import hashlib
 import importlib
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -30,7 +32,7 @@ def _exercise_ignored_path_cleanup(mod_name: str, monkeypatch, tmp_path: Path) -
     ignored.write_text("print('dogfood')\n", encoding="utf-8")
 
     monkeypatch.setenv("DEV_REMOTE_MODE", "1")
-    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None: "abc123")
+    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None, **_kwargs: "abc123")
     monkeypatch.setattr(mod, "set_cached_file_hash", lambda *a, **k: None)
 
     client = mod.RemoteUploadClient(
@@ -68,8 +70,8 @@ def _exercise_force_mode_cleanup(mod_name: str, monkeypatch, tmp_path: Path) -> 
     stale_ignored.write_text("print('stale')\n", encoding="utf-8")
 
     monkeypatch.setenv("DEV_REMOTE_MODE", "1")
-    monkeypatch.setattr(mod, "get_all_cached_paths", lambda repo_name=None: [str(stale_ignored)])
-    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None: "abc123")
+    monkeypatch.setattr(mod, "get_all_cached_paths", lambda repo_name=None, **_kwargs: [str(stale_ignored)])
+    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None, **_kwargs: "abc123")
     monkeypatch.setattr(mod, "set_cached_file_hash", lambda *a, **k: None)
 
     client = mod.RemoteUploadClient(
@@ -107,8 +109,8 @@ def _exercise_force_mode_excludes_ignored_current_files(mod_name: str, monkeypat
     ignored_current.write_text("print('ignored')\n", encoding="utf-8")
 
     monkeypatch.setenv("DEV_REMOTE_MODE", "1")
-    monkeypatch.setattr(mod, "get_all_cached_paths", lambda repo_name=None: [])
-    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None: None)
+    monkeypatch.setattr(mod, "get_all_cached_paths", lambda repo_name=None, **_kwargs: [])
+    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None, **_kwargs: None)
     monkeypatch.setattr(mod, "set_cached_file_hash", lambda *a, **k: None)
 
     client = mod.RemoteUploadClient(
@@ -155,8 +157,8 @@ def _exercise_force_mode_dev_workspace_cleanup_without_cache(mod_name: str, monk
     mirrored.write_text("print('stale')\n", encoding="utf-8")
 
     monkeypatch.setenv("DEV_REMOTE_MODE", "1")
-    monkeypatch.setattr(mod, "get_all_cached_paths", lambda repo_name=None: [])
-    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None: None)
+    monkeypatch.setattr(mod, "get_all_cached_paths", lambda repo_name=None, **_kwargs: [])
+    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None, **_kwargs: None)
     monkeypatch.setattr(mod, "set_cached_file_hash", lambda *a, **k: None)
 
     client = mod.RemoteUploadClient(
@@ -244,7 +246,7 @@ def _exercise_detect_file_changes_does_not_persist_hash(mod_name: str, monkeypat
     current.write_text("print('current')\n", encoding="utf-8")
 
     set_hash = MagicMock()
-    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None: "oldhash")
+    monkeypatch.setattr(mod, "get_cached_file_hash", lambda path, repo_name=None, **_kwargs: "oldhash")
     monkeypatch.setattr(mod, "set_cached_file_hash", set_hash)
 
     client = mod.RemoteUploadClient(
@@ -332,6 +334,112 @@ def test_standalone_upload_client_plan_skip_finalizes_hash(monkeypatch, tmp_path
     )
 
 
+def _exercise_mixed_plan_finalizes_hash_matched_files(mod_name: str, monkeypatch, tmp_path: Path) -> None:
+    mod = importlib.import_module(mod_name)
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir(parents=True, exist_ok=True)
+    matched = workspace / "matched.py"
+    needed = workspace / "needed.py"
+    matched.write_text("print('matched')\n", encoding="utf-8")
+    needed.write_text("print('needed')\n", encoding="utf-8")
+
+    client = mod.RemoteUploadClient(
+        upload_endpoint="http://localhost:8004",
+        workspace_path=str(workspace),
+        collection_name="test-coll",
+    )
+    set_hash = MagicMock()
+    monkeypatch.setattr(mod, "set_cached_file_hash", set_hash)
+    monkeypatch.setattr(
+        client,
+        "_plan_delta_upload",
+        lambda changes: {
+            "needed_files": {"created": ["needed.py"], "updated": [], "moved": []},
+            "operation_counts_preview": {"created": 1, "updated": 0, "deleted": 0, "moved": 0, "skipped": 1, "skipped_hash_match": 1, "failed": 0},
+            "needed_size_bytes": needed.stat().st_size,
+        },
+    )
+    bundle_path = workspace / "bundle.tar.gz"
+    bundle_path.write_bytes(b"bundle")
+    monkeypatch.setattr(client, "create_delta_bundle", lambda *a, **k: (str(bundle_path), {"bundle_id": "b1", "total_size_bytes": 1}))
+    monkeypatch.setattr(client, "upload_bundle", lambda *a, **k: {"success": True, "processed_operations": {"created": 1}})
+
+    assert client.process_changes_and_upload(
+        {"created": [matched, needed], "updated": [], "deleted": [], "moved": [], "unchanged": []}
+    ) is True
+    assert {call.args[0] for call in set_hash.call_args_list} == {
+        str(matched.resolve()),
+        str(needed.resolve()),
+    }
+
+
+def test_remote_upload_client_mixed_plan_finalizes_hash_matched_files(monkeypatch, tmp_path):
+    _exercise_mixed_plan_finalizes_hash_matched_files("scripts.remote_upload_client", monkeypatch, tmp_path)
+
+
+def test_standalone_upload_client_mixed_plan_finalizes_hash_matched_files(monkeypatch, tmp_path):
+    _exercise_mixed_plan_finalizes_hash_matched_files("scripts.standalone_upload_client", monkeypatch, tmp_path)
+
+
+def _exercise_upload_does_not_finalize_file_changed_during_upload(
+    mod_name: str, monkeypatch, tmp_path: Path
+) -> None:
+    mod = importlib.import_module(mod_name)
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir(parents=True, exist_ok=True)
+    current = workspace / "app.py"
+    current.write_text("before\n", encoding="utf-8")
+    uploaded_hash = hashlib.sha1(current.read_bytes()).hexdigest()
+
+    client = mod.RemoteUploadClient(
+        upload_endpoint="http://localhost:8004",
+        workspace_path=str(workspace),
+        collection_name="test-coll",
+    )
+    set_hash = MagicMock()
+    monkeypatch.setattr(mod, "set_cached_file_hash", set_hash)
+    monkeypatch.setattr(client, "_plan_delta_upload", lambda _changes: None)
+
+    bundle_path = workspace / "bundle.tar.gz"
+
+    def create_bundle(*_args, **_kwargs):
+        client._last_expected_hashes = {"app.py": f"sha1:{uploaded_hash}"}
+        bundle_path.write_bytes(b"bundle")
+        return str(bundle_path), {"bundle_id": "b1", "total_size_bytes": 1}
+
+    def upload_bundle(*_args, **_kwargs):
+        current.write_text("after\n", encoding="utf-8")
+        return {"success": True, "processed_operations": {"created": 1}}
+
+    monkeypatch.setattr(client, "create_delta_bundle", create_bundle)
+    monkeypatch.setattr(client, "upload_bundle", upload_bundle)
+
+    assert client.process_changes_and_upload(
+        {
+            "created": [current],
+            "updated": [],
+            "deleted": [],
+            "moved": [],
+            "unchanged": [],
+        }
+    ) is True
+    set_hash.assert_not_called()
+
+
+def test_remote_upload_client_does_not_finalize_file_changed_during_upload(monkeypatch, tmp_path):
+    _exercise_upload_does_not_finalize_file_changed_during_upload(
+        "scripts.remote_upload_client", monkeypatch, tmp_path
+    )
+
+
+def test_standalone_upload_client_does_not_finalize_file_changed_during_upload(monkeypatch, tmp_path):
+    _exercise_upload_does_not_finalize_file_changed_during_upload(
+        "scripts.standalone_upload_client", monkeypatch, tmp_path
+    )
+
+
 def test_standalone_upload_client_plan_payload_prefixes_previous_hash(monkeypatch, tmp_path):
     mod = importlib.import_module("scripts.standalone_upload_client")
 
@@ -361,6 +469,32 @@ def test_standalone_upload_client_plan_payload_prefixes_previous_hash(monkeypatc
     deleted_op = next(op for op in payload["operations"] if op["operation"] == "deleted")
     assert updated_op["previous_hash"] == "sha1:abc123"
     assert deleted_op["previous_hash"] == "sha1:abc123"
+
+
+@pytest.mark.parametrize(
+    "mod_name",
+    ["scripts.remote_upload_client", "scripts.standalone_upload_client"],
+)
+def test_upload_client_status_passes_auth_session(monkeypatch, tmp_path, mod_name):
+    mod = importlib.import_module(mod_name)
+    workspace = tmp_path / "repo"
+    workspace.mkdir(parents=True)
+    client = mod.RemoteUploadClient(
+        upload_endpoint="http://localhost:8004",
+        workspace_path=str(workspace),
+        collection_name="test-coll",
+    )
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"status": "ready"}
+    get_mock = MagicMock(return_value=response)
+    monkeypatch.setattr(client.session, "get", get_mock)
+    monkeypatch.setattr(mod, "get_auth_session", lambda _endpoint: "session-123")
+
+    assert client.get_server_status()["success"] is True
+    params = get_mock.call_args.kwargs["params"]
+    assert params["workspace_path"]
+    assert params["session"] == "session-123"
 
 
 def _exercise_delete_only_plan_uses_apply_ops(mod_name: str, monkeypatch, tmp_path: Path) -> None:
@@ -424,7 +558,7 @@ def _exercise_delete_only_plan_uses_apply_ops(mod_name: str, monkeypatch, tmp_pa
             }
 
     monkeypatch.setattr(client.session, "post", lambda *a, **k: _Resp())
-    monkeypatch.setattr(mod, "remove_cached_file", lambda path, repo_name=None: removed_paths.append((path, repo_name)))
+    monkeypatch.setattr(mod, "remove_cached_file", lambda path, repo_name=None, **_kwargs: removed_paths.append((path, repo_name)))
 
     assert client.process_changes_and_upload(
         {
@@ -450,8 +584,6 @@ def test_standalone_upload_client_delete_only_plan_uses_apply_ops(monkeypatch, t
 
 def _exercise_async_upload_sets_queued_result(mod_name: str, monkeypatch, tmp_path: Path) -> None:
     mod = importlib.import_module(mod_name)
-    monkeypatch.setenv("CTXCE_REMOTE_UPLOAD_STATUS_WAIT_SECS", "0")
-
     workspace = tmp_path / "repo"
     workspace.mkdir(parents=True, exist_ok=True)
     current = workspace / "app.py"
@@ -476,6 +608,8 @@ def _exercise_async_upload_sets_queued_result(mod_name: str, monkeypatch, tmp_pa
         "upload_bundle",
         lambda *a, **k: {"success": True, "sequence_number": 7, "processed_operations": None},
     )
+    set_hash = MagicMock()
+    monkeypatch.setattr(mod, "set_cached_file_hash", set_hash)
     monkeypatch.setattr(mod, "flush_cached_file_hashes", lambda: None, raising=False)
 
     assert client.process_changes_and_upload(
@@ -489,62 +623,7 @@ def _exercise_async_upload_sets_queued_result(mod_name: str, monkeypatch, tmp_pa
     ) is True
     assert client.last_upload_result["outcome"] == "queued"
     assert client.last_upload_result["sequence_number"] == 7
-
-
-def _exercise_async_upload_promotes_completed_result(mod_name: str, monkeypatch, tmp_path: Path) -> None:
-    mod = importlib.import_module(mod_name)
-
-    workspace = tmp_path / "repo"
-    workspace.mkdir(parents=True, exist_ok=True)
-    current = workspace / "app.py"
-    current.write_text("print('current')\n", encoding="utf-8")
-
-    client = mod.RemoteUploadClient(
-        upload_endpoint="http://localhost:8004",
-        workspace_path=str(workspace),
-        collection_name="test-coll",
-    )
-
-    bundle_path = workspace / "bundle.tar.gz"
-    bundle_path.write_bytes(b"bundle")
-    monkeypatch.setattr(client, "_plan_delta_upload", lambda changes: None)
-    monkeypatch.setattr(
-        client,
-        "create_delta_bundle",
-        lambda changes: (str(bundle_path), {"bundle_id": "bundle-1", "total_size_bytes": 6}),
-    )
-    monkeypatch.setattr(
-        client,
-        "upload_bundle",
-        lambda *a, **k: {"success": True, "sequence_number": 7, "processed_operations": None},
-    )
-    monkeypatch.setattr(
-        client,
-        "get_server_status",
-        lambda: {
-            "success": True,
-            "last_sequence": 7,
-            "server_info": {
-                "last_bundle_id": "bundle-1",
-                "last_upload_status": "completed",
-                "last_processed_operations": {"updated": 1, "failed": 0},
-                "last_processing_time_ms": 12,
-            },
-        },
-    )
-    monkeypatch.setattr(mod, "flush_cached_file_hashes", lambda: None, raising=False)
-
-    assert client.process_changes_and_upload(
-        {
-            "created": [current],
-            "updated": [],
-            "deleted": [],
-            "moved": [],
-            "unchanged": [],
-        }
-    ) is True
-    assert client.last_upload_result["outcome"] == "uploaded_async"
-    assert client.last_upload_result["processed_operations"] == {"updated": 1, "failed": 0}
+    set_hash.assert_called_once()
 
 
 def test_remote_upload_client_async_upload_sets_queued_result(monkeypatch, tmp_path):
@@ -553,14 +632,6 @@ def test_remote_upload_client_async_upload_sets_queued_result(monkeypatch, tmp_p
 
 def test_standalone_upload_client_async_upload_sets_queued_result(monkeypatch, tmp_path):
     _exercise_async_upload_sets_queued_result("scripts.standalone_upload_client", monkeypatch, tmp_path)
-
-
-def test_remote_upload_client_async_upload_promotes_completed_result(monkeypatch, tmp_path):
-    _exercise_async_upload_promotes_completed_result("scripts.remote_upload_client", monkeypatch, tmp_path)
-
-
-def test_standalone_upload_client_async_upload_promotes_completed_result(monkeypatch, tmp_path):
-    _exercise_async_upload_promotes_completed_result("scripts.standalone_upload_client", monkeypatch, tmp_path)
 
 
 def _exercise_watchable_path_excludes_ignored_updates(mod_name: str, monkeypatch, tmp_path: Path) -> None:
@@ -602,3 +673,72 @@ def test_standalone_upload_client_watchable_path_excludes_ignored_updates(monkey
         monkeypatch,
         tmp_path,
     )
+
+
+def test_remote_cache_keeps_missing_workspace_paths_and_ignores_other_workspaces(
+    monkeypatch, tmp_path
+):
+    mod = importlib.import_module("scripts.remote_upload_client")
+    workspace = tmp_path / "repo"
+    other_workspace = tmp_path / "other-repo"
+    metadata_root = tmp_path / "metadata"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    cache_path = metadata_root / ".codebase" / "cache.json"
+    cache_path.parent.mkdir(parents=True)
+
+    missing_in_workspace = workspace / "deleted.py"
+    outside_workspace = other_workspace / "old.py"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "file_hashes": {
+                    str(missing_in_workspace): "hash-inside",
+                    str(outside_workspace): "hash-outside",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("MULTI_REPO_MODE", "0")
+    hashes = mod._load_local_cache_file_hashes(
+        str(workspace), None, metadata_root=str(metadata_root)
+    )
+
+    assert hashes == {str(missing_in_workspace): "hash-inside"}
+    assert not missing_in_workspace.exists()
+
+
+def test_standalone_cache_keeps_missing_workspace_paths_and_ignores_other_workspaces(
+    tmp_path,
+):
+    mod = importlib.import_module("scripts.standalone_upload_client")
+    workspace = tmp_path / "repo"
+    other_workspace = tmp_path / "other-repo"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    cache_dir = workspace / ".context-engine"
+    cache_dir.mkdir()
+
+    missing_in_workspace = workspace / "deleted.py"
+    outside_workspace = other_workspace / "old.py"
+    cache_path = cache_dir / "file_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "file_hashes": {
+                    str(missing_in_workspace): "hash-inside",
+                    str(outside_workspace): "hash-outside",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache = mod.SimpleHashCache(str(workspace), "repo")
+
+    assert cache.all_paths() == [str(missing_in_workspace)]
+    assert not missing_in_workspace.exists()
+    persisted = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert persisted["file_hashes"] == {str(missing_in_workspace): "hash-inside"}
